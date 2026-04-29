@@ -1,32 +1,40 @@
-import os, csv, json, time, random, smtplib, imaplib, email, re, mimetypes
+import os, csv, json, time, random, smtplib, imaplib, email, re, mimetypes, logging
 from datetime import datetime
 from email.message import EmailMessage
 
 # ==========================================
-# 1. PARÁMETROS DEL SISTEMA
+# 1. PARÁMETROS DEL SISTEMA Y LOGS
 # ==========================================
 CARPETA_ACTUAL = os.path.dirname(os.path.abspath(__file__))
 
-MI_CORREO = ""
-MI_PASSWORD = ""
+# Caja Negra: Acá se anotan los errores graves sin asustar al usuario en la pantalla
+ARCHIVO_LOG = os.path.join(CARPETA_ACTUAL, "sistema_errores.log")
+logging.basicConfig(
+    filename=ARCHIVO_LOG,
+    level=logging.WARNING,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+    encoding="utf-8",
+)
 
+MI_CORREO, MI_PASSWORD = "", ""
+
+# Archivos de lectura y guardado
 ARCHIVO_CSV = os.path.join(CARPETA_ACTUAL, "contactos.csv")
 LOG_PROGRESO = os.path.join(CARPETA_ACTUAL, "registro_envios.json")
 ARCHIVO_RECHAZOS = os.path.join(CARPETA_ACTUAL, "registro_rechazados.json")
 
+# Configuración de los correos a enviar
 LIMITE_DIARIO = 250
 ASUNTO = "TECNOLOGIA PARA EMPRESAS: MEJORAR LA PRODUCTIVIDAD Y BAJAR COSTOS"
 CORREO_COPIA = "ventas@intellihelp.tech"
-
 URL_WHATSAPP = "https://wa.me/5491150274827?text=Hola,%20me%20interesa%20conocer%20m%C3%A1s%20sobre%20sus%20soluciones."
 URL_CALENDLY = "https://calendly.com/rnasif-intellihelp/30min"
 
-TIEMPO_MINIMO = 25
-TIEMPO_MAXIMO = 45
-
+TIEMPO_MINIMO, TIEMPO_MAXIMO = 25, 45
 FUENTE_BASE = "font-family: 'Saira', Arial, sans-serif;"
 
-# Lista de imágenes a adjuntar (Nombre del archivo en PC -> ID interno para el HTML)
+# Fotos e íconos que van a ir pegados adentro del correo
 ACTIVOS_MULTIMEDIA = [
     ("ITH-logo.png", "logo_intellihelp"),
     ("icon-process.svg", "icon_process"),
@@ -39,94 +47,48 @@ ACTIVOS_MULTIMEDIA = [
 
 
 # ==========================================
-# 2. MANEJO DE ESTADO (GUARDAR/CARGAR PROGRESO)
+# 2. GUARDAR Y CARGAR PROGRESO
 # ==========================================
-def cargar_estado_ejecucion():
-    """
-    Lee el archivo JSON para saber dónde nos quedamos en la ejecución anterior.
-    Esto evita que empecemos desde cero si el programa se cierra.
-    """
-    if os.path.exists(LOG_PROGRESO):
-        try:
-            with open(LOG_PROGRESO, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except json.JSONDecodeError:
-            print(
-                "[ADVERTENCIA] El archivo de progreso está roto. Empezaremos a contar desde cero."
-            )
+def cargar_estado():
+    # Lee nuestro archivo de guardado para no arrancar de cero si cerramos el programa.
+    if not os.path.exists(LOG_PROGRESO):
+        return {"ultimo_email": "", "fecha": "", "enviados_hoy": 0}
 
-    # Código de compatibilidad por si aún existe el viejo archivo .txt
-    txt_legado = os.path.join(CARPETA_ACTUAL, "ultimo_enviado.txt")
-    if os.path.exists(txt_legado):
-        with open(txt_legado, "r", encoding="utf-8") as f:
-            return {"ultimo_email": f.read().strip(), "fecha": "", "enviados_hoy": 0}
-
-    return {"ultimo_email": "", "fecha": "", "enviados_hoy": 0}
+    try:
+        with open(LOG_PROGRESO, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        # Si el archivo se rompió por algún motivo, empezamos de cero sin hacer ruido.
+        return {"ultimo_email": "", "fecha": "", "enviados_hoy": 0}
 
 
-def persistir_estado(email_str, enviados, fecha):
-    """
-    Guarda el correo actual y la cantidad de envíos en un JSON.
-    Se hace después de cada envío exitoso para no perder el progreso.
-    """
+def guardar_estado(email_str, enviados, fecha):
+    # Anota por qué cliente vamos para recordar el progreso.
     with open(LOG_PROGRESO, "w", encoding="utf-8") as f:
         json.dump(
-            {"ultimo_email": email_str, "fecha": fecha, "enviados_hoy": enviados},
-            f,
-            indent=4,
+            {"ultimo_email": email_str, "fecha": fecha, "enviados_hoy": enviados}, f
         )
 
 
 # ==========================================
 # 3. ARMADO Y ENVÍO DEL CORREO
 # ==========================================
-def _inyectar_recursos(msg_obj):
-    """
-    Toma las imágenes locales y las incrusta dentro del código del correo.
-    MIME es el estándar de internet para enviar archivos adjuntos o imágenes.
-    """
-    for nombre_archivo, cid in ACTIVOS_MULTIMEDIA:
-        ruta = os.path.join(CARPETA_ACTUAL, nombre_archivo)
-        if not os.path.exists(ruta):
-            print(
-                f"[ADVERTENCIA] No encontré la imagen '{nombre_archivo}'. Se enviará el correo sin ella."
-            )
-            continue
-
-        with open(ruta, "rb") as img:
-            datos = img.read()
-
-        tipo_mime, _ = mimetypes.guess_type(ruta)
-        tipo_mime = tipo_mime or (
-            "image/svg+xml"
-            if nombre_archivo.endswith(".svg")
-            else "application/octet-stream"
-        )
-        tipo, subtipo = tipo_mime.split("/")
-        msg_obj.get_payload()[1].add_related(
-            datos, maintype=tipo, subtype=subtipo, cid=f"<{cid}>"
-        )
-
-
-def _ensamblar_mensaje(nombre_completo, correo_destino):
-    """
-    Fabrica el paquete de datos a enviar (Payload).
-    Junta el Asunto, Destinatario, Texto Simple y el código HTML.
-    """
+def preparar_correo(nombre, destino):
+    # Arma la "carta" completa: textos, diseño y destinatarios.
     msg = EmailMessage()
-    msg["Subject"] = f"{ASUNTO} | {nombre_completo}"
-    msg["From"] = MI_CORREO
-    msg["To"] = correo_destino
-    msg["Cc"] = CORREO_COPIA
-
-    # Versión simple por si el cliente no soporta HTML
-    txt_plano = (
-        f"Estimado/a {nombre_completo}:\n\nAutomatizá tu empresa. Producí más, gastá menos.\n\n"
-        f"Soluciones tecnológicas a medida que reducen costos operativos y liberan a tu equipo.\n\n"
-        f"Agendá una reunión: {URL_CALENDLY}\nWhatsApp: {URL_WHATSAPP}"
+    msg["Subject"], msg["From"], msg["To"], msg["Cc"] = (
+        f"{ASUNTO} | {nombre}",
+        MI_CORREO,
+        destino,
+        CORREO_COPIA,
     )
-    msg.set_content(txt_plano)
 
+    # Texto simple por si el cliente del usuario tiene bloqueado el diseño visual
+    msg.set_content(
+        f"Estimado/a {nombre}:\n\nAutomatizá tu empresa. Producí más, gastá menos.\nAgendá una reunión: {URL_CALENDLY}\nWhatsApp: {URL_WHATSAPP}"
+    )
+
+    # Diseño visual
     html = f"""
     <!doctype html><html lang="es"><head><meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
@@ -148,7 +110,7 @@ def _ensamblar_mensaje(nombre_completo, correo_destino):
             </tr></table>
         </td></tr>
         <tr><td class="m-p-20" style="padding: 32px 28px 28px;">
-            <p style="font-size: 15px; color: #5a5d68; margin: 0 0 15px 0;">Estimado/a <strong>{nombre_completo}</strong>,</p>
+            <p style="font-size: 15px; color: #5a5d68; margin: 0 0 15px 0;">Estimado/a <strong>{nombre}</strong>,</p>
             <h1 class="m-txt-24" style="font-size: 32px; font-weight: 600; color: #161922; margin: 0 0 12px 0;">Automatizá tu empresa.<br/><span style="color: #663399;">Producí más, gastá menos.</span></h1>
             <p style="font-size: 14px; color: #5a5d68; line-height: 1.5; margin: 0 0 24px 0;">Soluciones a medida que reducen costos operativos y liberan a tu equipo.</p>
             <table width="100%" cellpadding="0" cellspacing="0" style="margin-bottom: 24px;"><tr>
@@ -176,216 +138,214 @@ def _ensamblar_mensaje(nombre_completo, correo_destino):
     </body></html>
     """
     msg.add_alternative(html, subtype="html")
-    _inyectar_recursos(msg)
+
+    # Pega las imágenes adentro del correo para que no salgan rotas ni las bloqueen
+    for archivo, id_imagen in ACTIVOS_MULTIMEDIA:
+        ruta = os.path.join(CARPETA_ACTUAL, archivo)
+        if not os.path.exists(ruta):
+            continue
+
+        with open(ruta, "rb") as img:
+            datos = img.read()
+
+        # Le avisa al correo si es una foto normal o un vector (SVG)
+        tipo = (
+            "image/svg+xml"
+            if archivo.endswith(".svg")
+            else mimetypes.guess_type(ruta)[0] or "application/octet-stream"
+        )
+        t, st = tipo.split("/")
+        msg.get_payload()[1].add_related(
+            datos, maintype=t, subtype=st, cid=f"<{id_imagen}>"
+        )
+
     return msg
 
 
-def _transmitir_via_smtp(msg, destino):
-    """
-    Abre una conexión segura (socket) con Google y despacha el correo.
-    Retorna True si fue exitoso, o False si falló.
-    """
+def enviar_correo(msg, destino):
+    # Se conecta a Google y despacha el correo.
     try:
-        server = smtplib.SMTP("smtp.gmail.com", 587)
-        server.starttls()  # Asegura que la contraseña viaje encriptada
-        server.login(MI_CORREO, MI_PASSWORD)
-        server.send_message(msg)
-        server.quit()
+        with smtplib.SMTP("smtp.gmail.com", 587) as server:
+            server.starttls()
+            server.login(MI_CORREO, MI_PASSWORD)
+            server.send_message(msg)
         return True
     except smtplib.SMTPRecipientsRefused:
-        print(
-            f"[ADVERTENCIA] Google rechazó el envío de inmediato (el correo destino es inválido): {destino}"
-        )
+        logging.warning(f"Google avisó que este correo está mal escrito: {destino}")
     except Exception as e:
-        print(
-            f"[ERROR] Falló la conexión a internet o al servidor intentando enviar a {destino}: {e}"
+        logging.error(
+            f"Se cortó internet o hubo un error enviando a {destino}. Detalle: {e}"
         )
     return False
 
 
 # ==========================================
-# 4. REVISIÓN DE REBOTES (LECTURA DE BANDEJA IMAP)
+# 4. REVISIÓN DE REBOTES (CORREOS QUE NO EXISTEN)
 # ==========================================
-def auditar_rebotes_diarios(fecha_actual, enviados_totales_hoy):
-    """
-    Se conecta a la bandeja de entrada para leer correos nuevos.
-    Busca avisos de 'Mail Delivery Subsystem' (DSN) que indican que un correo no existe (Hard Bounce).
-    """
-    print(
-        f"\n[SISTEMA] Revisando la bandeja de entrada buscando correos devueltos (Hard Bounces) para la fecha: {fecha_actual}"
-    )
-    rechazados_hoy = set()
+def revisar_rebotes(fecha_actual, enviados_hoy):
+    # Entra a la cuenta a leer los avisos de Google sobre correos que no existen.
+    print(f"\nRevisando si algún correo fue devuelto (fecha: {fecha_actual})...")
+    rechazados = set()
 
     try:
-        mail = imaplib.IMAP4_SSL("imap.gmail.com")
-        mail.login(MI_CORREO, MI_PASSWORD)
-        mail.select("inbox")
+        with imaplib.IMAP4_SSL("imap.gmail.com") as mail:
+            mail.login(MI_CORREO, MI_PASSWORD)
+            mail.select("inbox")
 
-        # Formatea la fecha para que el servidor de Google la entienda
-        fecha_imap = datetime.strptime(fecha_actual, "%Y-%m-%d").strftime("%d-%b-%Y")
+            fecha_google = datetime.strptime(fecha_actual, "%Y-%m-%d").strftime(
+                "%d-%b-%Y"
+            )
+            estado, mensajes = mail.search(
+                None, f'(FROM "mailer-daemon@googlemail.com" SINCE "{fecha_google}")'
+            )
 
-        # Busca correos enviados por el sistema automático de devoluciones
-        status, mensajes = mail.search(
-            None, f'(FROM "mailer-daemon@googlemail.com" SINCE "{fecha_imap}")'
-        )
+            # Si no hay avisos de correos devueltos, salimos de esta función rápido (Early Return).
+            if estado != "OK" or not mensajes[0]:
+                print("Todo excelente. Ningún correo rebotó hoy.")
+                return
 
-        if status == "OK" and mensajes[0]:
+            # Busca la dirección de email dentro del texto que nos mandó Google
             for num_id in mensajes[0].split():
-                _, msg_data = mail.fetch(num_id, "(RFC822)")
-                for respuesta in msg_data:
+                _, datos = mail.fetch(num_id, "(RFC822)")
+                for respuesta in datos:
                     if not isinstance(respuesta, tuple):
                         continue
 
-                    msg_correo = email.message_from_bytes(respuesta[1])
-                    cuerpo = ""
+                    correo_recibido = email.message_from_bytes(respuesta[1])
 
-                    # Lee el contenido del correo devuelto para encontrar a quién intentamos enviar
-                    if msg_correo.is_multipart():
-                        for part in msg_correo.walk():
-                            if part.get_content_type() == "text/plain":
-                                cuerpo += part.get_payload(decode=True).decode(
-                                    "utf-8", errors="ignore"
-                                )
+                    # Lee todo el texto del aviso
+                    texto = ""
+                    if correo_recibido.is_multipart():
+                        texto = "".join(
+                            p.get_payload(decode=True).decode("utf-8", "ignore")
+                            for p in correo_recibido.walk()
+                            if p.get_content_type() == "text/plain"
+                        )
                     else:
-                        cuerpo = msg_correo.get_payload(decode=True).decode(
-                            "utf-8", errors="ignore"
+                        texto = correo_recibido.get_payload(decode=True).decode(
+                            "utf-8", "ignore"
                         )
 
-                    # Usa una expresión regular (RegEx) para extraer direcciones de email del texto
-                    correos = re.findall(
-                        r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+", cuerpo
-                    )
-                    for c in [x.lower() for x in correos]:
-                        # Ignoramos nuestro propio correo y los correos del sistema
+                    # Atrapa cualquier dirección que tenga un '@'
+                    for c in re.findall(
+                        r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+", texto
+                    ):
+                        c_limpio = c.lower()
+                        # Si no es nuestro correo ni el del sistema de Google, lo guardamos.
                         if (
-                            "mailer-daemon" not in c
-                            and "postmaster" not in c
-                            and MI_CORREO.lower() not in c
+                            "daemon" not in c_limpio
+                            and MI_CORREO.lower() not in c_limpio
                         ):
-                            rechazados_hoy.add(c)
+                            rechazados.add(c_limpio)
                             break
 
-        mail.logout()
-
-        # Guarda la lista de rebotados en un archivo JSON sin borrar los días anteriores
+        # Actualiza el archivo de historial de rechazos
         historial = {}
         if os.path.exists(ARCHIVO_RECHAZOS):
-            try:
-                with open(ARCHIVO_RECHAZOS, "r", encoding="utf-8") as f:
-                    historial = json.load(f)
-            except json.JSONDecodeError:
-                pass
+            with open(ARCHIVO_RECHAZOS, "r", encoding="utf-8") as f:
+                historial = json.load(f)
 
         historial[fecha_actual] = {
-            "total": len(rechazados_hoy),
-            "correos": list(rechazados_hoy),
+            "total": len(rechazados),
+            "correos": list(rechazados),
         }
+
         with open(ARCHIVO_RECHAZOS, "w", encoding="utf-8") as f:
             json.dump(historial, f, indent=4)
 
-        tasa = (
-            (len(rechazados_hoy) / enviados_totales_hoy * 100)
-            if enviados_totales_hoy > 0
-            else 0
-        )
-        print(f"\n[INFO] --- REPORTE DE ENTREGAS Y REBOTES ({fecha_actual}) ---")
+        # Cálculo matemático para imprimirle la estadística clara al usuario
+        total_rechazados = len(rechazados)
+        porcentaje = (total_rechazados / enviados_hoy * 100) if enviados_hoy > 0 else 0
+
         print(
-            f"[INFO] Correos transmitidos: {enviados_totales_hoy} | Rebotados: {len(rechazados_hoy)} | Tasa de error: {tasa:.2f}%"
+            f"Resumen del día: De {enviados_hoy} correos enviados, {total_rechazados} rebotaron. (Porcentaje de rechazo: {porcentaje:.2f}%)"
         )
 
     except Exception as e:
-        print(f"[ERROR] Problema al leer la bandeja de entrada (IMAP): {e}")
+        logging.error(f"Hubo un problema intentando leer la bandeja de entrada: {e}")
 
 
 # ==========================================
-# 5. ORQUESTADOR (FUNCIÓN PRINCIPAL)
+# 5. MOTOR PRINCIPAL
 # ==========================================
 def main():
-    estado = cargar_estado_ejecucion()
-    ultimo_idx = estado.get("ultimo_email", "")
-    fecha_hoy = datetime.now().strftime("%Y-%m-%d")
-    enviados_hoy = (
-        estado.get("enviados_hoy", 0) if estado.get("fecha") == fecha_hoy else 0
-    )
+    estado = cargar_estado()
+    ultimo_correo = estado.get("ultimo_email", "")
+    hoy = datetime.now().strftime("%Y-%m-%d")
+    enviados = estado.get("enviados_hoy", 0) if estado.get("fecha") == hoy else 0
 
     print(
-        f"\n[SISTEMA] Iniciando programa principal (Daemon). Cuota utilizada hoy: {enviados_hoy}/{LIMITE_DIARIO}"
+        f"\nIniciando programa de envíos. Hoy ya mandamos {enviados} de {LIMITE_DIARIO} posibles."
     )
 
-    if enviados_hoy >= LIMITE_DIARIO:
-        print(
-            "[SISTEMA] Ya alcanzaste el límite de envíos diarios permitidos. Terminando programa."
-        )
-        return auditar_rebotes_diarios(fecha_hoy, enviados_hoy)
+    # Regla de guarda: Si ya llegamos al máximo, ni entramos a la lista.
+    if enviados >= LIMITE_DIARIO:
+        print("Ya llegamos al máximo por hoy. Nos vemos mañana.")
+        return revisar_rebotes(hoy, enviados)
 
     if not os.path.exists(ARCHIVO_CSV):
-        return print(
-            f"[ERROR] No se encontró el archivo de Excel/CSV en la ruta: {ARCHIVO_CSV}"
-        )
-
-    # Lee todos los clientes de una vez y los guarda en memoria RAM
-    with open(ARCHIVO_CSV, mode="r", encoding="utf-8") as f:
-        registros = list(csv.DictReader(f))
-
-    procesando_activo = not bool(ultimo_idx)
-    if ultimo_idx:
         print(
-            f"[INFO] Buscando al último cliente procesado ({ultimo_idx}) para continuar desde ahí..."
+            "Atención: No se encontró el archivo de contactos. Revisar que esté en la misma carpeta."
+        )
+        return
+
+    with open(ARCHIVO_CSV, "r", encoding="utf-8") as f:
+        lista_clientes = list(csv.DictReader(f))
+
+    # Control de reanudación
+    saltar_hasta_ultimo = bool(ultimo_correo)
+    if saltar_hasta_ultimo:
+        print(
+            "Avanzando automáticamente hasta encontrar dónde nos quedamos la última vez..."
         )
 
-    for i, fila in enumerate(registros):
-        if enviados_hoy >= LIMITE_DIARIO:
-            print("[SISTEMA] Se llegó al máximo de envíos permitidos en este momento.")
+    for i, fila in enumerate(lista_clientes):
+        if enviados >= LIMITE_DIARIO:
+            print("\nLlegamos al máximo de envíos por hoy. Pausando programa.")
             break
 
-        # Busca en las tres columnas de email, usa la primera que tenga datos
+        # Agarra el primer correo que no esté vacío en esas 3 columnas
         destino = (
             fila.get("Correo electrónico")
             or fila.get("Correo electrónico secundario")
             or fila.get("Correo electrónico terciario")
             or ""
         ).strip()
+
         if not destino:
             continue
 
-        if not procesando_activo:
-            if destino == ultimo_idx:
-                procesando_activo = True
+        # Adelanta rápido hasta llegar al cliente que se cortó la vez pasada
+        if saltar_hasta_ultimo:
+            if destino == ultimo_correo:
+                saltar_hasta_ultimo = False
             continue
 
-        nombre = f"{fila.get('Nombre', '').strip()} {fila.get('Apellidos', '').strip()}".strip()
-        nombre = nombre or fila.get("Nombre de Cuenta", "").strip() or "Cliente"
-
-        mensaje = _ensamblar_mensaje(nombre, destino)
-
-        # Intenta enviar el correo
-        if _transmitir_via_smtp(mensaje, destino):
-            enviados_hoy += 1
-            persistir_estado(destino, enviados_hoy, fecha_hoy)
-            print(
-                f"[Envío {i + 1}/{len(registros)}] (Total hoy: {enviados_hoy}) -> Entregado al servidor destino: {destino}"
-            )
-
-            # Si no hemos llegado al límite, hacemos una pausa antes del siguiente cliente
-            if enviados_hoy < LIMITE_DIARIO:
-                pausa = random.randint(TIEMPO_MINIMO, TIEMPO_MAXIMO)
-                print(
-                    f"  [SISTEMA] Pausa aleatoria (Jitter) de {pausa}s para simular comportamiento humano (Prevención Anti-Spam)."
-                )
-                time.sleep(pausa)
-
-    if enviados_hoy == 0 and ultimo_idx:
-        print(
-            "\n[ADVERTENCIA] No se envió nada. O llegaste al final del archivo, o el último correo no existe en la lista."
+        nombre = (
+            (fila.get("Nombre", "") + " " + fila.get("Apellidos", "")).strip()
+            or fila.get("Nombre de Cuenta", "").strip()
+            or "Cliente"
         )
+
+        # Intenta mandar el correo
+        if enviar_correo(preparar_correo(nombre, destino), destino):
+            enviados += 1
+            guardar_estado(destino, enviados, hoy)
+            print(f"Enviado con éxito a: {destino} (Van {enviados} de {LIMITE_DIARIO})")
+
+            # Pausa para no parecer un robot mandando a lo loco
+            if enviados < LIMITE_DIARIO:
+                espera = random.randint(TIEMPO_MINIMO, TIEMPO_MAXIMO)
+                print(f" Esperando {espera} segundos antes del siguiente...")
+                time.sleep(espera)
+
+    if enviados == 0 and ultimo_correo:
+        print("\nNo se enviaron correos nuevos. Ya terminamos la lista entera.")
     else:
-        print(
-            f"\n[SISTEMA] Ciclo finalizado. Total de correos procesados hoy: {enviados_hoy}"
-        )
+        print(f"\nLista finalizada por el momento. Total enviados hoy: {enviados}")
 
-    auditar_rebotes_diarios(fecha_hoy, enviados_hoy)
+    revisar_rebotes(hoy, enviados)
 
 
-# Esta línea asegura que el código solo corra si ejecutamos este archivo directamente
 if __name__ == "__main__":
     main()
