@@ -91,6 +91,19 @@ def main(page: ft.Page):
     page.bgcolor           = C_FONDO
     page.theme_mode        = ft.ThemeMode.LIGHT
     page.padding           = 0
+
+    # Ícono de la ventana / barra de tareas (usa ITH-logo.png si existe)
+    _logo_full = os.path.join(CARPETA_ACTUAL, "ITH-logo.png")
+    if os.path.exists(_logo_full):
+        for attr in ("icon",):
+            try:
+                setattr(page.window, attr, _logo_full)
+            except Exception:
+                pass
+        try:
+            page.window_icon = _logo_full
+        except Exception:
+            pass
     page.fonts = {
         "Saira": "https://fonts.gstatic.com/s/saira/v14/memXYa2wxmKQyPMrZX79wwYZQMhsyuShhKMjjbU9uXuA.woff2"
     }
@@ -124,6 +137,58 @@ def main(page: ft.Page):
             page.update()
         except Exception:
             pass
+
+    # ── Helper: portapapeles. En Flet 0.84 page.set_clipboard fue removido. ──
+    def copiar_portapapeles(texto):
+        if texto is None:
+            return False
+        texto = str(texto)
+        # Intento 1: APIs nativas de Flet (varían entre versiones)
+        for nombre in ("set_clipboard", "set_clipboard_async", "copy_to_clipboard"):
+            fn = getattr(page, nombre, None)
+            if callable(fn):
+                try:
+                    fn(texto)
+                    return True
+                except Exception:
+                    pass
+        # Intento 2: Tkinter (siempre disponible en Python estándar)
+        try:
+            import tkinter
+            r = tkinter.Tk()
+            r.withdraw()
+            r.clipboard_clear()
+            r.clipboard_append(texto)
+            r.update()
+            r.destroy()
+            return True
+        except Exception:
+            pass
+        # Intento 3: subprocess Windows
+        try:
+            import subprocess
+            subprocess.run(["clip"], input=texto.encode("utf-16le"),
+                           check=True, shell=False)
+            return True
+        except Exception:
+            return False
+
+    # ── Heartbeat asyncio: fuerza re-render desde el loop principal cada 0.4s. ──
+    # En Flet 0.84 los page.update() desde threads daemon no propagan hasta que
+    # ocurre una interacción. Este heartbeat dispara updates desde el event loop.
+    async def _heartbeat_render():
+        import asyncio as _aio
+        while True:
+            await _aio.sleep(0.4)
+            try:
+                page.update()
+            except Exception:
+                pass
+
+    try:
+        page.run_task(_heartbeat_render)
+    except Exception:
+        pass
 
     # ── Borde helper ──────────────────────────────────────────────
     def borde_all(w, color):
@@ -452,7 +517,7 @@ def main(page: ft.Page):
         columns=[
             ft.DataColumn(ft.Text("Nombre", font_family="Saira", weight=ft.FontWeight.BOLD)),
             ft.DataColumn(ft.Text("Apellido", font_family="Saira", weight=ft.FontWeight.BOLD)),
-            ft.DataColumn(ft.Text("Cuenta", font_family="Saira", weight=ft.FontWeight.BOLD)),
+            ft.DataColumn(ft.Text("Empresa", font_family="Saira", weight=ft.FontWeight.BOLD)),
             ft.DataColumn(ft.Text("Correo Principal", font_family="Saira", weight=ft.FontWeight.BOLD)),
             ft.DataColumn(ft.Text("Correo 2", font_family="Saira", weight=ft.FontWeight.BOLD)),
             ft.DataColumn(ft.Text("Correo 3", font_family="Saira", weight=ft.FontWeight.BOLD)),
@@ -671,7 +736,17 @@ def main(page: ft.Page):
         depurados    = enviar_correos.cargar_depurados()
         mostrar_dep  = chk_mostrar_depurados.value
 
-        lista_rechazados.controls.clear()
+        # Dedupe defensivo por email (por si el JSON trae duplicados de algún backfill)
+        vistos = set()
+        unicos = []
+        for r in rechazados:
+            em = (r.get("email") or "").lower().strip()
+            if em and em not in vistos:
+                vistos.add(em)
+                unicos.append(r)
+        rechazados = unicos
+
+        nuevos_controles = []
         visibles = 0
         for item in rechazados:
             es_dep = item["email"] in depurados
@@ -691,8 +766,10 @@ def main(page: ft.Page):
             )
 
             def _copiar(e, correo=item["email"]):
-                page.set_clipboard(correo)
-                _flash(f"Copiado: {correo}", C_EXITO)
+                if copiar_portapapeles(correo):
+                    _flash(f"Copiado: {correo}", C_EXITO)
+                else:
+                    _flash("No se pudo copiar al portapapeles", C_ROJO, 3)
 
             def _toggle_dep(e, correo=item["email"], ya=es_dep):
                 if ya:
@@ -731,7 +808,7 @@ def main(page: ft.Page):
                 visible=es_dep,
             )
 
-            lista_rechazados.controls.append(
+            nuevos_controles.append(
                 ft.Container(
                     bgcolor=C_BLANCO,
                     border_radius=ft.BorderRadius(10, 10, 10, 10),
@@ -753,8 +830,8 @@ def main(page: ft.Page):
                 )
             )
 
-        if not lista_rechazados.controls:
-            lista_rechazados.controls.append(
+        if not nuevos_controles:
+            nuevos_controles.append(
                 ft.Container(
                     padding=ft.Padding(20, 24, 20, 24),
                     content=ft.Text(
@@ -766,6 +843,8 @@ def main(page: ft.Page):
                         font_family="Saira"),
                 )
             )
+
+        lista_rechazados.controls = nuevos_controles
 
         ocultos = sum(1 for r in rechazados if r["email"] in depurados) \
                   if not mostrar_dep else 0
@@ -1634,14 +1713,19 @@ def main(page: ft.Page):
                 if not correo:
                     _flash_resp("No hay correo del invitado para responder", C_NARANJA)
                     return
-                _abrir_redactor(correo, asunto)
+                # Cambio a la vista de hilo y traigo la conversación entera
+                if ir_a_vista[0]:
+                    ir_a_vista[0]("hilo")
+                cargar_hilo(correo, asunto)
 
             def _copiar_resp(e, correo=accion_email):
                 if not correo:
                     _flash_resp("Sin correo para copiar", C_NARANJA)
                     return
-                page.set_clipboard(correo)
-                _flash_resp(f"Copiado: {correo}", C_EXITO)
+                if copiar_portapapeles(correo):
+                    _flash_resp(f"Copiado: {correo}", C_EXITO)
+                else:
+                    _flash_resp("No se pudo copiar al portapapeles", C_ROJO, 3)
 
             def _abrir_mailto_externo(e, correo=accion_email, asunto=subtitulo):
                 if not correo:
@@ -1902,6 +1986,308 @@ def main(page: ft.Page):
                 border=borde_all(1, C_BORDE),
                 padding=ft.Padding(0, 0, 0, 0),
                 content=lista_respuestas,
+            ),
+        ],
+    )
+
+    # ==========================================
+    # PANEL HILO — cadena completa de un correo + responder en línea
+    # ==========================================
+    hilo_email_actual    = [""]
+    hilo_asunto_actual   = [""]
+    hilo_mensajes        = [[]]   # lista de dicts cargados de IMAP
+    ring_hilo            = ft.ProgressRing(color=C_MORADO, width=20, height=20,
+                                            stroke_width=2.5, visible=False)
+    lbl_hilo_titulo      = ft.Text("Hilo", size=18, weight=ft.FontWeight.BOLD,
+                                    color=C_TEXTO_1, font_family="Saira")
+    lbl_hilo_estado      = ft.Text("", size=11, color=C_AZUL, font_family="Saira",
+                                    italic=True)
+    lista_mensajes_hilo  = ft.ListView(expand=True, spacing=12,
+                                        padding=ft.Padding(16, 16, 16, 16),
+                                        auto_scroll=False)
+
+    tf_hilo_respuesta = ft.TextField(
+        label="Tu respuesta",
+        hint_text="Escribí tu mensaje y apretá Enviar...",
+        multiline=True,
+        min_lines=4,
+        max_lines=10,
+        border_color=C_BORDE,
+        focused_border_color=C_MORADO,
+        text_style=ft.TextStyle(font_family="Saira"),
+        label_style=ft.TextStyle(color=C_TEXTO_2, font_family="Saira"),
+        expand=True,
+    )
+
+    def _flash_hilo(msg, color=C_AZUL, segundos=2):
+        lbl_hilo_estado.value = msg
+        lbl_hilo_estado.color = color
+        safe_update(lbl_hilo_estado)
+        def _limpiar():
+            import time as _t
+            _t.sleep(segundos)
+            if lbl_hilo_estado.value == msg:
+                lbl_hilo_estado.value = ""
+                safe_update(lbl_hilo_estado)
+        threading.Thread(target=_limpiar, daemon=True).start()
+
+    def _render_hilo_mensajes():
+        """Construye visualmente la cadena de mensajes del hilo."""
+        msgs = hilo_mensajes[0]
+        nuevos = []
+        if not msgs:
+            nuevos.append(
+                ft.Container(
+                    padding=ft.Padding(20, 30, 20, 30),
+                    alignment=ft.Alignment(0, 0),
+                    content=ft.Column(
+                        horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+                        spacing=8,
+                        controls=[
+                            ft.Icon(ft.Icons.FORUM_ROUNDED, color=C_TEXTO_3, size=42),
+                            ft.Text("Sin mensajes en este hilo todavía.", size=13,
+                                    color=C_TEXTO_3, italic=True, font_family="Saira"),
+                            ft.Text("Probá apretar 'Recargar hilo' o iniciar la conversación abajo.",
+                                    size=11, color=C_TEXTO_3, font_family="Saira"),
+                        ],
+                    ),
+                )
+            )
+        else:
+            for m in msgs:
+                saliente = (m.get("direccion") == "saliente")
+                color    = C_MORADO if saliente else C_AZUL
+                bg       = C_MORADO_LIGHT if saliente else C_AZUL_LIGHT
+                etiq     = "ENVIADO" if saliente else "RECIBIDO"
+
+                cuerpo_text = (m.get("body") or "").strip()
+                # Recortar quotes pesados (líneas que empiezan con ">")
+                lineas = cuerpo_text.split("\n")
+                limpio = []
+                for ln in lineas:
+                    if ln.lstrip().startswith(">"):
+                        continue
+                    if ln.strip().startswith("On ") and "wrote:" in ln:
+                        break
+                    if "El " in ln and "escribió:" in ln:
+                        break
+                    limpio.append(ln)
+                cuerpo_text = "\n".join(limpio).strip() or cuerpo_text
+
+                burbuja = ft.Container(
+                    bgcolor=bg,
+                    border=borde_all(1, color + "40"),
+                    border_radius=ft.BorderRadius(12, 12, 12, 12),
+                    padding=ft.Padding(14, 12, 14, 12),
+                    content=ft.Column(
+                        spacing=6,
+                        controls=[
+                            ft.Row(
+                                vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                                controls=[
+                                    ft.Container(
+                                        bgcolor=color,
+                                        border_radius=ft.BorderRadius(4, 4, 4, 4),
+                                        padding=ft.Padding(6, 1, 6, 1),
+                                        content=ft.Text(etiq, size=9, color=C_BLANCO,
+                                                        weight=ft.FontWeight.BOLD,
+                                                        font_family="Saira"),
+                                    ),
+                                    ft.Text(m.get("from", ""), size=12,
+                                            weight=ft.FontWeight.W_600,
+                                            color=C_TEXTO_1, font_family="Saira",
+                                            selectable=True, expand=True),
+                                    ft.Text(m.get("date", ""), size=10,
+                                            color=C_TEXTO_3, font_family="Saira"),
+                                ],
+                            ),
+                            ft.Text(m.get("subject", ""), size=11, color=C_TEXTO_2,
+                                    italic=True, font_family="Saira"),
+                            ft.Divider(height=1, color=color + "30"),
+                            ft.Text(cuerpo_text, size=13, color=C_TEXTO_1,
+                                    font_family="Saira", selectable=True),
+                        ],
+                    ),
+                )
+
+                fila = ft.Row(
+                    alignment=ft.MainAxisAlignment.END if saliente
+                              else ft.MainAxisAlignment.START,
+                    controls=[
+                        ft.Container(width=80) if saliente else ft.Container(),
+                        ft.Container(content=burbuja, expand=True),
+                        ft.Container(width=80) if not saliente else ft.Container(),
+                    ],
+                )
+                nuevos.append(fila)
+
+        lista_mensajes_hilo.controls = nuevos
+        safe_update()
+
+    def cargar_hilo(email_dest, asunto):
+        hilo_email_actual[0]  = email_dest or ""
+        hilo_asunto_actual[0] = asunto or ""
+        lbl_hilo_titulo.value = f"Hilo con {email_dest}" if email_dest else "Hilo"
+        ring_hilo.visible     = True
+        hilo_mensajes[0]      = []
+        _render_hilo_mensajes()
+        _flash_hilo("Trayendo conversación por IMAP...", C_AZUL, 60)
+
+        def trabajador():
+            try:
+                msgs = enviar_correos.obtener_hilo(email_dest, dias=180)
+                hilo_mensajes[0] = msgs
+                _flash_hilo(f"{len(msgs)} mensajes en el hilo.", C_EXITO, 2)
+            except Exception as ex:
+                _flash_hilo(f"Error al traer el hilo: {ex}", C_ROJO, 4)
+            finally:
+                ring_hilo.visible = False
+                _render_hilo_mensajes()
+
+        threading.Thread(target=trabajador, daemon=True).start()
+
+    def _enviar_respuesta_hilo(e=None):
+        cuerpo = tf_hilo_respuesta.value or ""
+        if not cuerpo.strip():
+            _flash_hilo("Escribí algo antes de enviar.", C_NARANJA, 3)
+            return
+        destino = hilo_email_actual[0]
+        if not destino:
+            _flash_hilo("No hay destinatario en este hilo.", C_ROJO, 3)
+            return
+
+        # Asunto: Re: del original sin acumular Re:Re:Re:
+        asunto_base = hilo_asunto_actual[0] or ""
+        asunto_limpio = re.sub(r"^(Re:|Fwd?:)\s*", "", asunto_base,
+                                flags=re.IGNORECASE).strip()
+        asunto = f"Re: {asunto_limpio}" if asunto_limpio else "Re:"
+
+        # Threading headers: usar el último mensaje del hilo
+        in_reply_to = ""
+        references  = ""
+        if hilo_mensajes[0]:
+            ultimo = hilo_mensajes[0][-1]
+            in_reply_to = ultimo.get("message_id", "")
+            ref_acum    = ultimo.get("references", "")
+            references  = (ref_acum + " " + in_reply_to).strip() if ref_acum else in_reply_to
+
+        btn_enviar_hilo.disabled = True
+        ring_hilo.visible        = True
+        _flash_hilo("Enviando respuesta...", C_AZUL, 60)
+        safe_update(btn_enviar_hilo, ring_hilo)
+
+        def trabajador():
+            ok, mensaje = enviar_correos.enviar_respuesta(
+                destino, asunto, cuerpo,
+                in_reply_to=in_reply_to or None,
+                references=references or None,
+            )
+            ring_hilo.visible        = False
+            btn_enviar_hilo.disabled = False
+            safe_update(btn_enviar_hilo, ring_hilo)
+            if ok:
+                _flash_hilo("Respuesta enviada. Recargando hilo...", C_EXITO, 3)
+                tf_hilo_respuesta.value = ""
+                safe_update(tf_hilo_respuesta)
+                import time as _t
+                _t.sleep(1.0)
+                cargar_hilo(destino, asunto_base)
+            else:
+                _flash_hilo(f"Falló: {mensaje}", C_ROJO, 5)
+
+        threading.Thread(target=trabajador, daemon=True).start()
+
+    def _volver_a_respuestas(e=None):
+        if ir_a_vista[0]:
+            ir_a_vista[0]("respuestas")
+
+    btn_enviar_hilo = ft.ElevatedButton(
+        "Enviar respuesta",
+        icon=ft.Icons.SEND_ROUNDED,
+        on_click=_enviar_respuesta_hilo,
+        style=ft.ButtonStyle(
+            bgcolor={ft.ControlState.DEFAULT: C_MORADO,
+                     ft.ControlState.HOVERED: C_MORADO_DARK},
+            color={ft.ControlState.DEFAULT: C_BLANCO},
+            shape=ft.RoundedRectangleBorder(radius=8),
+            padding=ft.Padding(20, 14, 20, 14),
+        ),
+    )
+
+    btn_recargar_hilo = ft.OutlinedButton(
+        "Recargar hilo",
+        icon=ft.Icons.REFRESH_ROUNDED,
+        on_click=lambda e: cargar_hilo(hilo_email_actual[0], hilo_asunto_actual[0]),
+        style=ft.ButtonStyle(
+            color={ft.ControlState.DEFAULT: C_MORADO},
+            side={ft.ControlState.DEFAULT: ft.BorderSide(1.2, C_MORADO)},
+            shape=ft.RoundedRectangleBorder(radius=8),
+            padding=ft.Padding(14, 10, 14, 10),
+        ),
+    )
+
+    btn_volver_hilo = ft.TextButton(
+        content=ft.Row(
+            spacing=4,
+            controls=[
+                ft.Icon(ft.Icons.ARROW_BACK_ROUNDED, color=C_MORADO, size=18),
+                ft.Text("Volver a Respuestas", size=13, color=C_MORADO,
+                        weight=ft.FontWeight.W_500, font_family="Saira"),
+            ],
+        ),
+        on_click=_volver_a_respuestas,
+    )
+
+    vista_hilo = ft.Column(
+        expand=True,
+        spacing=12,
+        controls=[
+            ft.Row(
+                vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                controls=[
+                    btn_volver_hilo,
+                    ft.Container(width=10),
+                    ft.Icon(ft.Icons.FORUM_ROUNDED, color=C_MORADO, size=22),
+                    ft.Column(
+                        spacing=2,
+                        expand=True,
+                        controls=[
+                            lbl_hilo_titulo,
+                            ft.Row(spacing=8,
+                                   controls=[ring_hilo, lbl_hilo_estado]),
+                        ],
+                    ),
+                    btn_recargar_hilo,
+                ],
+            ),
+            ft.Container(
+                expand=True,
+                bgcolor=C_FONDO,
+                border_radius=ft.BorderRadius(14, 14, 14, 14),
+                border=borde_all(1, C_BORDE),
+                content=lista_mensajes_hilo,
+            ),
+            ft.Container(
+                bgcolor=C_BLANCO,
+                border_radius=ft.BorderRadius(14, 14, 14, 14),
+                border=borde_all(1, C_BORDE),
+                padding=ft.Padding(16, 14, 16, 14),
+                content=ft.Column(
+                    spacing=10,
+                    controls=[
+                        tf_hilo_respuesta,
+                        ft.Row(
+                            controls=[
+                                ft.Text(
+                                    "Se envía manteniendo el hilo (In-Reply-To/References).",
+                                    size=11, color=C_TEXTO_3, italic=True,
+                                    font_family="Saira", expand=True,
+                                ),
+                                btn_enviar_hilo,
+                            ],
+                        ),
+                    ],
+                ),
             ),
         ],
     )
@@ -2243,6 +2629,10 @@ def main(page: ft.Page):
             lbl_topbar_titulo.value  = "Respuestas y reuniones"
             btn_iniciar.visible      = False
             _render_respuestas()
+        elif vista_key == "hilo":
+            contenedor_vista.content = vista_hilo
+            lbl_topbar_titulo.value  = "Conversación"
+            btn_iniciar.visible      = False
         elif vista_key == "historial":
             contenedor_vista.content = vista_historial
             lbl_topbar_titulo.value  = "Historial de campañas"

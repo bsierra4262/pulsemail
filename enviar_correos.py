@@ -627,8 +627,9 @@ def cargar_respuestas():
     return _cargar_respuestas_archivo()
 
 
-def enviar_respuesta(destino, asunto, cuerpo):
+def enviar_respuesta(destino, asunto, cuerpo, in_reply_to=None, references=None):
     """Envía un correo de texto plano usando las credenciales SMTP configuradas.
+    Si se pasa in_reply_to/references, los agrega para que Gmail mantenga el thread.
     Devuelve (ok: bool, mensaje: str)."""
     cfg = cargar_config()
     correo   = (cfg.get("correo")   or "").strip()
@@ -654,6 +655,10 @@ def enviar_respuesta(destino, asunto, cuerpo):
     msg["Subject"] = asunto
     msg["From"]    = correo
     msg["To"]      = destino
+    if in_reply_to:
+        msg["In-Reply-To"] = in_reply_to
+    if references:
+        msg["References"] = references
     msg.set_content(cuerpo)
 
     try:
@@ -669,6 +674,128 @@ def enviar_respuesta(destino, asunto, cuerpo):
     except Exception as e:
         logging.error(f"Error enviando respuesta a {destino}: {e}")
         return False, f"Error de envío: {e}"
+
+
+# ==========================================
+# 13. HILO DE CONVERSACIÓN (IMAP: INBOX + Sent)
+# ==========================================
+_BUZONES_SENT = [
+    '"[Gmail]/Sent Mail"',
+    '"[Gmail]/Enviados"',
+    '"Sent"',
+    '"Enviados"',
+    '"[Google Mail]/Sent Mail"',
+]
+
+
+def _parse_mensaje_imap(raw_msg, direccion):
+    asunto    = _decodificar_cabecera(raw_msg.get("Subject", ""))
+    fecha     = _decodificar_cabecera(raw_msg.get("Date", ""))
+    remitente = _decodificar_cabecera(raw_msg.get("From", ""))
+    destino   = _decodificar_cabecera(raw_msg.get("To", ""))
+    msg_id    = (raw_msg.get("Message-ID", "") or "").strip()
+    in_reply  = (raw_msg.get("In-Reply-To", "") or "").strip()
+    refs      = (raw_msg.get("References", "") or "").strip()
+    cuerpo    = _texto_correo(raw_msg)
+    if len(cuerpo) > 8000:
+        cuerpo = cuerpo[:8000] + "\n\n[... mensaje truncado ...]"
+
+    # Convertir fecha RFC2822 a datetime para ordenar
+    ts = ""
+    try:
+        from email.utils import parsedate_to_datetime
+        dt = parsedate_to_datetime(raw_msg.get("Date", ""))
+        if dt:
+            ts = dt.isoformat()
+    except Exception:
+        pass
+
+    return {
+        "direccion":   direccion,         # "entrante" o "saliente"
+        "from":        remitente,
+        "from_email":  _extraer_email(remitente),
+        "to":          destino,
+        "subject":     asunto,
+        "date":        fecha,
+        "ts":          ts,
+        "message_id":  msg_id,
+        "in_reply_to": in_reply,
+        "references":  refs,
+        "body":        cuerpo,
+    }
+
+
+def obtener_hilo(remitente, dias=180):
+    """Trae todos los correos enviados/recibidos con `remitente` en los últimos `dias`.
+    Devuelve lista ordenada cronológicamente."""
+    cfg = cargar_config()
+    imap_host = cfg.get("imap_host", "imap.gmail.com")
+    if not MI_CORREO() or not MI_PASSWORD() or not remitente:
+        return []
+
+    desde = (datetime.now() - timedelta(days=int(dias or 180))).strftime("%d-%b-%Y")
+    remitente = remitente.strip().lower()
+    mensajes = []
+    vistos_ids = set()
+
+    def _agregar(raw_msg, direccion):
+        m = _parse_mensaje_imap(raw_msg, direccion)
+        clave = m["message_id"] or f"{m['direccion']}|{m['ts']}|{m['subject'][:80]}"
+        if clave in vistos_ids:
+            return
+        vistos_ids.add(clave)
+        mensajes.append(m)
+
+    try:
+        with imaplib.IMAP4_SSL(imap_host) as mail:
+            mail.login(MI_CORREO(), MI_PASSWORD())
+
+            # ── Recibidos (FROM remitente) ───────────────────────────
+            try:
+                mail.select("inbox", readonly=True)
+                estado, ids = mail.search(
+                    None, f'(FROM "{remitente}" SINCE "{desde}")'
+                )
+                if estado == "OK" and ids and ids[0]:
+                    for num in ids[0].split():
+                        try:
+                            _, fetched = mail.fetch(num, "(RFC822)")
+                            for r in fetched:
+                                if isinstance(r, tuple):
+                                    _agregar(email.message_from_bytes(r[1]), "entrante")
+                        except Exception:
+                            continue
+            except Exception:
+                pass
+
+            # ── Enviados (TO remitente) ──────────────────────────────
+            for buzon in _BUZONES_SENT:
+                try:
+                    estado, _ = mail.select(buzon, readonly=True)
+                    if estado != "OK":
+                        continue
+                    estado, ids = mail.search(
+                        None, f'(TO "{remitente}" SINCE "{desde}")'
+                    )
+                    if estado == "OK" and ids and ids[0]:
+                        for num in ids[0].split():
+                            try:
+                                _, fetched = mail.fetch(num, "(RFC822)")
+                                for r in fetched:
+                                    if isinstance(r, tuple):
+                                        _agregar(email.message_from_bytes(r[1]),
+                                                  "saliente")
+                            except Exception:
+                                continue
+                        break  # usamos el primer buzón que matchea
+                except Exception:
+                    continue
+    except Exception as e:
+        logging.error(f"Error obteniendo hilo de {remitente}: {e}")
+        return []
+
+    mensajes.sort(key=lambda m: m.get("ts", ""))
+    return mensajes
 
 
 def _extraer_email(cabecera):
