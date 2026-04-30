@@ -1,5 +1,5 @@
-import os, csv, json, time, random, smtplib, imaplib, email, re, mimetypes, logging
-from datetime import datetime
+import os, csv, json, time, random, smtplib, imaplib, email, email.header, re, mimetypes, logging
+from datetime import datetime, timedelta
 from email.message import EmailMessage
 
 # ==========================================
@@ -20,6 +20,8 @@ ARCHIVO_CONFIG    = os.path.join(CARPETA_ACTUAL, "config.json")
 ARCHIVO_CSV       = os.path.join(CARPETA_ACTUAL, "contactos.csv")
 LOG_PROGRESO      = os.path.join(CARPETA_ACTUAL, "registro_envios.json")
 ARCHIVO_RECHAZOS  = os.path.join(CARPETA_ACTUAL, "registro_rechazados.json")
+ARCHIVO_DEPURADOS = os.path.join(CARPETA_ACTUAL, "registro_depurados.json")
+ARCHIVO_RESPUESTAS = os.path.join(CARPETA_ACTUAL, "registro_respuestas.json")
 CARPETA_HISTORIAL = os.path.join(CARPETA_ACTUAL, "historial")
 
 # Configuración de los correos a enviar
@@ -466,6 +468,342 @@ def main():
         guardar_evento_historial(hoy, "info", msg, enviados=enviados)
 
     revisar_rebotes(hoy, enviados)
+
+
+# ==========================================
+# 9. RECHAZADOS: vista global y depurados
+# ==========================================
+def cargar_rechazados_todos():
+    """Devuelve lista [{email, fecha}] de todos los rechazados conocidos, sin duplicar."""
+    if not os.path.exists(ARCHIVO_RECHAZOS):
+        return []
+    try:
+        with open(ARCHIVO_RECHAZOS, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        return []
+
+    vistos = {}
+    for fecha in sorted(data.keys()):
+        bloque = data.get(fecha) or {}
+        for c in bloque.get("correos", []):
+            c_lower = (c or "").strip().lower()
+            if not c_lower:
+                continue
+            if c_lower not in vistos:
+                vistos[c_lower] = {"email": c_lower, "fecha": fecha}
+    return list(vistos.values())
+
+
+def cargar_depurados():
+    """Set de correos marcados como ya depurados (ocultos en la pestaña)."""
+    if not os.path.exists(ARCHIVO_DEPURADOS):
+        return set()
+    try:
+        with open(ARCHIVO_DEPURADOS, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return set((c or "").lower() for c in data.get("depurados", []))
+    except Exception:
+        return set()
+
+
+def _guardar_depurados(conjunto):
+    with open(ARCHIVO_DEPURADOS, "w", encoding="utf-8") as f:
+        json.dump({"depurados": sorted(conjunto)}, f, indent=2, ensure_ascii=False)
+
+
+def marcar_depurado(email):
+    actuales = cargar_depurados()
+    actuales.add((email or "").strip().lower())
+    _guardar_depurados(actuales)
+
+
+def desmarcar_depurado(email):
+    actuales = cargar_depurados()
+    actuales.discard((email or "").strip().lower())
+    _guardar_depurados(actuales)
+
+
+# ==========================================
+# 10. ESTADÍSTICAS GLOBALES (todos los días)
+# ==========================================
+def obtener_estadisticas_globales():
+    """Suma enviados/rechazados de todo el historial. Devuelve también serie por día."""
+    total_env = 0
+    total_reb = 0
+    serie = []
+    if not os.path.exists(CARPETA_HISTORIAL):
+        return {"total_enviados": 0, "total_rechazados": 0, "serie": []}
+
+    for año in sorted(os.listdir(CARPETA_HISTORIAL)):
+        ruta_año = os.path.join(CARPETA_HISTORIAL, año)
+        if not os.path.isdir(ruta_año):
+            continue
+        for mes in sorted(os.listdir(ruta_año)):
+            ruta_mes = os.path.join(ruta_año, mes)
+            if not os.path.isdir(ruta_mes):
+                continue
+            for arch in sorted(os.listdir(ruta_mes)):
+                if not arch.endswith(".json"):
+                    continue
+                try:
+                    with open(os.path.join(ruta_mes, arch), "r", encoding="utf-8") as f:
+                        d = json.load(f)
+                    env = int(d.get("enviados", 0) or 0)
+                    reb = int(d.get("rebotes", 0) or 0)
+                    total_env += env
+                    total_reb += reb
+                    serie.append({"fecha": arch.replace(".json", ""),
+                                  "enviados": env, "rechazados": reb})
+                except Exception:
+                    continue
+
+    return {"total_enviados": total_env, "total_rechazados": total_reb, "serie": serie}
+
+
+# ==========================================
+# 11. CONTACTOS: utilidades
+# ==========================================
+def emails_de_contactos():
+    """Devuelve set de todos los correos válidos del CSV (los 3 campos)."""
+    correos = set()
+    if not os.path.exists(ARCHIVO_CSV):
+        return correos
+    try:
+        with open(ARCHIVO_CSV, "r", encoding="utf-8") as f:
+            for fila in csv.DictReader(f):
+                for campo in ("Correo electrónico",
+                              "Correo electrónico secundario",
+                              "Correo electrónico terciario"):
+                    valor = (fila.get(campo) or "").strip().lower()
+                    if valor:
+                        correos.add(valor)
+    except Exception:
+        pass
+    return correos
+
+
+def contar_contactos():
+    """Cuenta filas válidas del CSV sin cargarlas todas en memoria."""
+    if not os.path.exists(ARCHIVO_CSV):
+        return 0
+    total = 0
+    try:
+        with open(ARCHIVO_CSV, "r", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            for _ in reader:
+                total += 1
+    except Exception:
+        return 0
+    return total
+
+
+# ==========================================
+# 12. RESPUESTAS DE CLIENTES + CALENDLY (IMAP)
+# ==========================================
+_DOMINIOS_CALENDLY = ("calendly.com",)
+
+
+def _cargar_respuestas_archivo():
+    if not os.path.exists(ARCHIVO_RESPUESTAS):
+        return {"respuestas": [], "calendly": []}
+    try:
+        with open(ARCHIVO_RESPUESTAS, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        data.setdefault("respuestas", [])
+        data.setdefault("calendly", [])
+        return data
+    except Exception:
+        return {"respuestas": [], "calendly": []}
+
+
+def _guardar_respuestas_archivo(data):
+    with open(ARCHIVO_RESPUESTAS, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+
+
+def cargar_respuestas():
+    """API pública: devuelve dict {respuestas: [...], calendly: [...]}."""
+    return _cargar_respuestas_archivo()
+
+
+def enviar_respuesta(destino, asunto, cuerpo):
+    """Envía un correo de texto plano usando las credenciales SMTP configuradas.
+    Devuelve (ok: bool, mensaje: str)."""
+    cfg = cargar_config()
+    correo   = (cfg.get("correo")   or "").strip()
+    password = (cfg.get("password") or "").strip()
+    host     = (cfg.get("smtp_host") or "smtp.gmail.com").strip()
+    try:
+        port = int(cfg.get("smtp_port", 587) or 587)
+    except (ValueError, TypeError):
+        port = 587
+
+    destino = (destino or "").strip()
+    asunto  = (asunto  or "").strip()
+    cuerpo  = cuerpo or ""
+
+    if not correo or not password:
+        return False, "Sin credenciales en config.json"
+    if not destino:
+        return False, "Falta el destinatario"
+    if not asunto:
+        return False, "Falta el asunto"
+
+    msg = EmailMessage()
+    msg["Subject"] = asunto
+    msg["From"]    = correo
+    msg["To"]      = destino
+    msg.set_content(cuerpo)
+
+    try:
+        with smtplib.SMTP(host, port, timeout=20) as server:
+            server.starttls()
+            server.login(correo, password)
+            server.send_message(msg)
+        return True, "Correo enviado"
+    except smtplib.SMTPAuthenticationError:
+        return False, "Credenciales inválidas"
+    except smtplib.SMTPRecipientsRefused:
+        return False, "Destinatario rechazado"
+    except Exception as e:
+        logging.error(f"Error enviando respuesta a {destino}: {e}")
+        return False, f"Error de envío: {e}"
+
+
+def _extraer_email(cabecera):
+    if not cabecera:
+        return ""
+    m = re.search(r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+", cabecera)
+    return m.group(0).lower() if m else ""
+
+
+def _decodificar_cabecera(valor):
+    if not valor:
+        return ""
+    try:
+        partes = email.header.decode_header(valor)
+        salida = []
+        for texto, enc in partes:
+            if isinstance(texto, bytes):
+                salida.append(texto.decode(enc or "utf-8", errors="ignore"))
+            else:
+                salida.append(texto)
+        return "".join(salida)
+    except Exception:
+        return str(valor)
+
+
+def _texto_correo(mensaje):
+    if mensaje.is_multipart():
+        partes = []
+        for p in mensaje.walk():
+            if p.get_content_type() == "text/plain":
+                try:
+                    partes.append(p.get_payload(decode=True).decode("utf-8", "ignore"))
+                except Exception:
+                    continue
+        return "\n".join(partes)
+    try:
+        return mensaje.get_payload(decode=True).decode("utf-8", "ignore")
+    except Exception:
+        return ""
+
+
+def detectar_respuestas_y_calendly(dias=30):
+    """
+    Busca por IMAP en los últimos `dias`:
+      - Respuestas: correos cuyo From coincide con un contacto del CSV.
+      - Calendly: correos de Calendly cuya confirmación menciona un contacto del CSV.
+    Persiste en registro_respuestas.json y devuelve el dict.
+    """
+    cfg = cargar_config()
+    imap_host = cfg.get("imap_host", "imap.gmail.com")
+    if not MI_CORREO() or not MI_PASSWORD():
+        return _cargar_respuestas_archivo()
+
+    contactos = emails_de_contactos()
+    if not contactos:
+        return _cargar_respuestas_archivo()
+
+    data = _cargar_respuestas_archivo()
+    vistos_resp = {(r.get("uid"), r.get("from")) for r in data["respuestas"]}
+    vistos_cal  = {c.get("uid") for c in data["calendly"]}
+
+    try:
+        desde = datetime.now() - timedelta(days=int(dias))
+    except Exception:
+        desde = datetime.now() - timedelta(days=30)
+    fecha_imap = desde.strftime("%d-%b-%Y")
+
+    try:
+        with imaplib.IMAP4_SSL(imap_host) as mail:
+            mail.login(MI_CORREO(), MI_PASSWORD())
+            mail.select("inbox")
+
+            estado, msgs = mail.search(None, f'(SINCE "{fecha_imap}")')
+            if estado != "OK" or not msgs or not msgs[0]:
+                _guardar_respuestas_archivo(data)
+                return data
+
+            ids = msgs[0].split()
+            for num_id in ids:
+                try:
+                    _, fetched = mail.fetch(num_id, "(RFC822)")
+                except Exception:
+                    continue
+                for respuesta in fetched:
+                    if not isinstance(respuesta, tuple):
+                        continue
+                    msg = email.message_from_bytes(respuesta[1])
+                    remitente_raw = _decodificar_cabecera(msg.get("From", ""))
+                    remitente     = _extraer_email(remitente_raw)
+                    asunto        = _decodificar_cabecera(msg.get("Subject", ""))
+                    fecha_msg     = _decodificar_cabecera(msg.get("Date", ""))
+                    uid           = msg.get("Message-ID", "") or num_id.decode("utf-8", "ignore")
+
+                    if not remitente or "daemon" in remitente:
+                        continue
+                    if remitente == (MI_CORREO() or "").lower():
+                        continue
+
+                    es_calendly = any(d in remitente for d in _DOMINIOS_CALENDLY)
+
+                    if es_calendly:
+                        if uid in vistos_cal:
+                            continue
+                        cuerpo = _texto_correo(msg)
+                        invitado = ""
+                        for c in re.findall(r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+",
+                                            cuerpo):
+                            cl = c.lower()
+                            if cl in contactos:
+                                invitado = cl
+                                break
+                        data["calendly"].append({
+                            "uid":      uid,
+                            "from":     remitente,
+                            "subject":  asunto,
+                            "date":     fecha_msg,
+                            "invitado": invitado,
+                        })
+                        vistos_cal.add(uid)
+                    elif remitente in contactos:
+                        clave = (uid, remitente)
+                        if clave in vistos_resp:
+                            continue
+                        data["respuestas"].append({
+                            "uid":     uid,
+                            "from":    remitente,
+                            "subject": asunto,
+                            "date":    fecha_msg,
+                        })
+                        vistos_resp.add(clave)
+    except Exception as e:
+        logging.error(f"No se pudo escanear respuestas: {e}")
+
+    _guardar_respuestas_archivo(data)
+    return data
 
 
 if __name__ == "__main__":
