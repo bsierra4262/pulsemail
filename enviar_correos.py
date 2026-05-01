@@ -1,6 +1,7 @@
-import os, csv, json, time, random, smtplib, imaplib, email, email.header, re, mimetypes, logging
+import os, csv, json, time, random, smtplib, imaplib, email, email.header, re, mimetypes, logging, base64
 from datetime import datetime, timedelta
 from email.message import EmailMessage
+from email.utils import formatdate, make_msgid, parsedate_to_datetime
 
 # ==========================================
 # 1. PARÁMETROS DEL SISTEMA Y LOGS
@@ -652,9 +653,17 @@ def enviar_respuesta(destino, asunto, cuerpo, in_reply_to=None, references=None)
         return False, "Falta el asunto"
 
     msg = EmailMessage()
-    msg["Subject"] = asunto
-    msg["From"]    = correo
-    msg["To"]      = destino
+    msg["Subject"]    = asunto
+    msg["From"]       = correo
+    msg["To"]         = destino
+    # Date con timezone local de la PC (ej: -0300 si estás en Buenos Aires)
+    msg["Date"]       = formatdate(localtime=True)
+    # Message-ID propio para que las respuestas posteriores hagan threading bien
+    try:
+        dominio = correo.split("@", 1)[1] if "@" in correo else "localhost"
+        msg["Message-ID"] = make_msgid(domain=dominio)
+    except Exception:
+        msg["Message-ID"] = make_msgid()
     if in_reply_to:
         msg["In-Reply-To"] = in_reply_to
     if references:
@@ -696,14 +705,16 @@ def _parse_mensaje_imap(raw_msg, direccion):
     msg_id    = (raw_msg.get("Message-ID", "") or "").strip()
     in_reply  = (raw_msg.get("In-Reply-To", "") or "").strip()
     refs      = (raw_msg.get("References", "") or "").strip()
-    cuerpo    = _texto_correo(raw_msg)
-    if len(cuerpo) > 8000:
-        cuerpo = cuerpo[:8000] + "\n\n[... mensaje truncado ...]"
+
+    # Extracción rica: texto plano, HTML con cid resueltos, y markdown
+    texto, html, _imgs = _partes_correo(raw_msg)
+    body_md = _html_a_markdown(html) if html else (texto or "")
+    if len(body_md) > 16000:
+        body_md = body_md[:16000] + "\n\n_[... mensaje truncado ...]_"
 
     # Convertir fecha RFC2822 a datetime para ordenar
     ts = ""
     try:
-        from email.utils import parsedate_to_datetime
         dt = parsedate_to_datetime(raw_msg.get("Date", ""))
         if dt:
             ts = dt.isoformat()
@@ -711,7 +722,7 @@ def _parse_mensaje_imap(raw_msg, direccion):
         pass
 
     return {
-        "direccion":   direccion,         # "entrante" o "saliente"
+        "direccion":   direccion,
         "from":        remitente,
         "from_email":  _extraer_email(remitente),
         "to":          destino,
@@ -721,12 +732,15 @@ def _parse_mensaje_imap(raw_msg, direccion):
         "message_id":  msg_id,
         "in_reply_to": in_reply,
         "references":  refs,
-        "body":        cuerpo,
+        "body":        texto or body_md,
+        "body_md":     body_md,
+        "has_html":    bool(html),
     }
 
 
-def obtener_hilo(remitente, dias=180):
-    """Trae todos los correos enviados/recibidos con `remitente` en los últimos `dias`.
+def obtener_hilo(remitente, asunto=None, dias=180):
+    """Trae los correos enviados/recibidos con `remitente` en los últimos `dias`,
+    filtrando por `asunto` (base, sin Re:/Fwd:) si se pasa.
     Devuelve lista ordenada cronológicamente."""
     cfg = cargar_config()
     imap_host = cfg.get("imap_host", "imap.gmail.com")
@@ -735,6 +749,8 @@ def obtener_hilo(remitente, dias=180):
 
     desde = (datetime.now() - timedelta(days=int(dias or 180))).strftime("%d-%b-%Y")
     remitente = remitente.strip().lower()
+    asunto_base = re.sub(r"^\s*(Re:|Fwd?:)\s*", "", asunto or "",
+                          flags=re.IGNORECASE).strip().lower()
     mensajes = []
     vistos_ids = set()
 
@@ -794,6 +810,16 @@ def obtener_hilo(remitente, dias=180):
         logging.error(f"Error obteniendo hilo de {remitente}: {e}")
         return []
 
+    # Filtrar por asunto base si se pidió: el subject limpio del mensaje
+    # debe contener el asunto base de la conversación.
+    if asunto_base:
+        def _coincide(msg):
+            sub = re.sub(r"^\s*(Re:|Fwd?:)\s*", "", msg.get("subject", "") or "",
+                         flags=re.IGNORECASE).strip().lower()
+            return asunto_base in sub or sub in asunto_base
+
+        mensajes = [m for m in mensajes if _coincide(m)]
+
     mensajes.sort(key=lambda m: m.get("ts", ""))
     return mensajes
 
@@ -835,6 +861,128 @@ def _texto_correo(mensaje):
         return mensaje.get_payload(decode=True).decode("utf-8", "ignore")
     except Exception:
         return ""
+
+
+def _partes_correo(mensaje):
+    """Devuelve (texto_plano, html, imagenes_cid) extraídos del mensaje.
+    `imagenes_cid` es dict {cid: data_url_base64} para imágenes embebidas."""
+    texto = []
+    html  = []
+    imgs  = {}
+
+    if mensaje.is_multipart():
+        for p in mensaje.walk():
+            ctype = p.get_content_type()
+            cdisp = str(p.get("Content-Disposition") or "").lower()
+
+            if ctype == "text/plain" and "attachment" not in cdisp:
+                try:
+                    texto.append(p.get_payload(decode=True).decode("utf-8", "ignore"))
+                except Exception:
+                    pass
+            elif ctype == "text/html" and "attachment" not in cdisp:
+                try:
+                    html.append(p.get_payload(decode=True).decode("utf-8", "ignore"))
+                except Exception:
+                    pass
+            elif ctype.startswith("image/"):
+                cid = (p.get("Content-ID") or "").strip().strip("<>").strip()
+                if cid:
+                    try:
+                        data = p.get_payload(decode=True)
+                        b64  = base64.b64encode(data).decode("ascii")
+                        imgs[cid] = f"data:{ctype};base64,{b64}"
+                    except Exception:
+                        pass
+    else:
+        try:
+            payload = mensaje.get_payload(decode=True).decode("utf-8", "ignore")
+            if mensaje.get_content_type() == "text/html":
+                html.append(payload)
+            else:
+                texto.append(payload)
+        except Exception:
+            pass
+
+    texto_final = "\n".join(texto).strip()
+    html_final  = "\n".join(html).strip()
+
+    # Reemplazar cid: por data URLs base64 directamente en el HTML
+    if html_final and imgs:
+        for cid, durl in imgs.items():
+            html_final = html_final.replace(f"cid:{cid}", durl)
+            html_final = html_final.replace(f'"cid:{cid}"', f'"{durl}"')
+            html_final = html_final.replace(f"'cid:{cid}'", f"'{durl}'")
+
+    return texto_final, html_final, imgs
+
+
+def _html_a_markdown(html_str):
+    """Conversión HTML→Markdown sin dependencias externas. Preserva bold/italic,
+    links, imágenes (incluso data: URLs), saltos de línea y headings."""
+    if not html_str:
+        return ""
+
+    s = html_str
+
+    # Quitar bloques que no aportan
+    s = re.sub(r"<style[^>]*>.*?</style>", "", s, flags=re.DOTALL | re.IGNORECASE)
+    s = re.sub(r"<script[^>]*>.*?</script>", "", s, flags=re.DOTALL | re.IGNORECASE)
+    s = re.sub(r"<head[^>]*>.*?</head>",   "", s, flags=re.DOTALL | re.IGNORECASE)
+    s = re.sub(r"<!--.*?-->",              "", s, flags=re.DOTALL)
+
+    # Saltos de línea estructurales
+    s = re.sub(r"<br\s*/?>",                  "\n",   s, flags=re.IGNORECASE)
+    s = re.sub(r"</p\s*>",                    "\n\n", s, flags=re.IGNORECASE)
+    s = re.sub(r"</(?:div|tr|li|h[1-6])\s*>", "\n",   s, flags=re.IGNORECASE)
+    s = re.sub(r"<li[^>]*>",                  "- ",   s, flags=re.IGNORECASE)
+    s = re.sub(r"<hr\s*/?>",                  "\n---\n", s, flags=re.IGNORECASE)
+
+    # Headings
+    s = re.sub(r"<h([1-6])[^>]*>",
+               lambda m: "\n" + "#" * int(m.group(1)) + " ", s,
+               flags=re.IGNORECASE)
+
+    # Énfasis
+    s = re.sub(r"<(?:strong|b)\s*>", "**", s, flags=re.IGNORECASE)
+    s = re.sub(r"</(?:strong|b)\s*>", "**", s, flags=re.IGNORECASE)
+    s = re.sub(r"<(?:em|i)\s*>",     "*",  s, flags=re.IGNORECASE)
+    s = re.sub(r"</(?:em|i)\s*>",    "*",  s, flags=re.IGNORECASE)
+
+    # Links: <a href="X">Y</a> -> [Y](X)
+    s = re.sub(
+        r'<a[^>]*href\s*=\s*["\']([^"\']*)["\'][^>]*>(.*?)</a>',
+        lambda m: f"[{re.sub(r'<[^>]+>', '', m.group(2)).strip() or m.group(1)}]({m.group(1)})",
+        s, flags=re.IGNORECASE | re.DOTALL,
+    )
+
+    # Imágenes: <img src="X" alt="Y"> -> ![Y](X)
+    def _img_repl(m):
+        tag = m.group(0)
+        src = re.search(r'src\s*=\s*["\']([^"\']*)["\']', tag, flags=re.IGNORECASE)
+        alt = re.search(r'alt\s*=\s*["\']([^"\']*)["\']', tag, flags=re.IGNORECASE)
+        url = src.group(1) if src else ""
+        txt = alt.group(1) if alt else ""
+        if not url:
+            return ""
+        return f"![{txt}]({url})"
+    s = re.sub(r"<img[^>]*/?>", _img_repl, s, flags=re.IGNORECASE)
+
+    # Quitar tags restantes
+    s = re.sub(r"<[^>]+>", "", s)
+
+    # Decodificar entidades HTML (&amp;, &nbsp;, &quot;, etc.)
+    try:
+        import html as _html_mod
+        s = _html_mod.unescape(s)
+    except Exception:
+        pass
+
+    # Limpieza de whitespace
+    s = re.sub(r"[ \t]+\n", "\n", s)
+    s = re.sub(r"\n{3,}",   "\n\n", s)
+    s = "\n".join(line.rstrip() for line in s.split("\n"))
+    return s.strip()
 
 
 def detectar_respuestas_y_calendly(dias=30):

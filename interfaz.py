@@ -124,6 +124,7 @@ def main(page: ft.Page):
     vista_actual   = ["dashboard"]
     fecha_actual   = [_hoy]
     ir_a_vista     = [None]  # se setea más abajo cuando definimos nav_item
+    respuestas_no_vistas = [0]  # contador para el badge del sidebar
 
     # ── Helper de refresco seguro (Flet 0.84 a veces no propaga desde threads) ──
     def safe_update(*controles):
@@ -2060,19 +2061,35 @@ def main(page: ft.Page):
                 bg       = C_MORADO_LIGHT if saliente else C_AZUL_LIGHT
                 etiq     = "ENVIADO" if saliente else "RECIBIDO"
 
-                cuerpo_text = (m.get("body") or "").strip()
-                # Recortar quotes pesados (líneas que empiezan con ">")
-                lineas = cuerpo_text.split("\n")
+                # Cuerpo: preferir markdown del HTML; fallback a texto plano
+                cuerpo_raw = (m.get("body_md") or m.get("body") or "").strip()
+                # Recortar quotes y bloques tipo "On ... wrote:" / "El ... escribió:"
+                lineas = cuerpo_raw.split("\n")
                 limpio = []
                 for ln in lineas:
-                    if ln.lstrip().startswith(">"):
+                    stripped = ln.lstrip()
+                    if stripped.startswith(">"):
                         continue
-                    if ln.strip().startswith("On ") and "wrote:" in ln:
+                    if stripped.startswith("On ") and "wrote:" in stripped:
                         break
-                    if "El " in ln and "escribió:" in ln:
+                    if stripped.startswith("El ") and "escribió:" in stripped:
                         break
                     limpio.append(ln)
-                cuerpo_text = "\n".join(limpio).strip() or cuerpo_text
+                cuerpo_md = "\n".join(limpio).strip() or cuerpo_raw
+
+                if m.get("has_html"):
+                    contenido_cuerpo = ft.Markdown(
+                        cuerpo_md,
+                        extension_set=ft.MarkdownExtensionSet.GITHUB_FLAVORED,
+                        selectable=True,
+                        auto_follow_links=True,
+                        on_tap_link=lambda e: page.launch_url(e.data),
+                    )
+                else:
+                    contenido_cuerpo = ft.Text(
+                        cuerpo_md, size=13, color=C_TEXTO_1,
+                        font_family="Saira", selectable=True,
+                    )
 
                 burbuja = ft.Container(
                     bgcolor=bg,
@@ -2104,8 +2121,7 @@ def main(page: ft.Page):
                             ft.Text(m.get("subject", ""), size=11, color=C_TEXTO_2,
                                     italic=True, font_family="Saira"),
                             ft.Divider(height=1, color=color + "30"),
-                            ft.Text(cuerpo_text, size=13, color=C_TEXTO_1,
-                                    font_family="Saira", selectable=True),
+                            contenido_cuerpo,
                         ],
                     ),
                 )
@@ -2135,7 +2151,9 @@ def main(page: ft.Page):
 
         def trabajador():
             try:
-                msgs = enviar_correos.obtener_hilo(email_dest, dias=180)
+                msgs = enviar_correos.obtener_hilo(
+                    email_dest, asunto=asunto, dias=180,
+                )
                 hilo_mensajes[0] = msgs
                 _flash_hilo(f"{len(msgs)} mensajes en el hilo.", C_EXITO, 2)
             except Exception as ex:
@@ -2628,6 +2646,8 @@ def main(page: ft.Page):
             contenedor_vista.content = vista_respuestas
             lbl_topbar_titulo.value  = "Respuestas y reuniones"
             btn_iniciar.visible      = False
+            respuestas_no_vistas[0]  = 0
+            _actualizar_badge_respuestas()
             _render_respuestas()
         elif vista_key == "hilo":
             contenedor_vista.content = vista_hilo
@@ -2653,26 +2673,50 @@ def main(page: ft.Page):
 
     ir_a_vista[0] = cambiar_vista
 
-    def nav_item(label, icono, vista_key, activo=False):
+    # Badge para "Respuestas" (cantidad de no leídas)
+    lbl_badge_resp_text = ft.Text(
+        "", size=10, color=C_BLANCO,
+        weight=ft.FontWeight.BOLD, font_family="Saira",
+    )
+    lbl_badge_respuestas = ft.Container(
+        bgcolor=C_ROJO,
+        border_radius=ft.BorderRadius(10, 10, 10, 10),
+        padding=ft.Padding(6, 1, 6, 1),
+        content=lbl_badge_resp_text,
+        visible=False,
+    )
+
+    def _actualizar_badge_respuestas():
+        n = respuestas_no_vistas[0]
+        if n > 0:
+            lbl_badge_resp_text.value = str(n) if n <= 99 else "99+"
+            lbl_badge_respuestas.visible = True
+        else:
+            lbl_badge_respuestas.visible = False
+        safe_update(lbl_badge_resp_text, lbl_badge_respuestas)
+
+    def nav_item(label, icono, vista_key, activo=False, badge=None):
+        controles = [
+            ft.Icon(icono,
+                    color=C_MORADO if activo else C_TEXTO_3,
+                    size=20),
+            ft.Text(label,
+                    color=C_MORADO if activo else C_TEXTO_2,
+                    size=14,
+                    weight=ft.FontWeight.BOLD if activo else ft.FontWeight.NORMAL,
+                    font_family="Saira"),
+        ]
+        if badge is not None:
+            controles.append(ft.Container(expand=True))
+            controles.append(badge)
+
         cont = ft.Container(
             border_radius=ft.BorderRadius(10, 10, 10, 10),
             bgcolor=C_MORADO_LIGHT if activo else ft.Colors.TRANSPARENT,
             padding=ft.Padding(14, 11, 14, 11),
             on_click=lambda e, vk=vista_key: cambiar_vista(vk),
             ink=True,
-            content=ft.Row(
-                spacing=12,
-                controls=[
-                    ft.Icon(icono,
-                            color=C_MORADO if activo else C_TEXTO_3,
-                            size=20),
-                    ft.Text(label,
-                            color=C_MORADO if activo else C_TEXTO_2,
-                            size=14,
-                            weight=ft.FontWeight.BOLD if activo else ft.FontWeight.NORMAL,
-                            font_family="Saira"),
-                ],
-            ),
+            content=ft.Row(spacing=12, controls=controles),
         )
         nav_items_refs[vista_key] = cont
         return cont
@@ -2737,6 +2781,45 @@ def main(page: ft.Page):
 
     threading.Thread(target=watcher_dashboard, daemon=True).start()
 
+    # ── Watcher de respuestas: polling IMAP cada 30s (rápido, dias=2) ──
+    def watcher_respuestas():
+        import time as _time
+        _time.sleep(8)  # delay inicial para que arranque la UI tranquila
+        while True:
+            cfg = enviar_correos.cargar_config()
+            if cfg.get("correo") and cfg.get("password"):
+                try:
+                    antes = enviar_correos.cargar_respuestas()
+                    n_antes_resp = len(antes.get("respuestas", []))
+                    n_antes_cal  = len(antes.get("calendly", []))
+
+                    enviar_correos.detectar_respuestas_y_calendly(dias=2)
+
+                    despues     = enviar_correos.cargar_respuestas()
+                    n_desp_resp = len(despues.get("respuestas", []))
+                    n_desp_cal  = len(despues.get("calendly", []))
+
+                    nuevas_resp = max(0, n_desp_resp - n_antes_resp)
+                    nuevas_cal  = max(0, n_desp_cal  - n_antes_cal)
+                    total_nuevas = nuevas_resp + nuevas_cal
+
+                    if total_nuevas > 0:
+                        if vista_actual[0] == "respuestas":
+                            # El usuario está mirando: no acumula badge, sólo refresca
+                            _render_respuestas()
+                        else:
+                            respuestas_no_vistas[0] += total_nuevas
+                            _actualizar_badge_respuestas()
+                            agregar_log(
+                                "info",
+                                f"{total_nuevas} nueva(s) respuesta(s) detectada(s) por IMAP."
+                            )
+                except Exception:
+                    pass
+            _time.sleep(30)
+
+    threading.Thread(target=watcher_respuestas, daemon=True).start()
+
     # ── Header del sidebar con LOGO ITH ──────────────────────────
     logo_path = os.path.join(CARPETA_ACTUAL, "ITH-logo.png")
     if os.path.exists(logo_path):
@@ -2795,7 +2878,8 @@ def main(page: ft.Page):
                             nav_item("Dashboard",      ft.Icons.DASHBOARD_ROUNDED,         "dashboard",     True),
                             nav_item("Contactos",      ft.Icons.PEOPLE_ALT_ROUNDED,        "contactos"),
                             nav_item("Rechazados",     ft.Icons.REPORT_GMAILERRORRED_ROUNDED, "rechazados"),
-                            nav_item("Respuestas",     ft.Icons.MARK_EMAIL_READ_ROUNDED,   "respuestas"),
+                            nav_item("Respuestas",     ft.Icons.MARK_EMAIL_READ_ROUNDED,   "respuestas",
+                                     badge=lbl_badge_respuestas),
                             nav_item("Estadísticas",   ft.Icons.ANALYTICS_ROUNDED,         "estadisticas"),
                             nav_item("Historial",      ft.Icons.HISTORY_ROUNDED,           "historial"),
                             nav_item("Configuración",  ft.Icons.SETTINGS_ROUNDED,          "configuracion"),
