@@ -23,6 +23,7 @@ LOG_PROGRESO      = os.path.join(CARPETA_ACTUAL, "registro_envios.json")
 ARCHIVO_RECHAZOS  = os.path.join(CARPETA_ACTUAL, "registro_rechazados.json")
 ARCHIVO_DEPURADOS = os.path.join(CARPETA_ACTUAL, "registro_depurados.json")
 ARCHIVO_RESPUESTAS = os.path.join(CARPETA_ACTUAL, "registro_respuestas.json")
+ARCHIVO_VISTOS    = os.path.join(CARPETA_ACTUAL, "registro_vistos.json")
 CARPETA_HISTORIAL = os.path.join(CARPETA_ACTUAL, "historial")
 
 # Configuración de los correos a enviar
@@ -55,6 +56,10 @@ _CONFIG_DEFAULTS = {
     "smtp_host":     "smtp.gmail.com",
     "smtp_port":     587,
     "imap_host":     "imap.gmail.com",
+    "tema":          "sistema",   # 'claro' | 'oscuro' | 'sistema'
+    "firma":         "",          # firma personal del usuario (texto plano)
+    "firma_tipo":    "texto",     # 'texto' | 'imagen'
+    "firma_imagen":  "",          # ruta absoluta a la imagen de firma
 }
 
 def cargar_config():
@@ -525,6 +530,46 @@ def desmarcar_depurado(email):
     _guardar_depurados(actuales)
 
 
+def cargar_vistos():
+    """Set de claves de hilos/respuestas ya vistas por el usuario."""
+    if not os.path.exists(ARCHIVO_VISTOS):
+        return set()
+    try:
+        with open(ARCHIVO_VISTOS, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return set(data.get("vistos", []))
+    except Exception:
+        return set()
+
+
+def _guardar_vistos(conjunto):
+    try:
+        with open(ARCHIVO_VISTOS, "w", encoding="utf-8") as f:
+            json.dump({"vistos": sorted(conjunto)}, f, indent=2, ensure_ascii=False)
+    except Exception:
+        pass
+
+
+def marcar_visto(clave):
+    """Marca un hilo/respuesta como visto por el usuario."""
+    if not clave:
+        return
+    actuales = cargar_vistos()
+    actuales.add(str(clave))
+    _guardar_vistos(actuales)
+
+
+def marcar_vistos(claves):
+    """Marca varias claves como vistas en una sola escritura."""
+    if not claves:
+        return
+    actuales = cargar_vistos()
+    for c in claves:
+        if c:
+            actuales.add(str(c))
+    _guardar_vistos(actuales)
+
+
 # ==========================================
 # 10. ESTADÍSTICAS GLOBALES (todos los días)
 # ==========================================
@@ -628,7 +673,8 @@ def cargar_respuestas():
     return _cargar_respuestas_archivo()
 
 
-def enviar_respuesta(destino, asunto, cuerpo, in_reply_to=None, references=None):
+def enviar_respuesta(destino, asunto, cuerpo, in_reply_to=None, references=None,
+                     cc=None):
     """Envía un correo de texto plano usando las credenciales SMTP configuradas.
     Si se pasa in_reply_to/references, los agrega para que Gmail mantenga el thread.
     Devuelve (ok: bool, mensaje: str)."""
@@ -652,23 +698,86 @@ def enviar_respuesta(destino, asunto, cuerpo, in_reply_to=None, references=None)
     if not asunto:
         return False, "Falta el asunto"
 
+    firma_tipo   = (cfg.get("firma_tipo") or "texto").lower()
+    firma_imagen = (cfg.get("firma_imagen") or "").strip()
+    firma_texto  = (cfg.get("firma") or "").strip()
+
+    # Para la versión texto plano (compatibilidad), incluir la firma de texto
+    cuerpo_plano = cuerpo
+    if firma_tipo == "texto" and firma_texto and firma_texto not in cuerpo_plano:
+        cuerpo_plano = cuerpo_plano.rstrip() + "\n\n--\n" + firma_texto + "\n"
+
+    # Sanitizar headers: Python prohíbe \r\n dentro de cabeceras.
+    def _h(s):
+        if not s:
+            return ""
+        return re.sub(r"\s+", " ", str(s).replace("\r", " ").replace("\n", " ")).strip()
+
     msg = EmailMessage()
-    msg["Subject"]    = asunto
-    msg["From"]       = correo
-    msg["To"]         = destino
-    # Date con timezone local de la PC (ej: -0300 si estás en Buenos Aires)
+    msg["Subject"]    = _h(asunto)
+    msg["From"]       = _h(correo)
+    msg["To"]         = _h(destino)
+    if cc:
+        cc_clean = _h(cc) if isinstance(cc, str) else _h(", ".join(cc))
+        if cc_clean:
+            msg["Cc"] = cc_clean
     msg["Date"]       = formatdate(localtime=True)
-    # Message-ID propio para que las respuestas posteriores hagan threading bien
     try:
         dominio = correo.split("@", 1)[1] if "@" in correo else "localhost"
         msg["Message-ID"] = make_msgid(domain=dominio)
     except Exception:
         msg["Message-ID"] = make_msgid()
     if in_reply_to:
-        msg["In-Reply-To"] = in_reply_to
+        msg["In-Reply-To"] = _h(in_reply_to)
     if references:
-        msg["References"] = references
-    msg.set_content(cuerpo)
+        # References puede tener varios Message-IDs separados por espacios;
+        # los normalizamos sin saltos de línea.
+        msg["References"] = _h(references)
+
+    msg.set_content(cuerpo_plano)
+
+    # Si la firma es una imagen, mandamos también una versión HTML con la
+    # imagen como adjunto inline (CID). Esto es lo que Gmail/Outlook
+    # respetan en clientes web Y mobile (las data URL muchas veces se
+    # bloquean por anti-spam).
+    if firma_tipo == "imagen" and firma_imagen and os.path.exists(firma_imagen):
+        try:
+            with open(firma_imagen, "rb") as f:
+                img_bytes = f.read()
+            ext = os.path.splitext(firma_imagen)[1].lstrip(".").lower() or "png"
+            if ext == "jpg":
+                ext = "jpeg"
+
+            # CID único para esta firma
+            firma_cid = make_msgid(domain="pulsemail.local").strip("<>")
+
+            from html import escape as _html_escape
+            cuerpo_html = _html_escape(cuerpo).replace("\n", "<br>")
+            # max-width 380px + width attribute → Gmail Web respeta el
+            # tamaño y mobile escala bien al 100%.
+            html_body = (
+                "<!doctype html><html><body style=\"font-family:Arial,"
+                "sans-serif;font-size:14px;color:#1a1a1a;\">"
+                f"<div>{cuerpo_html}</div>"
+                "<br><br>"
+                f"<img src=\"cid:{firma_cid}\" alt=\"Firma\" width=\"380\" "
+                "style=\"max-width:380px;width:100%;height:auto;"
+                "display:block;\"/>"
+                "</body></html>"
+            )
+            msg.add_alternative(html_body, subtype="html")
+
+            # Adjuntar la imagen como related al HTML que acabamos de
+            # añadir (último payload del multipart).
+            msg.get_payload()[-1].add_related(
+                img_bytes,
+                maintype="image",
+                subtype=ext,
+                cid=f"<{firma_cid}>",
+                filename=f"firma_pulsemail.{ext}",
+            )
+        except Exception as e:
+            logging.error(f"No se pudo embeber firma de imagen: {e}")
 
     try:
         with smtplib.SMTP(host, port, timeout=20) as server:
@@ -702,6 +811,7 @@ def _parse_mensaje_imap(raw_msg, direccion):
     fecha     = _decodificar_cabecera(raw_msg.get("Date", ""))
     remitente = _decodificar_cabecera(raw_msg.get("From", ""))
     destino   = _decodificar_cabecera(raw_msg.get("To", ""))
+    cc        = _decodificar_cabecera(raw_msg.get("Cc", ""))
     msg_id    = (raw_msg.get("Message-ID", "") or "").strip()
     in_reply  = (raw_msg.get("In-Reply-To", "") or "").strip()
     refs      = (raw_msg.get("References", "") or "").strip()
@@ -726,6 +836,7 @@ def _parse_mensaje_imap(raw_msg, direccion):
         "from":        remitente,
         "from_email":  _extraer_email(remitente),
         "to":          destino,
+        "cc":          cc,
         "subject":     asunto,
         "date":        fecha,
         "ts":          ts,
@@ -734,6 +845,7 @@ def _parse_mensaje_imap(raw_msg, direccion):
         "references":  refs,
         "body":        texto or body_md,
         "body_md":     body_md,
+        "body_html":   html or "",
         "has_html":    bool(html),
     }
 
@@ -810,15 +922,43 @@ def obtener_hilo(remitente, asunto=None, dias=180):
         logging.error(f"Error obteniendo hilo de {remitente}: {e}")
         return []
 
-    # Filtrar por asunto base si se pidió: el subject limpio del mensaje
-    # debe contener el asunto base de la conversación.
-    if asunto_base:
-        def _coincide(msg):
-            sub = re.sub(r"^\s*(Re:|Fwd?:)\s*", "", msg.get("subject", "") or "",
-                         flags=re.IGNORECASE).strip().lower()
-            return asunto_base in sub or sub in asunto_base
+    total_raw = len(mensajes)
+    logging.info(f"Hilo {remitente!r}: {total_raw} mensajes raw encontrados")
 
-        mensajes = [m for m in mensajes if _coincide(m)]
+    # Filtrar por asunto base si se pidió: matching tolerante.
+    if asunto_base and mensajes:
+        # Normalización: quitar pipe + nombre, espacios múltiples, signos.
+        def _norm(s):
+            s = re.sub(r"^\s*(Re:|Fwd?:)\s*", "", s or "", flags=re.IGNORECASE)
+            s = re.sub(r"\s*\|\s*[^|]*$", "", s)   # quita "| Nombre" del final
+            s = re.sub(r"\s+", " ", s).strip().lower()
+            return s
+
+        base_norm = _norm(asunto)
+        # Tomamos los primeros 30 chars distintivos del asunto base
+        clave_corta = base_norm[:30] if base_norm else ""
+
+        def _coincide(msg):
+            sub_norm = _norm(msg.get("subject", ""))
+            if not clave_corta:
+                return True
+            return clave_corta in sub_norm or sub_norm in base_norm
+
+        filtrados = [m for m in mensajes if _coincide(m)]
+
+        # Fallback: si el filtro eliminó TODO pero teníamos mensajes,
+        # mantenemos todos sin filtrar (mejor mostrar algo que nada).
+        if filtrados:
+            mensajes = filtrados
+            logging.info(
+                f"Hilo {remitente!r}: {len(mensajes)} mensajes después del filtro "
+                f"de asunto ({clave_corta!r})"
+            )
+        else:
+            logging.warning(
+                f"Hilo {remitente!r}: filtro de asunto {clave_corta!r} dejó 0 "
+                f"mensajes. Devolviendo {total_raw} sin filtrar como fallback."
+            )
 
     mensajes.sort(key=lambda m: m.get("ts", ""))
     return mensajes
@@ -861,6 +1001,57 @@ def _texto_correo(mensaje):
         return mensaje.get_payload(decode=True).decode("utf-8", "ignore")
     except Exception:
         return ""
+
+
+def _limpiar_html_quote(html_str):
+    """Trunca el HTML al primer marcador de 'mensaje original quoted'.
+
+    Cuando alguien responde un correo, Gmail/Outlook/Yahoo dejan debajo el
+    mensaje original (con un header tipo 'El viernes 1 de mayo... escribió:'
+    o 'On X, Y wrote:'). Eso ensucia la burbuja del hilo en la app, así que
+    cortamos el HTML al primer marcador encontrado.
+    """
+    if not html_str:
+        return html_str
+
+    # Marcadores comunes que indican el inicio del quote.
+    # Buscamos la posición más temprana entre todos.
+    markers = [
+        # Tags que siempre son quote
+        r"<blockquote\b",
+        # Contenedores de quote por cliente
+        r'<div[^>]*class\s*=\s*["\'][^"\']*gmail_quote[^"\']*["\']',
+        r'<div[^>]*class\s*=\s*["\'][^"\']*gmail_attr[^"\']*["\']',
+        r'<div[^>]*class\s*=\s*["\'][^"\']*moz-cite-prefix[^"\']*["\']',
+        r'<div[^>]*class\s*=\s*["\'][^"\']*yahoo_quoted[^"\']*["\']',
+        r'<div[^>]*class\s*=\s*["\'][^"\']*OutlookMessageHeader[^"\']*["\']',
+        r'<div[^>]*id\s*=\s*["\'][^"\']*appendonsend[^"\']*["\']',
+        r'<div[^>]*id\s*=\s*["\'][^"\']*divRplyFwdMsg[^"\']*["\']',
+        r'<hr[^>]*id\s*=\s*["\']stopSpelling["\']',
+        # Cabeceras textuales típicas del quote
+        r"On\s+\w+,\s+\w+\s+\d+,\s+\d{4}\s+at\s+\d+:\d+[^<]*wrote\s*:",
+        r"El\s+\w+,?\s+\d{1,2}\s+(?:de\s+)?\w+\s+(?:de\s+)?\d{4}[^<]*escrib(?:i[oó]|ió)\s*:",
+        r"El\s+\w+,?\s+\d{1,2}/\d{1,2}/\d{2,4}[^<]*escrib(?:i[oó]|ió)\s*:",
+        # Outlook plain
+        r"-{2,}\s*(?:Mensaje\s+(?:original|reenviado)|Original\s+Message)\s*-{2,}",
+        r"_{5,}",  # divider del Outlook
+        # "From: X" típica de forwards de Outlook
+        r"From:\s*[^\n<]*<\s*[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-.]+\s*>",
+    ]
+
+    earliest = len(html_str)
+    for patron in markers:
+        try:
+            match = re.search(patron, html_str, flags=re.IGNORECASE)
+            if match and match.start() < earliest:
+                earliest = match.start()
+        except re.error:
+            continue
+
+    if earliest < len(html_str):
+        # Cortamos y cerramos los tags básicos para que el HTML siga válido
+        return html_str[:earliest].rstrip() + "</body></html>"
+    return html_str
 
 
 def _partes_correo(mensaje):
@@ -913,6 +1104,23 @@ def _partes_correo(mensaje):
             html_final = html_final.replace(f"cid:{cid}", durl)
             html_final = html_final.replace(f'"cid:{cid}"', f'"{durl}"')
             html_final = html_final.replace(f"'cid:{cid}'", f"'{durl}'")
+
+    # Eliminar <img> con cid: que no se pudieron resolver (quedan como
+    # imagen rota y dejan un espacio blanco en el render). Igual con los
+    # <img> sin src.
+    if html_final:
+        html_final = re.sub(
+            r"<img\b[^>]*\bsrc\s*=\s*[\"']cid:[^\"']*[\"'][^>]*/?>",
+            "", html_final, flags=re.IGNORECASE,
+        )
+        html_final = re.sub(
+            r"<img\b(?:(?!src\s*=)[^>])*/?>",   # <img sin src
+            "", html_final, flags=re.IGNORECASE,
+        )
+
+    # Quitar el "quote" del mensaje anterior (si esto es una respuesta)
+    if html_final:
+        html_final = _limpiar_html_quote(html_final)
 
     return texto_final, html_final, imgs
 
