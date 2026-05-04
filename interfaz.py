@@ -1013,6 +1013,40 @@ def main(page: ft.Page):
         pagina_contactos[0] += delta
         _render_pagina_contactos()
 
+    def _importar_contactos_dialog(e=None):
+        """Abre un diálogo nativo de Windows para elegir un CSV y lo importa
+        como contactos.csv (sobrescribe haciendo .bak previo)."""
+        def _picker():
+            try:
+                import tkinter as _tk
+                from tkinter import filedialog as _fd
+                root = _tk.Tk()
+                root.withdraw()
+                root.attributes("-topmost", True)
+                path = _fd.askopenfilename(
+                    parent=root,
+                    title="Seleccioná tu contactos.csv",
+                    filetypes=[("CSV", "*.csv"), ("Todos los archivos", "*.*")],
+                )
+                root.destroy()
+                if not path:
+                    return
+                ok, msg = enviar_correos.importar_archivo_local(
+                    path, "contactos.csv"
+                )
+                if ok:
+                    agregar_log("info",
+                                f"Contactos importados desde: {path}")
+                    cargar_contactos(forzar=True)
+                else:
+                    agregar_log("error", f"No se pudo importar: {msg}")
+            except Exception as ex:
+                try:
+                    agregar_log("error", f"Error abriendo diálogo: {ex}")
+                except Exception:
+                    pass
+        threading.Thread(target=_picker, daemon=True).start()
+
     tf_buscar_contactos = ft.TextField(
         hint_text="Buscar por nombre, cuenta o correo...",
         prefix_icon=ft.Icons.SEARCH_ROUNDED,
@@ -1049,6 +1083,18 @@ def main(page: ft.Page):
                             color=C_TEXTO_1, font_family="Saira", expand=True),
                     ring_contactos,
                     lbl_contactos_total,
+                    ft.OutlinedButton(
+                        "Importar CSV…",
+                        icon=ft.Icons.UPLOAD_FILE_ROUNDED,
+                        on_click=_importar_contactos_dialog,
+                        style=ft.ButtonStyle(
+                            color={ft.ControlState.DEFAULT: C_MORADO},
+                            side={ft.ControlState.DEFAULT:
+                                  ft.BorderSide(1.2, C_MORADO)},
+                            shape=ft.RoundedRectangleBorder(radius=8),
+                            padding=ft.Padding(14, 12, 14, 12),
+                        ),
+                    ),
                     ft.ElevatedButton(
                         "Recargar CSV",
                         icon=ft.Icons.REFRESH_ROUNDED,
@@ -3404,12 +3450,376 @@ def main(page: ft.Page):
         ),
     )
 
+    # ── Tab "Datos" (import/export, backups) ────────────────────
+    lbl_datos_estado = ft.Text("", size=12, italic=True, font_family="Saira")
+
+    def _flash_datos(msg, color=C_AZUL, segundos=4):
+        lbl_datos_estado.value = msg
+        lbl_datos_estado.color = color
+        safe_update(lbl_datos_estado)
+        def _limpiar():
+            import time as _t
+            _t.sleep(segundos)
+            if lbl_datos_estado.value == msg:
+                lbl_datos_estado.value = ""
+                safe_update(lbl_datos_estado)
+        threading.Thread(target=_limpiar, daemon=True).start()
+
+    def _abrir_dialogo(titulo, modo, filetypes, default_name=""):
+        """Abre tkinter filedialog y devuelve la ruta elegida (o '').
+        modo = 'open' | 'save'."""
+        import tkinter as _tk
+        from tkinter import filedialog as _fd
+        root = _tk.Tk()
+        root.withdraw()
+        root.attributes("-topmost", True)
+        try:
+            if modo == "save":
+                ruta = _fd.asksaveasfilename(
+                    parent=root, title=titulo,
+                    filetypes=filetypes,
+                    defaultextension=filetypes[0][1].split()[0].lstrip("*"),
+                    initialfile=default_name,
+                )
+            else:
+                ruta = _fd.askopenfilename(
+                    parent=root, title=titulo, filetypes=filetypes,
+                )
+        finally:
+            root.destroy()
+        return ruta or ""
+
+    def _importar_archivo_dialog(nombre_local, descripcion, exts):
+        def _picker():
+            try:
+                path = _abrir_dialogo(
+                    f"Importar {descripcion}",
+                    "open",
+                    [(descripcion, " ".join(f"*.{e}" for e in exts)),
+                     ("Todos los archivos", "*.*")],
+                )
+                if not path:
+                    return
+                ok, msg = enviar_correos.importar_archivo_local(
+                    path, nombre_local
+                )
+                if ok:
+                    _flash_datos(f"✓ {msg}", C_EXITO, 4)
+                    agregar_log("info",
+                                f"{descripcion} importado desde: {path}")
+                else:
+                    _flash_datos(msg, C_ROJO, 5)
+            except Exception as ex:
+                _flash_datos(f"Error: {ex}", C_ROJO, 5)
+        threading.Thread(target=_picker, daemon=True).start()
+
+    def _exportar_archivo_dialog(nombre_local, descripcion, exts):
+        def _picker():
+            try:
+                # Sugerimos un nombre de archivo con timestamp
+                sufijo = datetime.now().strftime("%Y%m%d_%H%M")
+                base, ext = os.path.splitext(nombre_local)
+                default_name = f"{base}_{sufijo}{ext}"
+                path = _abrir_dialogo(
+                    f"Exportar {descripcion}",
+                    "save",
+                    [(descripcion, " ".join(f"*.{e}" for e in exts)),
+                     ("Todos los archivos", "*.*")],
+                    default_name=default_name,
+                )
+                if not path:
+                    return
+                ok, msg = enviar_correos.exportar_archivo_local(
+                    nombre_local, path
+                )
+                _flash_datos(("✓ " if ok else "") + msg,
+                             C_EXITO if ok else C_ROJO, 5)
+                if ok:
+                    agregar_log("info",
+                                f"{descripcion} exportado a: {path}")
+            except Exception as ex:
+                _flash_datos(f"Error: {ex}", C_ROJO, 5)
+        threading.Thread(target=_picker, daemon=True).start()
+
+    def _exportar_backup_completo_dialog(e=None):
+        def _picker():
+            try:
+                sufijo = datetime.now().strftime("%Y%m%d_%H%M")
+                default_name = f"pulsemail_backup_{sufijo}.zip"
+                path = _abrir_dialogo(
+                    "Exportar configuración completa (ZIP)",
+                    "save",
+                    [("Backup ZIP", "*.zip"), ("Todos", "*.*")],
+                    default_name=default_name,
+                )
+                if not path:
+                    return
+                _flash_datos("Comprimiendo backup...", C_AZUL, 30)
+                ok, msg = enviar_correos.exportar_backup_completo(path)
+                _flash_datos(("✓ " if ok else "") + msg,
+                             C_EXITO if ok else C_ROJO, 6)
+                if ok:
+                    agregar_log("info",
+                                f"Backup completo exportado a: {path}")
+            except Exception as ex:
+                _flash_datos(f"Error: {ex}", C_ROJO, 5)
+        threading.Thread(target=_picker, daemon=True).start()
+
+    def _importar_backup_completo_dialog(e=None):
+        def _picker():
+            try:
+                path = _abrir_dialogo(
+                    "Importar configuración completa (ZIP)",
+                    "open",
+                    [("Backup ZIP", "*.zip"), ("Todos", "*.*")],
+                )
+                if not path:
+                    return
+                _flash_datos("Restaurando backup...", C_AZUL, 30)
+                ok, msg = enviar_correos.importar_backup_completo(path)
+                if ok:
+                    _flash_datos(
+                        "✓ Backup restaurado. Reiniciá la app para que "
+                        "tome todos los cambios.",
+                        C_EXITO, 12,
+                    )
+                    agregar_log("info",
+                                f"Backup completo restaurado desde: {path}. "
+                                f"Reiniciá Pulsemail.")
+                    # Recargar contactos en vivo
+                    try:
+                        cargar_contactos(forzar=True)
+                    except Exception:
+                        pass
+                else:
+                    _flash_datos(msg, C_ROJO, 6)
+            except Exception as ex:
+                _flash_datos(f"Error: {ex}", C_ROJO, 5)
+        threading.Thread(target=_picker, daemon=True).start()
+
+    def _btn_outlined(label, icon, handler, color=C_MORADO):
+        return ft.OutlinedButton(
+            label,
+            icon=icon,
+            on_click=handler,
+            style=ft.ButtonStyle(
+                color={ft.ControlState.DEFAULT: color},
+                side={ft.ControlState.DEFAULT: ft.BorderSide(1.2, color)},
+                shape=ft.RoundedRectangleBorder(radius=8),
+                padding=ft.Padding(14, 10, 14, 10),
+            ),
+        )
+
+    def _btn_filled(label, icon, handler, color=C_MORADO):
+        return ft.ElevatedButton(
+            label,
+            icon=icon,
+            on_click=handler,
+            style=ft.ButtonStyle(
+                bgcolor={ft.ControlState.DEFAULT: color,
+                         ft.ControlState.HOVERED: C_MORADO_DARK},
+                color={ft.ControlState.DEFAULT: C_BLANCO},
+                shape=ft.RoundedRectangleBorder(radius=8),
+                padding=ft.Padding(16, 12, 16, 12),
+            ),
+        )
+
+    tab_datos = ft.Container(
+        padding=ft.Padding(0, 20, 0, 0),
+        content=ft.Column(
+            spacing=18,
+            scroll=ft.ScrollMode.AUTO,
+            controls=[
+                ft.Text(
+                    "Importá y exportá los datos de Pulsemail. Útil para "
+                    "migrar a otra PC, hacer backups o pasarle el software "
+                    "a otra persona con la campaña ya en curso.",
+                    size=12, color=C_TEXTO_3, font_family="Saira",
+                ),
+                lbl_datos_estado,
+
+                # ── Backup completo ─────────────────────────────────
+                ft.Container(
+                    bgcolor=C_FONDO,
+                    border_radius=ft.BorderRadius(10, 10, 10, 10),
+                    border=borde_all(1, C_BORDE),
+                    padding=ft.Padding(16, 14, 16, 14),
+                    content=ft.Column(
+                        spacing=10,
+                        controls=[
+                            ft.Row(
+                                controls=[
+                                    ft.Icon(ft.Icons.BACKUP_ROUNDED,
+                                            color=C_MORADO, size=20),
+                                    ft.Text("Backup completo (recomendado)",
+                                            size=14, weight=ft.FontWeight.BOLD,
+                                            color=C_TEXTO_1, font_family="Saira"),
+                                ],
+                            ),
+                            ft.Text(
+                                "Exporta TODO en un solo ZIP: configuración, "
+                                "contactos, historial diario completo, "
+                                "registros de envíos/rechazados/respuestas, "
+                                "firma y tema. Para restaurar en otra PC, "
+                                "instalá Pulsemail y apretá 'Importar backup'.",
+                                size=11, color=C_TEXTO_2, font_family="Saira",
+                            ),
+                            ft.Row(
+                                spacing=10,
+                                controls=[
+                                    _btn_filled(
+                                        "Exportar configuración completa",
+                                        ft.Icons.FILE_DOWNLOAD_ROUNDED,
+                                        _exportar_backup_completo_dialog,
+                                    ),
+                                    _btn_outlined(
+                                        "Importar backup",
+                                        ft.Icons.FILE_UPLOAD_ROUNDED,
+                                        _importar_backup_completo_dialog,
+                                    ),
+                                ],
+                            ),
+                        ],
+                    ),
+                ),
+
+                # ── Archivos individuales ────────────────────────────
+                ft.Container(
+                    bgcolor=C_FONDO,
+                    border_radius=ft.BorderRadius(10, 10, 10, 10),
+                    border=borde_all(1, C_BORDE),
+                    padding=ft.Padding(16, 14, 16, 14),
+                    content=ft.Column(
+                        spacing=12,
+                        controls=[
+                            ft.Row(
+                                controls=[
+                                    ft.Icon(ft.Icons.FOLDER_OPEN_ROUNDED,
+                                            color=C_MORADO, size=20),
+                                    ft.Text("Archivos individuales",
+                                            size=14, weight=ft.FontWeight.BOLD,
+                                            color=C_TEXTO_1,
+                                            font_family="Saira"),
+                                ],
+                            ),
+                            ft.Text(
+                                "Si solo querés mover un archivo puntual "
+                                "(por ejemplo, el progreso del día actual "
+                                "o el listado de contactos).",
+                                size=11, color=C_TEXTO_2, font_family="Saira",
+                            ),
+                            # registro_envios.json
+                            ft.Row(
+                                vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                                spacing=10,
+                                controls=[
+                                    ft.Text("registro_envios.json",
+                                            size=12, color=C_TEXTO_1,
+                                            font_family="Saira",
+                                            weight=ft.FontWeight.W_500,
+                                            expand=True),
+                                    _btn_outlined(
+                                        "Exportar",
+                                        ft.Icons.FILE_DOWNLOAD_ROUNDED,
+                                        lambda e: _exportar_archivo_dialog(
+                                            "registro_envios.json",
+                                            "Progreso del día (JSON)",
+                                            ["json"],
+                                        ),
+                                    ),
+                                    _btn_outlined(
+                                        "Importar",
+                                        ft.Icons.FILE_UPLOAD_ROUNDED,
+                                        lambda e: _importar_archivo_dialog(
+                                            "registro_envios.json",
+                                            "Progreso del día (JSON)",
+                                            ["json"],
+                                        ),
+                                    ),
+                                ],
+                            ),
+                            # contactos.csv
+                            ft.Row(
+                                vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                                spacing=10,
+                                controls=[
+                                    ft.Text("contactos.csv",
+                                            size=12, color=C_TEXTO_1,
+                                            font_family="Saira",
+                                            weight=ft.FontWeight.W_500,
+                                            expand=True),
+                                    _btn_outlined(
+                                        "Exportar",
+                                        ft.Icons.FILE_DOWNLOAD_ROUNDED,
+                                        lambda e: _exportar_archivo_dialog(
+                                            "contactos.csv",
+                                            "Lista de contactos",
+                                            ["csv"],
+                                        ),
+                                    ),
+                                    _btn_outlined(
+                                        "Importar",
+                                        ft.Icons.FILE_UPLOAD_ROUNDED,
+                                        lambda e: _importar_archivo_dialog(
+                                            "contactos.csv",
+                                            "Lista de contactos",
+                                            ["csv"],
+                                        ),
+                                    ),
+                                ],
+                            ),
+                            # config.json
+                            ft.Row(
+                                vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                                spacing=10,
+                                controls=[
+                                    ft.Text("config.json",
+                                            size=12, color=C_TEXTO_1,
+                                            font_family="Saira",
+                                            weight=ft.FontWeight.W_500,
+                                            expand=True),
+                                    _btn_outlined(
+                                        "Exportar",
+                                        ft.Icons.FILE_DOWNLOAD_ROUNDED,
+                                        lambda e: _exportar_archivo_dialog(
+                                            "config.json",
+                                            "Configuración",
+                                            ["json"],
+                                        ),
+                                    ),
+                                    _btn_outlined(
+                                        "Importar",
+                                        ft.Icons.FILE_UPLOAD_ROUNDED,
+                                        lambda e: _importar_archivo_dialog(
+                                            "config.json",
+                                            "Configuración",
+                                            ["json"],
+                                        ),
+                                    ),
+                                ],
+                            ),
+                        ],
+                    ),
+                ),
+
+                ft.Text(
+                    "Antes de importar cualquier archivo, Pulsemail crea "
+                    "automáticamente un .bak del archivo existente. Para "
+                    "que algunos cambios se reflejen completamente "
+                    "(ej. firma de imagen) conviene reiniciar la app.",
+                    size=11, color=C_TEXTO_3, italic=True, font_family="Saira",
+                ),
+            ],
+        ),
+    )
+
     # ── Sub-pestañas custom (más confiable que ft.Tabs en Flet 0.84) ──
     cfg_tabs = [
         ("cuenta",     "Cuenta",      ft.Icons.ACCOUNT_CIRCLE_ROUNDED, tab_cuenta),
         ("firma",      "Firma",       ft.Icons.DRAW_ROUNDED,           tab_firma),
         ("servidores", "Servidores",  ft.Icons.DNS_ROUNDED,            tab_servidores),
         ("apariencia", "Apariencia",  ft.Icons.PALETTE_ROUNDED,        tab_apariencia),
+        ("datos",      "Datos",       ft.Icons.STORAGE_ROUNDED,        tab_datos),
     ]
     cfg_tab_actual = [_CFG_TAB_INICIAL[0]]
     cfg_tab_botones = {}

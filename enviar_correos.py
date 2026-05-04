@@ -1,4 +1,4 @@
-import os, csv, json, time, random, smtplib, imaplib, email, email.header, re, mimetypes, logging, base64
+import os, csv, json, time, random, smtplib, imaplib, email, email.header, re, mimetypes, logging, base64, shutil, zipfile
 from datetime import datetime, timedelta
 from email.message import EmailMessage
 from email.utils import formatdate, make_msgid, parsedate_to_datetime
@@ -1287,6 +1287,168 @@ def detectar_respuestas_y_calendly(dias=30):
 
     _guardar_respuestas_archivo(data)
     return data
+
+
+# ==========================================
+# 14. IMPORT / EXPORT — backup completo y archivos sueltos
+# ==========================================
+
+# Archivos de datos en la raíz del proyecto que entran al backup completo.
+# Excluimos cosas como sistema_errores.log y __pycache__ que no son estado.
+_ARCHIVOS_BACKUP = [
+    "config.json",
+    "contactos.csv",
+    "registro_envios.json",
+    "registro_rechazados.json",
+    "registro_depurados.json",
+    "registro_respuestas.json",
+    "registro_vistos.json",
+]
+
+
+def importar_archivo_local(origen_path, nombre_local):
+    """Copia un archivo externo a la carpeta del proyecto bajo `nombre_local`.
+    Devuelve (ok, mensaje).
+    Sobrescribe si ya existe (hace backup .bak previo)."""
+    if not origen_path or not os.path.exists(origen_path):
+        return False, "El archivo origen no existe."
+    if not nombre_local:
+        return False, "Falta el nombre destino."
+    destino = os.path.join(CARPETA_ACTUAL, nombre_local)
+    try:
+        if os.path.exists(destino):
+            try:
+                shutil.copy2(destino, destino + ".bak")
+            except Exception:
+                pass
+        shutil.copy2(origen_path, destino)
+        return True, f"Importado: {nombre_local}"
+    except Exception as e:
+        logging.error(f"Error importando {origen_path} -> {nombre_local}: {e}")
+        return False, f"Error: {e}"
+
+
+def exportar_archivo_local(nombre_local, destino_path):
+    """Copia un archivo del proyecto a una ruta externa elegida por el usuario."""
+    origen = os.path.join(CARPETA_ACTUAL, nombre_local)
+    if not os.path.exists(origen):
+        return False, f"No existe {nombre_local} en el proyecto."
+    try:
+        shutil.copy2(origen, destino_path)
+        return True, f"Exportado a {destino_path}"
+    except Exception as e:
+        logging.error(f"Error exportando {nombre_local} -> {destino_path}: {e}")
+        return False, f"Error: {e}"
+
+
+def exportar_backup_completo(destino_zip):
+    """Crea un ZIP con TODA la configuración y estado de Pulsemail:
+      - config.json (incluye firma de texto + path a firma de imagen)
+      - contactos.csv
+      - registro_envios.json (estado del día actual)
+      - registro_rechazados.json
+      - registro_depurados.json
+      - registro_respuestas.json
+      - registro_vistos.json
+      - historial/ (carpeta entera, todos los días de campaña)
+      - firma/<imagen> si la firma_imagen apunta a un archivo válido
+
+    El ZIP resultante se puede usar con `importar_backup_completo()` en otra
+    PC para clonar la instalación.
+    """
+    if not destino_zip:
+        return False, "Falta path destino."
+    try:
+        with zipfile.ZipFile(destino_zip, "w", zipfile.ZIP_DEFLATED) as zf:
+            # 1. Archivos sueltos en raíz
+            for nombre in _ARCHIVOS_BACKUP:
+                ruta = os.path.join(CARPETA_ACTUAL, nombre)
+                if os.path.exists(ruta):
+                    zf.write(ruta, nombre)
+
+            # 2. Carpeta historial completa (todos los días/meses/años)
+            if os.path.isdir(CARPETA_HISTORIAL):
+                for root, _dirs, files in os.walk(CARPETA_HISTORIAL):
+                    for f in files:
+                        abs_path = os.path.join(root, f)
+                        rel_path = os.path.relpath(abs_path, CARPETA_ACTUAL)
+                        try:
+                            zf.write(abs_path, rel_path.replace("\\", "/"))
+                        except Exception:
+                            continue
+
+            # 3. Firma de imagen (si está configurada y existe)
+            try:
+                cfg = cargar_config()
+                firma_img = (cfg.get("firma_imagen") or "").strip()
+                if firma_img and os.path.exists(firma_img):
+                    arcname = "firma/" + os.path.basename(firma_img)
+                    zf.write(firma_img, arcname)
+            except Exception:
+                pass
+
+            # 4. Metadata del backup (para validar al importar)
+            meta = {
+                "app":          "Pulsemail",
+                "version":      "1.0",
+                "timestamp":    datetime.now().isoformat(),
+                "incluye":      _ARCHIVOS_BACKUP + ["historial/", "firma/"],
+            }
+            zf.writestr("pulsemail_backup.json",
+                        json.dumps(meta, indent=2, ensure_ascii=False))
+
+        return True, f"Backup creado: {destino_zip}"
+    except Exception as e:
+        logging.error(f"Error creando backup: {e}")
+        return False, f"Error creando backup: {e}"
+
+
+def importar_backup_completo(origen_zip):
+    """Restaura un ZIP creado por `exportar_backup_completo()` encima de la
+    carpeta actual. Sobrescribe los archivos existentes (hace .bak antes).
+    Devuelve (ok, mensaje)."""
+    if not origen_zip or not os.path.exists(origen_zip):
+        return False, "El backup no existe."
+    if not zipfile.is_zipfile(origen_zip):
+        return False, "El archivo no es un ZIP válido."
+
+    try:
+        with zipfile.ZipFile(origen_zip, "r") as zf:
+            nombres = zf.namelist()
+
+            # Hacer backup de los archivos críticos antes de pisar
+            for nombre in _ARCHIVOS_BACKUP:
+                ruta_local = os.path.join(CARPETA_ACTUAL, nombre)
+                if os.path.exists(ruta_local):
+                    try:
+                        shutil.copy2(ruta_local, ruta_local + ".bak")
+                    except Exception:
+                        pass
+
+            # Extraer todo en la carpeta del proyecto
+            zf.extractall(CARPETA_ACTUAL)
+
+            # Si vino una firma de imagen, actualizar el path en config
+            firma_dir = os.path.join(CARPETA_ACTUAL, "firma")
+            if os.path.isdir(firma_dir):
+                imgs = [
+                    os.path.join(firma_dir, f) for f in os.listdir(firma_dir)
+                    if os.path.isfile(os.path.join(firma_dir, f))
+                ]
+                if imgs:
+                    try:
+                        cfg = cargar_config()
+                        cfg["firma_imagen"] = imgs[0]
+                        if not cfg.get("firma_tipo"):
+                            cfg["firma_tipo"] = "imagen"
+                        guardar_config(cfg)
+                    except Exception:
+                        pass
+
+        return True, f"Backup restaurado desde {origen_zip}"
+    except Exception as e:
+        logging.error(f"Error restaurando backup: {e}")
+        return False, f"Error restaurando: {e}"
 
 
 if __name__ == "__main__":
