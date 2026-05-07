@@ -11,6 +11,19 @@ import webbrowser
 import enviar_correos
 from datetime import datetime
 
+# ── AppUserModelID ──
+# Sin esto, Windows trata la app como "Flet generic" y al anclarla a la
+# barra de tareas, el acceso anclado apunta al runtime de Flet en vez de
+# a Pulsemail. Setearlo permite anclar/agrupar correctamente con icono y
+# nombre propios.
+try:
+    import ctypes
+    ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+        u"Pulsemail.OutreachSuite.1.0"
+    )
+except Exception:
+    pass
+
 # ── Detección de WebView ──
 # NOTA: Flet 0.84 NO soporta WebView en desktop (Windows/macOS/Linux).
 # Sólo funciona en mobile (iOS/Android) y web. En desktop el control se
@@ -74,13 +87,13 @@ def _resolver_icono_notif():
     Convierte logo-app.png → logo-app.ico con PIL si hace falta."""
     if _NOTIF_ICON_PATH[0] and os.path.exists(_NOTIF_ICON_PATH[0]):
         return _NOTIF_ICON_PATH[0]
-    ico_path = os.path.join(CARPETA_ACTUAL, "logo-app.ico")
+    ico_path = os.path.join(CARPETA_ASSETS, "logo-app.ico")
     if os.path.exists(ico_path):
         _NOTIF_ICON_PATH[0] = ico_path
         return ico_path
-    png_path = os.path.join(CARPETA_ACTUAL, "logo-app.png")
+    png_path = os.path.join(CARPETA_ASSETS, "logo-app.png")
     if not os.path.exists(png_path):
-        png_path = os.path.join(CARPETA_ACTUAL, "ITH-logo.png")
+        png_path = os.path.join(CARPETA_ASSETS, "ITH-logo.png")
     if not os.path.exists(png_path):
         return None
     # Convertir PNG → ICO (Windows toast lo prefiere así)
@@ -146,7 +159,8 @@ def _hti_init():
         from html2image import Html2Image
         _HTI_INSTANCE[0] = Html2Image(
             output_path=_HTML_CACHE_DIR,
-            size=(900, 3500),
+            # Viewport más ancho → mejor calidad al escalar a pantallas 2K/4K
+            size=(1400, 5000),
             custom_flags=[
                 "--default-background-color=FFFFFF",
                 "--hide-scrollbars",
@@ -235,18 +249,57 @@ def _html_a_imagen(html_str, message_id):
     # también lateral). Esto evita las "tarjetas blancas" gigantes que
     # quedaban cuando el HTML del correo tenía padding grande o cuando
     # el contenido no llenaba todo el viewport.
+    #
+    # En pantallas con DPI alto (2K/4K) Chrome aplica anti-aliasing y los
+    # bordes del contenido tienen pixels casi-blancos (#fafafa, #f8f8f8
+    # etc.) que bbox(255,255,255) no detecta. Usamos un threshold para
+    # tratarlos también como "blanco" y recortar agresivamente.
     try:
-        from PIL import Image as _PIL_Image, ImageChops as _PIL_ImageChops
+        from PIL import Image as _PIL_Image
         img = _PIL_Image.open(path).convert("RGB")
-        bg  = _PIL_Image.new("RGB", img.size, (255, 255, 255))
-        diff = _PIL_ImageChops.difference(img, bg)
-        bbox = diff.getbbox()
-        if bbox:
-            left   = max(0, bbox[0] - 4)
-            top    = max(0, bbox[1] - 4)
-            right  = min(img.width,  bbox[2] + 4)
-            bottom = min(img.height, bbox[3] + 8)
-            cropped = img.crop((left, top, right, bottom))
+        ancho, alto = img.size
+        pixels = img.load()
+        UMBRAL = 245  # cualquier RGB con todos los canales >= 245 = "blanco"
+
+        def _es_blanco(r, g, b):
+            return r >= UMBRAL and g >= UMBRAL and b >= UMBRAL
+
+        def _fila_es_blanca(y):
+            # Sample cada 3 pixels para velocidad (trim tolera ruido)
+            for x in range(0, ancho, 3):
+                r, g, b = pixels[x, y]
+                if not _es_blanco(r, g, b):
+                    return False
+            return True
+
+        def _col_es_blanca(x):
+            for y in range(0, alto, 3):
+                r, g, b = pixels[x, y]
+                if not _es_blanco(r, g, b):
+                    return False
+            return True
+
+        top = 0
+        while top < alto and _fila_es_blanca(top):
+            top += 1
+        bottom = alto - 1
+        while bottom > top and _fila_es_blanca(bottom):
+            bottom -= 1
+        left = 0
+        while left < ancho and _col_es_blanca(left):
+            left += 1
+        right = ancho - 1
+        while right > left and _col_es_blanca(right):
+            right -= 1
+
+        # Si quedó algo de contenido, recortamos con un pequeño margen
+        if right > left and bottom > top:
+            margen = 4
+            l = max(0, left - margen)
+            t = max(0, top - margen)
+            r = min(ancho,  right  + margen + 1)
+            b = min(alto,   bottom + margen + 1)
+            cropped = img.crop((l, t, r, b))
             cropped.save(path)
     except Exception:
         pass
@@ -277,7 +330,10 @@ C_AZUL_LIGHT    = "#eaf3fb"
 C_EXITO         = "#2ecc71"
 C_EXITO_LIGHT   = "#edfaf0"
 
-CARPETA_ACTUAL = os.path.dirname(os.path.abspath(__file__))
+# Datos del usuario (estable entre ejecuciones, incluso dentro del bundle)
+CARPETA_ACTUAL = enviar_correos.CARPETA_ACTUAL
+# Recursos empaquetados (logos, íconos) — en bundle: sys._MEIPASS
+CARPETA_ASSETS = enviar_correos.CARPETA_ASSETS
 
 
 # ==========================================
@@ -466,24 +522,103 @@ def main(page: ft.Page):
     except Exception:
         pass
 
-    # Ícono de la app: logo-app.png (creado por el usuario). NOTA: con
-    # `py interfaz.py` Windows muestra en la barra de tareas el ícono del
-    # runtime de Flet — esto recién se aplica al compilar con `flet pack`
-    # (ver dependencias.txt). Igual seteamos page.window.icon por si
-    # alguna versión de Flet lo respeta.
-    _logo_app = os.path.join(CARPETA_ACTUAL, "logo-app.png")
+    # Ícono de la app: logo-app.png/ico. Lo aplicamos por TRES vías:
+    #  (1) page.window.icon (Flet)
+    #  (2) page.window_icon (versiones viejas de Flet)
+    #  (3) Win32 SendMessage WM_SETICON sobre las ventanas del proceso
+    #      → ESTE es el que hace que aparezca el logo en la barra de
+    #      tareas y la barra de título incluso al ejecutar `py interfaz.py`
+    _logo_app = os.path.join(CARPETA_ASSETS, "logo-app.png")
+    _logo_ico = os.path.join(CARPETA_ASSETS, "logo-app.ico")
     if not os.path.exists(_logo_app):
-        # Fallback al logo del cliente si todavía no existe el de la app
-        _logo_app = os.path.join(CARPETA_ACTUAL, "ITH-logo.png")
+        _logo_app = os.path.join(CARPETA_ASSETS, "ITH-logo.png")
+
+    # Generar el .ico en runtime si no existe (lo necesita Win32 LoadImage)
+    if (not os.path.exists(_logo_ico)) and os.path.exists(_logo_app):
+        try:
+            from PIL import Image as _PILImg
+            _PILImg.open(_logo_app).convert("RGBA").save(
+                _logo_ico,
+                sizes=[(16, 16), (32, 32), (48, 48),
+                       (64, 64), (128, 128), (256, 256)],
+            )
+        except Exception:
+            pass
+
     if os.path.exists(_logo_app):
         for setter in (
             lambda v: setattr(page.window, "icon", v),
             lambda v: setattr(page, "window_icon", v),
         ):
             try:
-                setter(_logo_app)
+                setter(_logo_ico if os.path.exists(_logo_ico) else _logo_app)
             except Exception:
                 pass
+
+    # Forzar el ícono de la ventana via Win32 (funciona con `py interfaz.py`).
+    # Lo hacemos en background con varios reintentos porque la ventana de
+    # Flet puede tardar 1-2s en estar disponible para EnumWindows.
+    def _aplicar_icono_win32():
+        if not os.path.exists(_logo_ico):
+            return
+        try:
+            import ctypes
+            from ctypes import wintypes
+            user32 = ctypes.windll.user32
+            kernel32 = ctypes.windll.kernel32
+
+            IMAGE_ICON      = 1
+            LR_LOADFROMFILE = 0x0010
+            LR_DEFAULTSIZE  = 0x0040
+            WM_SETICON      = 0x0080
+            ICON_SMALL      = 0
+            ICON_BIG        = 1
+
+            # Cargar el ícono dos veces (small + big)
+            h_small = user32.LoadImageW(
+                None, _logo_ico, IMAGE_ICON, 16, 16,
+                LR_LOADFROMFILE,
+            )
+            h_big = user32.LoadImageW(
+                None, _logo_ico, IMAGE_ICON, 32, 32,
+                LR_LOADFROMFILE,
+            )
+            if not h_small and not h_big:
+                return
+
+            # Buscar las ventanas top-level del proceso actual
+            pid_actual = kernel32.GetCurrentProcessId()
+            hwnds_propias = []
+
+            EnumWindowsProc = ctypes.WINFUNCTYPE(
+                wintypes.BOOL, wintypes.HWND, wintypes.LPARAM,
+            )
+
+            def _callback(hwnd, _lparam):
+                pid = wintypes.DWORD()
+                user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+                if pid.value == pid_actual:
+                    if user32.IsWindowVisible(hwnd):
+                        hwnds_propias.append(hwnd)
+                return True
+
+            import time as _t
+            for _ in range(20):  # ~6 segundos
+                hwnds_propias.clear()
+                user32.EnumWindows(EnumWindowsProc(_callback), 0)
+                if hwnds_propias:
+                    break
+                _t.sleep(0.3)
+
+            for hwnd in hwnds_propias:
+                if h_small:
+                    user32.SendMessageW(hwnd, WM_SETICON, ICON_SMALL, h_small)
+                if h_big:
+                    user32.SendMessageW(hwnd, WM_SETICON, ICON_BIG, h_big)
+        except Exception:
+            pass
+
+    threading.Thread(target=_aplicar_icono_win32, daemon=True).start()
     page.fonts = {
         "Saira": "https://fonts.gstatic.com/s/saira/v14/memXYa2wxmKQyPMrZX79wwYZQMhsyuShhKMjjbU9uXuA.woff2"
     }
@@ -519,40 +654,122 @@ def main(page: ft.Page):
         except Exception:
             pass
 
-    # ── Helper: portapapeles. En Flet 0.84 page.set_clipboard fue removido. ──
+    # ── Helper: portapapeles. En Flet 0.84 page.set_clipboard fue removido.
+    # Usamos la API nativa de Windows (Win32) con declaración explícita
+    # de tipos (CRÍTICO en 64-bit: sin esto los punteros HGLOBAL se
+    # truncan a 32 bits y SetClipboardData falla silenciosamente).
+    # Soporta cientos de copias por segundo sin delay ni race conditions.
+    try:
+        import ctypes as _ctypes_mod
+        from ctypes import wintypes as _wintypes_mod
+        _u32 = _ctypes_mod.windll.user32
+        _k32 = _ctypes_mod.windll.kernel32
+
+        # Tipos de retorno y argumentos (sin esto, en 64-bit los handles
+        # de 64 bits se truncan a 32 → corrupción de memoria → falla)
+        _u32.OpenClipboard.argtypes  = [_wintypes_mod.HWND]
+        _u32.OpenClipboard.restype   = _wintypes_mod.BOOL
+        _u32.CloseClipboard.restype  = _wintypes_mod.BOOL
+        _u32.EmptyClipboard.restype  = _wintypes_mod.BOOL
+        _u32.SetClipboardData.argtypes = [_wintypes_mod.UINT, _wintypes_mod.HANDLE]
+        _u32.SetClipboardData.restype  = _wintypes_mod.HANDLE
+        _u32.GetClipboardData.argtypes = [_wintypes_mod.UINT]
+        _u32.GetClipboardData.restype  = _wintypes_mod.HANDLE
+
+        _k32.GlobalAlloc.argtypes  = [_wintypes_mod.UINT, _ctypes_mod.c_size_t]
+        _k32.GlobalAlloc.restype   = _wintypes_mod.HGLOBAL
+        _k32.GlobalLock.argtypes   = [_wintypes_mod.HGLOBAL]
+        _k32.GlobalLock.restype    = _wintypes_mod.LPVOID
+        _k32.GlobalUnlock.argtypes = [_wintypes_mod.HGLOBAL]
+        _k32.GlobalUnlock.restype  = _wintypes_mod.BOOL
+        _k32.GlobalFree.argtypes   = [_wintypes_mod.HGLOBAL]
+        _k32.GlobalFree.restype    = _wintypes_mod.HGLOBAL
+
+        _CLIPBOARD_OK = True
+    except Exception:
+        _CLIPBOARD_OK = False
+
     def copiar_portapapeles(texto):
         if texto is None:
             return False
         texto = str(texto)
-        # Intento 1: APIs nativas de Flet (varían entre versiones)
-        for nombre in ("set_clipboard", "set_clipboard_async", "copy_to_clipboard"):
-            fn = getattr(page, nombre, None)
-            if callable(fn):
+
+        if _CLIPBOARD_OK:
+            try:
+                CF_UNICODETEXT = 13
+                GMEM_MOVEABLE  = 0x0002
+
+                # Reintentos rápidos por si el clipboard está bloqueado
+                # por otra app
+                abierto = False
+                for _ in range(20):
+                    if _u32.OpenClipboard(None):
+                        abierto = True
+                        break
+                    _k32.Sleep(2)
+                if not abierto:
+                    return False
+
                 try:
-                    fn(texto)
+                    _u32.EmptyClipboard()
+                    data  = (texto + "\0").encode("utf-16-le")
+                    h_mem = _k32.GlobalAlloc(GMEM_MOVEABLE, len(data))
+                    if not h_mem:
+                        return False
+                    ptr = _k32.GlobalLock(h_mem)
+                    if not ptr:
+                        _k32.GlobalFree(h_mem)
+                        return False
+                    _ctypes_mod.memmove(ptr, data, len(data))
+                    _k32.GlobalUnlock(h_mem)
+                    if not _u32.SetClipboardData(CF_UNICODETEXT, h_mem):
+                        _k32.GlobalFree(h_mem)
+                        return False
                     return True
-                except Exception:
-                    pass
-        # Intento 2: Tkinter (siempre disponible en Python estándar)
-        try:
-            import tkinter
-            r = tkinter.Tk()
-            r.withdraw()
-            r.clipboard_clear()
-            r.clipboard_append(texto)
-            r.update()
-            r.destroy()
-            return True
-        except Exception:
-            pass
-        # Intento 3: subprocess Windows
+                finally:
+                    _u32.CloseClipboard()
+            except Exception:
+                pass
+
+        # Fallback: subprocess Windows clip
         try:
             import subprocess
-            subprocess.run(["clip"], input=texto.encode("utf-16le"),
-                           check=True, shell=False)
+            subprocess.run(
+                ["clip"], input=texto.encode("utf-16-le"),
+                check=True, shell=False,
+                creationflags=0x08000000,   # CREATE_NO_WINDOW
+            )
             return True
         except Exception:
             return False
+
+    def leer_portapapeles():
+        """Devuelve el contenido del portapapeles como string (Win32)."""
+        if not _CLIPBOARD_OK:
+            return ""
+        try:
+            CF_UNICODETEXT = 13
+            for _ in range(20):
+                if _u32.OpenClipboard(None):
+                    break
+                _k32.Sleep(2)
+            else:
+                return ""
+            try:
+                handle = _u32.GetClipboardData(CF_UNICODETEXT)
+                if not handle:
+                    return ""
+                ptr = _k32.GlobalLock(handle)
+                if not ptr:
+                    return ""
+                try:
+                    return _ctypes_mod.c_wchar_p(ptr).value or ""
+                finally:
+                    _k32.GlobalUnlock(handle)
+            finally:
+                _u32.CloseClipboard()
+        except Exception:
+            return ""
 
     # ── Heartbeat asyncio: fuerza re-render desde el loop principal cada 0.4s. ──
     # En Flet 0.84 los page.update() desde threads daemon no propagan hasta que
@@ -1047,15 +1264,346 @@ def main(page: ft.Page):
                     pass
         threading.Thread(target=_picker, daemon=True).start()
 
+    # ── Pegar contactos desde el portapapeles ─────────────────────
+    tf_pegar_contactos = ft.TextField(
+        label="Emails (uno por línea o separados por coma/espacio)",
+        hint_text=("ejemplo1@empresa.com\nejemplo2@empresa.com\n"
+                    "contacto@otra.com\n..."),
+        multiline=True,
+        min_lines=8,
+        max_lines=15,
+        border_color=C_BORDE,
+        focused_border_color=C_MORADO,
+        text_style=ft.TextStyle(font_family="Saira"),
+        label_style=ft.TextStyle(color=C_TEXTO_2, font_family="Saira"),
+        expand=True,
+    )
+    lbl_pegar_estado = ft.Text("", size=12, italic=True, font_family="Saira")
+
+    def _pegar_del_portapapeles(e=None):
+        contenido = leer_portapapeles()
+        if contenido:
+            tf_pegar_contactos.value = (
+                (tf_pegar_contactos.value or "") + "\n" + contenido
+            ).strip()
+            safe_update(tf_pegar_contactos)
+        else:
+            lbl_pegar_estado.value = "Portapapeles vacío"
+            lbl_pegar_estado.color = C_NARANJA
+            safe_update(lbl_pegar_estado)
+
+    def _agregar_contactos_pegados(e=None):
+        texto = tf_pegar_contactos.value or ""
+        # Parsear emails (acepta separados por línea, coma, ; o espacio)
+        emails = re.findall(
+            r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+", texto
+        )
+        # Dedupe respetando orden
+        vistos, nuevos = set(), []
+        for em in emails:
+            em_low = em.lower()
+            if em_low not in vistos:
+                vistos.add(em_low)
+                nuevos.append(em)
+
+        if not nuevos:
+            lbl_pegar_estado.value = "No se encontraron emails válidos."
+            lbl_pegar_estado.color = C_ROJO
+            safe_update(lbl_pegar_estado)
+            return
+
+        # Cargar el CSV existente para no duplicar
+        ruta_csv = enviar_correos.ARCHIVO_CSV
+        existentes = set()
+        filas_actuales = []
+        cabeceras = ["Nombre de Cuenta", "Nombre", "Apellidos",
+                     "Correo electrónico", "Correo electrónico secundario",
+                     "Correo electrónico terciario"]
+        if os.path.exists(ruta_csv):
+            try:
+                with open(ruta_csv, "r", encoding="utf-8") as f:
+                    reader = csv.DictReader(f)
+                    if reader.fieldnames:
+                        cabeceras = reader.fieldnames
+                    for fila in reader:
+                        filas_actuales.append(fila)
+                        for k in ("Correo electrónico",
+                                  "Correo electrónico secundario",
+                                  "Correo electrónico terciario"):
+                            v = (fila.get(k) or "").strip().lower()
+                            if v:
+                                existentes.add(v)
+            except Exception:
+                pass
+
+        agregados = 0
+        omitidos = 0
+        for em in nuevos:
+            if em.lower() in existentes:
+                omitidos += 1
+                continue
+            fila = {h: "" for h in cabeceras}
+            fila["Nombre de Cuenta"] = "Sin nombre"
+            fila["Nombre"]           = ""
+            fila["Apellidos"]        = ""
+            fila["Correo electrónico"] = em
+            filas_actuales.append(fila)
+            existentes.add(em.lower())
+            agregados += 1
+
+        # Hacer backup previo
+        try:
+            if os.path.exists(ruta_csv):
+                import shutil as _sh
+                _sh.copy2(ruta_csv, ruta_csv + ".bak")
+        except Exception:
+            pass
+
+        # Escribir el CSV completo
+        try:
+            with open(ruta_csv, "w", encoding="utf-8", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=cabeceras)
+                writer.writeheader()
+                writer.writerows(filas_actuales)
+        except Exception as ex:
+            lbl_pegar_estado.value = f"Error al guardar: {ex}"
+            lbl_pegar_estado.color = C_ROJO
+            safe_update(lbl_pegar_estado)
+            return
+
+        msg_partes = [f"✓ {agregados} agregado{'s' if agregados != 1 else ''}"]
+        if omitidos:
+            msg_partes.append(f"{omitidos} ya existía{'n' if omitidos != 1 else ''}")
+        lbl_pegar_estado.value = "  •  ".join(msg_partes)
+        lbl_pegar_estado.color = C_EXITO
+        safe_update(lbl_pegar_estado)
+
+        agregar_log("info",
+                    f"Contactos pegados: {agregados} agregados, "
+                    f"{omitidos} duplicados omitidos")
+
+        if agregados > 0:
+            tf_pegar_contactos.value = ""
+            safe_update(tf_pegar_contactos)
+            cargar_contactos(forzar=True)
+
+    btn_pegar_portapapeles = ft.OutlinedButton(
+        "Pegar del portapapeles",
+        icon=ft.Icons.CONTENT_PASTE_ROUNDED,
+        on_click=_pegar_del_portapapeles,
+        style=ft.ButtonStyle(
+            color={ft.ControlState.DEFAULT: C_MORADO},
+            side={ft.ControlState.DEFAULT: ft.BorderSide(1.2, C_MORADO)},
+            shape=ft.RoundedRectangleBorder(radius=8),
+            padding=ft.Padding(14, 10, 14, 10),
+        ),
+    )
+    btn_agregar_pegados = ft.ElevatedButton(
+        "Agregar al CSV",
+        icon=ft.Icons.PERSON_ADD_ROUNDED,
+        on_click=_agregar_contactos_pegados,
+        style=ft.ButtonStyle(
+            bgcolor={ft.ControlState.DEFAULT: C_MORADO,
+                     ft.ControlState.HOVERED: C_MORADO_DARK},
+            color={ft.ControlState.DEFAULT: C_BLANCO},
+            shape=ft.RoundedRectangleBorder(radius=8),
+            padding=ft.Padding(20, 12, 20, 12),
+        ),
+    )
+
+    dialog_pegar_contactos = ft.AlertDialog(
+        modal=True,
+        title=ft.Row(
+            spacing=8,
+            controls=[
+                ft.Icon(ft.Icons.CONTENT_PASTE_ROUNDED, color=C_MORADO),
+                ft.Text("Pegar contactos", size=18, weight=ft.FontWeight.BOLD,
+                        color=C_TEXTO_1, font_family="Saira"),
+            ],
+        ),
+        content=ft.Container(
+            width=560,
+            content=ft.Column(
+                tight=True,
+                spacing=12,
+                controls=[
+                    ft.Text(
+                        "Pegá una lista de emails (uno por línea, "
+                        "separados por coma, punto y coma o espacio). "
+                        "Pulsemail extrae los emails y los agrega al "
+                        "contactos.csv evitando duplicados.",
+                        size=12, color=C_TEXTO_3, font_family="Saira",
+                    ),
+                    tf_pegar_contactos,
+                    lbl_pegar_estado,
+                ],
+            ),
+        ),
+        actions=[
+            btn_pegar_portapapeles,
+            ft.TextButton(
+                "Cerrar",
+                on_click=lambda e: (
+                    page.close(dialog_pegar_contactos)
+                    if hasattr(page, "close")
+                    else (setattr(dialog_pegar_contactos, "open", False),
+                          safe_update())
+                ),
+                style=ft.ButtonStyle(color=C_TEXTO_2),
+            ),
+            btn_agregar_pegados,
+        ],
+        actions_alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+    )
+
+    def _abrir_dialog_pegar_contactos(e=None):
+        tf_pegar_contactos.value  = ""
+        lbl_pegar_estado.value    = ""
+        try:
+            page.open(dialog_pegar_contactos)
+        except Exception:
+            page.dialog = dialog_pegar_contactos
+            dialog_pegar_contactos.open = True
+            safe_update()
+
+    # Banner que aparece cuando detectamos emails pegados en el buscador
+    lbl_pegar_detect = ft.Text("", size=12, font_family="Saira",
+                                color=C_MORADO, italic=True)
+    btn_agregar_pegados_inline = ft.ElevatedButton(
+        "Agregar al CSV",
+        icon=ft.Icons.PERSON_ADD_ROUNDED,
+        visible=False,
+        style=ft.ButtonStyle(
+            bgcolor={ft.ControlState.DEFAULT: C_MORADO,
+                     ft.ControlState.HOVERED: C_MORADO_DARK},
+            color={ft.ControlState.DEFAULT: C_BLANCO},
+            shape=ft.RoundedRectangleBorder(radius=8),
+            padding=ft.Padding(14, 8, 14, 8),
+        ),
+    )
+    _emails_pendientes_pegar = [[]]
+
+    def _agregar_emails_al_csv(emails_a_agregar):
+        """Agrega los emails dados al contactos.csv (con .bak previo).
+        Devuelve (agregados, omitidos)."""
+        ruta_csv = enviar_correos.ARCHIVO_CSV
+        existentes = set()
+        filas_actuales = []
+        cabeceras = ["Nombre de Cuenta", "Nombre", "Apellidos",
+                     "Correo electrónico", "Correo electrónico secundario",
+                     "Correo electrónico terciario"]
+        if os.path.exists(ruta_csv):
+            try:
+                with open(ruta_csv, "r", encoding="utf-8") as f:
+                    reader = csv.DictReader(f)
+                    if reader.fieldnames:
+                        cabeceras = reader.fieldnames
+                    for fila in reader:
+                        filas_actuales.append(fila)
+                        for k in ("Correo electrónico",
+                                  "Correo electrónico secundario",
+                                  "Correo electrónico terciario"):
+                            v = (fila.get(k) or "").strip().lower()
+                            if v:
+                                existentes.add(v)
+            except Exception:
+                pass
+
+        agregados = 0
+        omitidos = 0
+        for em in emails_a_agregar:
+            if em.lower() in existentes:
+                omitidos += 1
+                continue
+            fila = {h: "" for h in cabeceras}
+            fila["Nombre de Cuenta"]      = "Sin nombre"
+            fila["Correo electrónico"]    = em
+            filas_actuales.append(fila)
+            existentes.add(em.lower())
+            agregados += 1
+
+        try:
+            if os.path.exists(ruta_csv):
+                import shutil as _sh
+                _sh.copy2(ruta_csv, ruta_csv + ".bak")
+        except Exception:
+            pass
+        try:
+            with open(ruta_csv, "w", encoding="utf-8", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=cabeceras)
+                writer.writeheader()
+                writer.writerows(filas_actuales)
+        except Exception:
+            pass
+        return agregados, omitidos
+
+    def _on_buscar_change(e):
+        valor = e.control.value or ""
+        filtro_actual[0] = valor
+        # Detectar si el contenido pegado tiene emails. Sólo activamos el
+        # botón si hay 2+ (con uno solo, el comportamiento esperado es
+        # filtrar normal).
+        emails_detectados = re.findall(
+            r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+", valor
+        )
+        emails_unicos = []
+        vistos = set()
+        for em in emails_detectados:
+            em_l = em.lower()
+            if em_l not in vistos:
+                vistos.add(em_l)
+                emails_unicos.append(em)
+
+        if len(emails_unicos) >= 2:
+            _emails_pendientes_pegar[0] = emails_unicos
+            lbl_pegar_detect.value = (
+                f"Detectados {len(emails_unicos)} emails. "
+                f"¿Querés agregarlos al CSV?"
+            )
+            btn_agregar_pegados_inline.visible = True
+            btn_agregar_pegados_inline.text = (
+                f"Agregar {len(emails_unicos)} al CSV"
+            )
+        else:
+            _emails_pendientes_pegar[0] = []
+            lbl_pegar_detect.value = ""
+            btn_agregar_pegados_inline.visible = False
+
+        _aplicar_filtro_contactos()
+        safe_update(lbl_pegar_detect, btn_agregar_pegados_inline)
+
+    def _accion_agregar_pegados(e=None):
+        emails = _emails_pendientes_pegar[0]
+        if not emails:
+            return
+        agregados, omitidos = _agregar_emails_al_csv(emails)
+        msg = f"✓ {agregados} agregados"
+        if omitidos:
+            msg += f"  •  {omitidos} ya existían"
+        lbl_pegar_detect.value = msg
+        lbl_pegar_detect.color = C_EXITO
+        # Limpiar el buscador y refrescar lista
+        tf_buscar_contactos.value = ""
+        filtro_actual[0] = ""
+        _emails_pendientes_pegar[0] = []
+        btn_agregar_pegados_inline.visible = False
+        agregar_log("info",
+                    f"Contactos agregados desde búsqueda: {agregados} nuevos, "
+                    f"{omitidos} duplicados omitidos")
+        cargar_contactos(forzar=True)
+        safe_update()
+
+    btn_agregar_pegados_inline.on_click = _accion_agregar_pegados
+
     tf_buscar_contactos = ft.TextField(
-        hint_text="Buscar por nombre, cuenta o correo...",
+        hint_text=("Buscar por nombre, cuenta o correo... "
+                    "(o pegá una lista de emails con Ctrl+V para agregarlos)"),
         prefix_icon=ft.Icons.SEARCH_ROUNDED,
         border_color=C_BORDE,
         focused_border_color=C_MORADO,
         text_style=ft.TextStyle(font_family="Saira"),
         expand=True,
-        on_change=lambda e: (filtro_actual.__setitem__(0, e.control.value),
-                             _aplicar_filtro_contactos()),
+        on_change=_on_buscar_change,
     )
 
     btn_pag_prev = ft.IconButton(
@@ -1120,6 +1668,15 @@ def main(page: ft.Page):
                     btn_pag_next,
                 ],
             ),
+            ft.Row(
+                vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                spacing=12,
+                controls=[
+                    lbl_pegar_detect,
+                    ft.Container(expand=True),
+                    btn_agregar_pegados_inline,
+                ],
+            ),
             ft.Container(
                 expand=True,
                 bgcolor=C_BLANCO,
@@ -1145,14 +1702,24 @@ def main(page: ft.Page):
     # ==========================================
     lista_rechazados      = ft.ListView(expand=True, spacing=8,
                                          padding=ft.Padding(8, 8, 8, 8))
-    lbl_rechazados_total  = ft.Text("", size=12, color=C_TEXTO_3, font_family="Saira")
-    lbl_rechazados_estado = ft.Text("", size=11, color=C_AZUL, font_family="Saira",
-                                     italic=True)
-    chk_mostrar_depurados = ft.Checkbox(label="Mostrar depurados", value=False,
-                                         active_color=C_MORADO,
-                                         label_style=ft.TextStyle(font_family="Saira",
-                                                                   size=12,
-                                                                   color=C_TEXTO_2))
+    lbl_rechazados_total  = ft.Text("", size=12, color=C_TEXTO_3, font_family="Saira",
+                                     no_wrap=True)
+    lbl_rechazados_pagina = ft.Text("", size=12, color=C_TEXTO_2, font_family="Saira",
+                                     no_wrap=True)
+    lbl_rechazados_estado = ft.Text(
+        "", size=11, color=C_AZUL, font_family="Saira", italic=True,
+        max_lines=1, overflow=ft.TextOverflow.ELLIPSIS, no_wrap=True,
+    )
+    chk_mostrar_depurados = ft.Checkbox(
+        label="Ver sólo depurados",
+        value=False,
+        active_color=C_MORADO,
+        label_style=ft.TextStyle(font_family="Saira", size=12, color=C_TEXTO_2),
+        tooltip="Activado: muestra SÓLO los rechazados ya depurados.\n"
+                "Desactivado: muestra los pendientes de depurar.",
+    )
+    pagina_rechazados     = [0]
+    TAM_PAGINA_RECH       = 50
 
     def _flash(msg, color=C_AZUL, segundos=2):
         lbl_rechazados_estado.value = msg
@@ -1165,6 +1732,63 @@ def main(page: ft.Page):
                 lbl_rechazados_estado.value = ""
                 safe_update()
         threading.Thread(target=_limpiar, daemon=True).start()
+
+    # Ring para escaneo forzado IMAP (mailer-daemon + postmaster)
+    ring_rechazados_scan = ft.ProgressRing(
+        color=C_MORADO, width=18, height=18,
+        stroke_width=2.5, visible=False,
+    )
+    chk_borrar_gmail = ft.Checkbox(
+        label="También borrar de Gmail al depurar",
+        value=True,
+        active_color=C_MORADO,
+        label_style=ft.TextStyle(font_family="Saira", size=12, color=C_TEXTO_2),
+        tooltip="Mueve el correo de mailer-daemon a la papelera de Gmail "
+                "cuando marcás un email como depurado.",
+    )
+
+    def _escanear_rebotes_forzado(e=None):
+        """Reescanea IMAP por mailer-daemon + postmaster en los últimos
+        7 días. Si el usuario eliminó manualmente correos de rebotes,
+        esos desaparecen del listado al refrescar."""
+        if ring_rechazados_scan.visible:
+            return
+        cfg = enviar_correos.cargar_config()
+        if not cfg.get("correo") or not cfg.get("password"):
+            _flash("Configurá la cuenta antes de escanear.", C_ROJO, 3)
+            return
+        ring_rechazados_scan.visible = True
+        _flash("Escaneando rebotes en IMAP (mailer-daemon + postmaster)...",
+               C_AZUL, 60)
+        safe_update(ring_rechazados_scan)
+
+        def trabajador():
+            try:
+                resultado = enviar_correos.revisar_rebotes_recientes(dias=7)
+                if resultado.get("error"):
+                    _flash(f"Error: {resultado['error']}", C_ROJO, 6)
+                else:
+                    partes = [f"Total: {resultado['total']}"]
+                    if resultado["agregados"]:
+                        partes.append(f"+{resultado['agregados']} nuevos")
+                    if resultado["eliminados"]:
+                        partes.append(f"-{resultado['eliminados']} restablecidos")
+                    _flash("Escaneo completo. " + " · ".join(partes),
+                           C_EXITO, 5)
+                    agregar_log(
+                        "info",
+                        f"Re-escaneo de rebotes: {resultado['total']} en total, "
+                        f"{resultado['agregados']} nuevos, "
+                        f"{resultado['eliminados']} restablecidos."
+                    )
+            except Exception as ex:
+                _flash(f"Falló: {ex}", C_ROJO, 6)
+            finally:
+                ring_rechazados_scan.visible = False
+                safe_update(ring_rechazados_scan)
+                refrescar_rechazados()
+
+        threading.Thread(target=trabajador, daemon=True).start()
 
     def refrescar_rechazados():
         rechazados   = enviar_correos.cargar_rechazados_todos()
@@ -1181,14 +1805,32 @@ def main(page: ft.Page):
                 unicos.append(r)
         rechazados = unicos
 
-        nuevos_controles = []
-        visibles = 0
+        # Filtrar primero (más rápido) y después paginar.
+        # Lógica del checkbox:
+        #   chk OFF (default) → muestra sólo PENDIENTES (no depurados)
+        #   chk ON            → muestra sólo DEPURADOS (los ya procesados)
+        items_visibles = []
         for item in rechazados:
             es_dep = item["email"] in depurados
-            if es_dep and not mostrar_dep:
+            if mostrar_dep and not es_dep:
                 continue
-            visibles += 1
+            if (not mostrar_dep) and es_dep:
+                continue
+            items_visibles.append((item, es_dep))
 
+        total_visibles = len(items_visibles)
+        max_pag = max(0, (total_visibles - 1) // TAM_PAGINA_RECH) if total_visibles else 0
+        if pagina_rechazados[0] > max_pag:
+            pagina_rechazados[0] = max_pag
+        if pagina_rechazados[0] < 0:
+            pagina_rechazados[0] = 0
+        ini = pagina_rechazados[0] * TAM_PAGINA_RECH
+        fin = min(ini + TAM_PAGINA_RECH, total_visibles)
+
+        nuevos_controles = []
+        visibles = total_visibles  # contador para el header
+
+        for item, es_dep in items_visibles[ini:fin]:
             email_txt = ft.Text(item["email"], size=14, weight=ft.FontWeight.W_600,
                                 color=C_TEXTO_1, font_family="Saira", selectable=True,
                                 expand=True)
@@ -1210,10 +1852,44 @@ def main(page: ft.Page):
                 if ya:
                     enviar_correos.desmarcar_depurado(correo)
                     _flash(f"{correo} restaurado", C_AZUL)
-                else:
-                    enviar_correos.marcar_depurado(correo)
-                    _flash(f"{correo} marcado como depurado", C_EXITO)
+                    refrescar_rechazados()
+                    return
+
+                # 1) Marcar depurado en JSON + refrescar UI AL INSTANTE
+                #    (sin esperar el IMAP delete que tarda 5-10s).
+                enviar_correos.marcar_depurado(correo)
+                _flash(f"✓ {correo} depurado", C_EXITO, 3)
                 refrescar_rechazados()
+
+                # 2) En background, si está activado, borrar el rebote
+                #    correspondiente de Gmail (lento por IMAP).
+                if bool(chk_borrar_gmail.value):
+                    def _bg_delete():
+                        try:
+                            movidos = enviar_correos.borrar_correo_rebote_gmail(
+                                correo
+                            )
+                            if movidos:
+                                _flash(
+                                    f"🗑 {correo}: {movidos} rebote"
+                                    f"{'s' if movidos != 1 else ''} "
+                                    "movido a la papelera de Gmail.",
+                                    C_EXITO, 4,
+                                )
+                                agregar_log(
+                                    "info",
+                                    f"Rebote de {correo} movido a "
+                                    f"papelera de Gmail.",
+                                )
+                            # Si movidos==0, no avisamos: el correo de
+                            # mailer-daemon ya no estaba en INBOX
+                            # (el cliente lo borró antes).
+                        except Exception as _ex:
+                            _flash(
+                                f"No se pudo borrar de Gmail: {_ex}",
+                                C_NARANJA, 4,
+                            )
+                    threading.Thread(target=_bg_delete, daemon=True).start()
 
             btn_copiar = ft.IconButton(
                 icon=ft.Icons.CONTENT_COPY_ROUNDED,
@@ -1281,16 +1957,55 @@ def main(page: ft.Page):
 
         lista_rechazados.controls = nuevos_controles
 
-        ocultos = sum(1 for r in rechazados if r["email"] in depurados) \
-                  if not mostrar_dep else 0
-        partes = [f"{visibles} visibles"]
-        if ocultos:
-            partes.append(f"{ocultos} ocultos")
-        partes.append(f"{len(rechazados)} totales")
-        lbl_rechazados_total.value = "  •  ".join(partes)
+        total_dep    = sum(1 for r in rechazados if r["email"] in depurados)
+        total_pend   = len(rechazados) - total_dep
+        modo_label   = "depurados" if mostrar_dep else "pendientes"
+        partes = [
+            f"{visibles} {modo_label}",
+            f"{total_pend} pendientes" if not mostrar_dep else f"{total_pend} pendientes",
+            f"{total_dep} depurados",
+            f"{len(rechazados)} totales",
+        ]
+        # Quitar el duplicado del modo_label que coincide con la línea siguiente
+        partes_unicas = []
+        vistos_lbl = set()
+        for p in partes:
+            if p not in vistos_lbl:
+                vistos_lbl.add(p)
+                partes_unicas.append(p)
+        lbl_rechazados_total.value = "  •  ".join(partes_unicas)
+
+        # Label de paginación
+        if total_visibles == 0:
+            lbl_rechazados_pagina.value = ""
+        else:
+            lbl_rechazados_pagina.value = (
+                f"Mostrando {ini + 1}–{fin} de {total_visibles}  •  "
+                f"Página {pagina_rechazados[0] + 1} / {max_pag + 1}"
+            )
         safe_update()
 
-    chk_mostrar_depurados.on_change = lambda e: refrescar_rechazados()
+    def _ir_pagina_rech(delta):
+        pagina_rechazados[0] += delta
+        refrescar_rechazados()
+
+    def _on_mostrar_dep_change(e):
+        pagina_rechazados[0] = 0
+        refrescar_rechazados()
+    chk_mostrar_depurados.on_change = _on_mostrar_dep_change
+
+    btn_rech_prev = ft.IconButton(
+        icon=ft.Icons.CHEVRON_LEFT_ROUNDED,
+        icon_color=C_MORADO,
+        on_click=lambda e: _ir_pagina_rech(-1),
+        tooltip="Página anterior",
+    )
+    btn_rech_next = ft.IconButton(
+        icon=ft.Icons.CHEVRON_RIGHT_ROUNDED,
+        icon_color=C_MORADO,
+        on_click=lambda e: _ir_pagina_rech(1),
+        tooltip="Página siguiente",
+    )
 
     vista_rechazados = ft.Column(
         expand=True,
@@ -1301,13 +2016,34 @@ def main(page: ft.Page):
                 controls=[
                     ft.Icon(ft.Icons.REPORT_GMAILERRORRED_ROUNDED, color=C_ROJO, size=22),
                     ft.Text("Rechazados", size=20, weight=ft.FontWeight.BOLD,
-                            color=C_TEXTO_1, font_family="Saira", expand=True),
-                    lbl_rechazados_estado,
+                            color=C_TEXTO_1, font_family="Saira", no_wrap=True),
+                    ring_rechazados_scan,
+                    ft.Container(
+                        expand=True,
+                        content=lbl_rechazados_estado,
+                        alignment=ft.Alignment(0, 0),
+                    ),
                     lbl_rechazados_total,
-                    ft.ElevatedButton(
-                        "Refrescar",
-                        icon=ft.Icons.REFRESH_ROUNDED,
+                    ft.OutlinedButton(
+                        "Recargar lista",
+                        icon=ft.Icons.LIST_ALT_ROUNDED,
                         on_click=lambda e: refrescar_rechazados(),
+                        style=ft.ButtonStyle(
+                            color={ft.ControlState.DEFAULT: C_MORADO},
+                            side={ft.ControlState.DEFAULT:
+                                  ft.BorderSide(1.2, C_MORADO)},
+                            shape=ft.RoundedRectangleBorder(radius=8),
+                            padding=ft.Padding(14, 12, 14, 12),
+                        ),
+                    ),
+                    ft.ElevatedButton(
+                        "Re-escanear IMAP",
+                        icon=ft.Icons.REFRESH_ROUNDED,
+                        on_click=_escanear_rebotes_forzado,
+                        tooltip="Vuelve a buscar rebotes (mailer-daemon + "
+                                "postmaster) en la bandeja. Si el cliente "
+                                "eliminó manualmente correos, se "
+                                "restablecen las estadísticas.",
                         style=ft.ButtonStyle(
                             bgcolor={ft.ControlState.DEFAULT: C_MORADO,
                                      ft.ControlState.HOVERED: C_MORADO_DARK},
@@ -1319,17 +2055,22 @@ def main(page: ft.Page):
                 ],
             ),
             ft.Row(
-                spacing=12,
+                spacing=14,
                 vertical_alignment=ft.CrossAxisAlignment.CENTER,
                 controls=[
                     chk_mostrar_depurados,
+                    chk_borrar_gmail,
                     ft.Container(expand=True),
-                    ft.Text(
-                        "Tip: Marcá como depurado los que ya pasaste a tu base externa. "
-                        "Quedan ocultos pero no se borran.",
-                        size=11, color=C_TEXTO_3, italic=True, font_family="Saira",
-                    ),
+                    btn_rech_prev,
+                    lbl_rechazados_pagina,
+                    btn_rech_next,
                 ],
+            ),
+            ft.Text(
+                "Marcá como depurado los que ya pasaste a tu base externa. "
+                "Si activás 'Borrar de Gmail' también se elimina el correo "
+                "de mailer-daemon.",
+                size=11, color=C_TEXTO_3, italic=True, font_family="Saira",
             ),
             ft.Container(
                 expand=True,
@@ -1404,39 +2145,71 @@ def main(page: ft.Page):
                                     color=C_TEXTO_3, font_family="Saira", italic=True),
                 )
             )
+        # Tarjeta horizontal con fecha legible arriba y badges abajo
         for d in dias:
             data = enviar_correos.cargar_historial_dia(d)
             env  = data.get("enviados", 0)
             reb  = data.get("rebotes", 0)
             dd   = d
+            # Fecha amigable: 2026-05-03 → "03 May 2026"
+            fecha_amigable = dd
+            try:
+                _meses = ["Ene","Feb","Mar","Abr","May","Jun",
+                          "Jul","Ago","Sep","Oct","Nov","Dic"]
+                _y, _m, _da = dd.split("-")
+                fecha_amigable = f"{_da} {_meses[int(_m)-1]} {_y}"
+            except Exception:
+                pass
 
             lista_historial_dias.controls.append(
                 ft.Container(
                     bgcolor=C_BLANCO,
-                    border_radius=ft.BorderRadius(10, 10, 10, 10),
+                    border_radius=ft.BorderRadius(12, 12, 12, 12),
                     border=borde_all(1, C_BORDE),
-                    padding=ft.Padding(16, 12, 16, 12),
+                    padding=ft.Padding(14, 12, 14, 12),
                     on_click=lambda e, fecha=dd: cargar_dia_historial(fecha),
                     ink=True,
-                    content=ft.Row(
+                    content=ft.Column(
+                        spacing=10,
                         controls=[
-                            ft.Icon(ft.Icons.CALENDAR_TODAY_ROUNDED, color=C_MORADO, size=16),
-                            ft.Text(dd, size=13, weight=ft.FontWeight.W_600,
-                                    color=C_TEXTO_1, font_family="Saira", expand=True),
-                            ft.Container(
-                                bgcolor=C_MORADO_LIGHT,
-                                border_radius=ft.BorderRadius(6, 6, 6, 6),
-                                padding=ft.Padding(8, 2, 8, 2),
-                                content=ft.Text(f"{env} env.", size=11, color=C_MORADO,
-                                                font_family="Saira"),
+                            ft.Row(
+                                vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                                spacing=8,
+                                controls=[
+                                    ft.Icon(ft.Icons.CALENDAR_TODAY_ROUNDED,
+                                            color=C_MORADO, size=16),
+                                    ft.Text(fecha_amigable, size=14,
+                                            weight=ft.FontWeight.BOLD,
+                                            color=C_TEXTO_1, font_family="Saira",
+                                            no_wrap=True),
+                                ],
                             ),
-                            ft.Container(width=6),
-                            ft.Container(
-                                bgcolor=C_ROJO_LIGHT,
-                                border_radius=ft.BorderRadius(6, 6, 6, 6),
-                                padding=ft.Padding(8, 2, 8, 2),
-                                content=ft.Text(f"{reb} rech.", size=11, color=C_ROJO,
-                                                font_family="Saira"),
+                            ft.Row(
+                                spacing=6,
+                                controls=[
+                                    ft.Container(
+                                        bgcolor=C_MORADO_LIGHT,
+                                        border_radius=ft.BorderRadius(6, 6, 6, 6),
+                                        padding=ft.Padding(10, 3, 10, 3),
+                                        content=ft.Text(
+                                            f"{env} env.", size=11,
+                                            color=C_MORADO,
+                                            weight=ft.FontWeight.W_600,
+                                            font_family="Saira",
+                                        ),
+                                    ),
+                                    ft.Container(
+                                        bgcolor=C_ROJO_LIGHT,
+                                        border_radius=ft.BorderRadius(6, 6, 6, 6),
+                                        padding=ft.Padding(10, 3, 10, 3),
+                                        content=ft.Text(
+                                            f"{reb} rech.", size=11,
+                                            color=C_ROJO,
+                                            weight=ft.FontWeight.W_600,
+                                            font_family="Saira",
+                                        ),
+                                    ),
+                                ],
                             ),
                         ],
                     ),
@@ -1473,7 +2246,7 @@ def main(page: ft.Page):
                 spacing=16,
                 controls=[
                     ft.Container(
-                        width=240,
+                        width=290,
                         bgcolor=C_BLANCO,
                         border_radius=ft.BorderRadius(14, 14, 14, 14),
                         border=borde_all(1, C_BORDE),
@@ -1944,6 +2717,7 @@ def main(page: ft.Page):
     filtro_respuestas     = ["todas"]                       # todas | respuestas | calendly
     filtro_asunto_resp    = [""]                            # texto libre
     solo_campana_resp     = [True]                          # sólo correos cuyo asunto matchee la campaña
+    mostrar_ignorados     = [False]                         # checkbox "Mostrar ignorados"
     pagina_resp           = [0]
     TAM_PAGINA_RESP       = 15
 
@@ -2168,12 +2942,25 @@ def main(page: ft.Page):
                 if (item.get("date") or "") > (g["ultimo"].get("date") or ""):
                     g["ultimo"] = item
 
-        agrupados = list(grupos.values())
+        # Filtrar hilos ignorados (a menos que el usuario quiera verlos)
+        ignorados_set = enviar_correos.cargar_ignorados()
+        agrupados = []
+        contado_ignorados = 0
+        for g in grupos.values():
+            es_ignorado = g["clave"] in ignorados_set
+            if es_ignorado:
+                contado_ignorados += 1
+                if not mostrar_ignorados[0]:
+                    continue
+            g["ignorado"] = es_ignorado
+            agrupados.append(g)
+
         agrupados.sort(key=lambda g: g["ultimo"].get("date", ""), reverse=True)
-        return agrupados, len(respuestas), len(calendly)
+        # Devolvemos también el conteo de ignorados para el header
+        return agrupados, len(respuestas), len(calendly), contado_ignorados
 
     def _render_respuestas():
-        grupos, total_resp, total_cal = _items_filtrados()
+        grupos, total_resp, total_cal, total_ignorados = _items_filtrados()
         total_visibles = len(grupos)
 
         max_pag = max(0, (total_visibles - 1) // TAM_PAGINA_RESP) if total_visibles else 0
@@ -2193,11 +2980,16 @@ def main(page: ft.Page):
             count = grupo["count"]
             clave = grupo["clave"]
             uids  = grupo.get("uids", [])
+            es_ignorado = grupo.get("ignorado", False)
 
             # ¿El hilo tiene mensajes nuevos sin que el usuario los abrió?
             hay_nuevos = any(u not in vistos_set for u in uids) if uids else (
                 clave not in vistos_set
             )
+            # Detectar respuesta automática (sólo etiqueta sugerida)
+            sugerir_ignorar = enviar_correos.parece_auto_reply(
+                item.get("subject", "")
+            ) and not es_ignorado
 
             if tipo == "calendly":
                 icono       = ft.Icons.EVENT_AVAILABLE_ROUNDED
@@ -2250,6 +3042,16 @@ def main(page: ft.Page):
                 url = f"mailto:{correo}?subject=Re:%20{asunto_q.replace(' ', '%20')}"
                 page.launch_url(url)
 
+            def _toggle_ignorar(e, clave_loc=clave, ya=es_ignorado,
+                                  principal_loc=accion_email):
+                if ya:
+                    enviar_correos.desmarcar_ignorado(clave_loc)
+                    _flash_resp(f"Restaurado: {principal_loc}", C_AZUL, 3)
+                else:
+                    enviar_correos.marcar_ignorado(clave_loc)
+                    _flash_resp(f"Ignorado: {principal_loc}", C_NARANJA, 3)
+                _render_respuestas()
+
             # Badge "+N" si el hilo tiene varios mensajes
             badge_count = []
             if count > 1:
@@ -2263,6 +3065,36 @@ def main(page: ft.Page):
                                          weight=ft.FontWeight.BOLD,
                                          font_family="Saira"),
                         tooltip=f"{count} mensajes en este hilo",
+                    )
+                )
+
+            # Badge "AUTO" si parece respuesta automática
+            badge_auto = []
+            if sugerir_ignorar:
+                badge_auto.append(
+                    ft.Container(
+                        bgcolor=C_NARANJA_LIGHT,
+                        border_radius=ft.BorderRadius(4, 4, 4, 4),
+                        padding=ft.Padding(6, 1, 6, 1),
+                        content=ft.Text("AUTO", size=9, color=C_NARANJA,
+                                        weight=ft.FontWeight.BOLD,
+                                        font_family="Saira"),
+                        tooltip="Parece respuesta automática "
+                                "(out-of-office / unsubscribe / etc.)",
+                    )
+                )
+
+            # Badge "IGNORADO" si está ignorado
+            badge_ignorado = []
+            if es_ignorado:
+                badge_ignorado.append(
+                    ft.Container(
+                        bgcolor=C_TEXTO_3 + "33",
+                        border_radius=ft.BorderRadius(4, 4, 4, 4),
+                        padding=ft.Padding(6, 1, 6, 1),
+                        content=ft.Text("IGNORADO", size=9, color=C_TEXTO_3,
+                                        weight=ft.FontWeight.BOLD,
+                                        font_family="Saira"),
                     )
                 )
 
@@ -2318,6 +3150,8 @@ def main(page: ft.Page):
                                                     font_family="Saira",
                                                     selectable=True),
                                             *badge_count,
+                                            *badge_auto,
+                                            *badge_ignorado,
                                         ],
                                     ),
                                     ft.Text(subtitulo, size=12, color=C_TEXTO_2,
@@ -2338,6 +3172,16 @@ def main(page: ft.Page):
                                 icon_color=C_TEXTO_3,
                                 tooltip="Abrir en cliente externo (mailto)",
                                 on_click=_abrir_mailto_externo,
+                            ),
+                            ft.IconButton(
+                                icon=(ft.Icons.VISIBILITY_ROUNDED if es_ignorado
+                                       else ft.Icons.VISIBILITY_OFF_ROUNDED),
+                                icon_color=(C_AZUL if es_ignorado
+                                             else C_TEXTO_3),
+                                tooltip=("Restaurar (volver a mostrar)"
+                                          if es_ignorado
+                                          else "Ignorar este hilo"),
+                                on_click=_toggle_ignorar,
                             ),
                             ft.ElevatedButton(
                                 "Responder",
@@ -2368,10 +3212,14 @@ def main(page: ft.Page):
                 )
             )
 
-        lbl_resp_total.value = (
-            f"{total_resp} respuestas  •  {total_cal} reuniones  •  "
-            f"{total_visibles} hilos"
-        )
+        partes_total = [
+            f"{total_resp} respuestas",
+            f"{total_cal} reuniones",
+            f"{total_visibles} hilos",
+        ]
+        if total_ignorados:
+            partes_total.append(f"{total_ignorados} ignorados")
+        lbl_resp_total.value = "  •  ".join(partes_total)
         if total_visibles == 0:
             lbl_resp_pagina.value = ""
         else:
@@ -2462,6 +3310,15 @@ def main(page: ft.Page):
                              pagina_resp.__setitem__(0, 0),
                              _render_respuestas()),
     )
+    chk_mostrar_ignorados = ft.Checkbox(
+        label="Mostrar ignorados",
+        value=False,
+        active_color=C_MORADO,
+        label_style=ft.TextStyle(font_family="Saira", size=12, color=C_TEXTO_2),
+        on_change=lambda e: (mostrar_ignorados.__setitem__(0, bool(e.control.value)),
+                             pagina_resp.__setitem__(0, 0),
+                             _render_respuestas()),
+    )
 
     btn_resp_prev = ft.IconButton(
         icon=ft.Icons.CHEVRON_LEFT_ROUNDED,
@@ -2512,6 +3369,7 @@ def main(page: ft.Page):
                     btns_filtro_resp["calendly"],
                     ft.Container(width=10),
                     chk_solo_campana,
+                    chk_mostrar_ignorados,
                 ],
             ),
             ft.Row(
@@ -2795,7 +3653,7 @@ def main(page: ft.Page):
                                 flags=re.IGNORECASE).strip()
         asunto = f"Re: {asunto_limpio}" if asunto_limpio else "Re:"
 
-        # Threading headers: usar el último mensaje del hilo
+        # Threading headers + Responder a todos
         in_reply_to = ""
         references  = ""
         cc_lista    = []
@@ -2805,28 +3663,34 @@ def main(page: ft.Page):
             ref_acum    = ultimo.get("references", "")
             references  = (ref_acum + " " + in_reply_to).strip() if ref_acum else in_reply_to
 
-            # "Responder a todos": tomamos el último mensaje recibido
-            # (entrante) y juntamos To + Cc, excluyendo nuestro propio
-            # correo y el destinatario principal.
-            ultimo_entrante = next(
-                (m for m in reversed(hilo_mensajes[0])
-                 if m.get("direccion") == "entrante"),
-                None,
-            )
-            base = ultimo_entrante or ultimo
-            mi_correo = (enviar_correos.MI_CORREO() or "").lower()
+            # "Responder a todos" REAL: recolectamos TODOS los emails que
+            # aparecieron en CUALQUIER mensaje del hilo (To + Cc + From),
+            # excluyendo nuestro propio correo y el destinatario principal.
+            # Esto asegura que si el cliente metió a alguien en copia en
+            # cualquier punto del hilo, lo seguimos incluyendo.
+            mi_correo   = (enviar_correos.MI_CORREO() or "").lower()
             destino_low = destino.lower()
-            todos_emails = re.findall(
-                r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+",
-                f"{base.get('to','')} {base.get('cc','')}",
-            )
-            for em in todos_emails:
-                em_low = em.lower()
-                if em_low == mi_correo or em_low == destino_low:
-                    continue
-                if em_low in [c.lower() for c in cc_lista]:
-                    continue
-                cc_lista.append(em)
+            ya_incluidos = {mi_correo, destino_low}
+
+            for m in hilo_mensajes[0]:
+                # En cada mensaje, juntar To + Cc. Si es entrante también
+                # incluir el From (porque en otros mensajes del hilo el
+                # remitente original puede haber sido distinto).
+                campos = [m.get("to", ""), m.get("cc", "")]
+                if m.get("direccion") == "entrante":
+                    # NO incluimos From de entrantes en CC porque ése es
+                    # el remitente principal — ya está en el TO.
+                    pass
+                texto_emails = " ".join(campos)
+                for em in re.findall(
+                    r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+",
+                    texto_emails,
+                ):
+                    em_low = em.lower()
+                    if em_low in ya_incluidos:
+                        continue
+                    ya_incluidos.add(em_low)
+                    cc_lista.append(em)
 
         cc_str = ", ".join(cc_lista) if cc_lista else None
 
@@ -4255,16 +5119,17 @@ def main(page: ft.Page):
                             )
                 except Exception:
                     pass
-            # Polling más rápido cuando el usuario está mirando Respuestas;
-            # un poco más lento si está en otra pestaña (ahorra red).
-            _time.sleep(3 if vista_actual[0] == "respuestas" else 5)
+            # Gmail rate-limita logins IMAP frecuentes con
+            # "Application-specific password required". 12-20s evita el
+            # bloqueo y sigue siendo casi en tiempo real para el usuario.
+            _time.sleep(12 if vista_actual[0] == "respuestas" else 20)
 
     if not _INIT_HECHO[0]:
         threading.Thread(target=watcher_respuestas, daemon=True).start()
     _INIT_HECHO[0] = True
 
     # ── Header del sidebar: nombre del producto + logo del cliente ──
-    logo_path = os.path.join(CARPETA_ACTUAL, "ITH-logo.png")
+    logo_path = os.path.join(CARPETA_ASSETS, "ITH-logo.png")
     sidebar_header = ft.Container(
         bgcolor=C_BLANCO,
         padding=ft.Padding(20, 22, 20, 22),

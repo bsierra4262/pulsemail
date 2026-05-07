@@ -1,31 +1,65 @@
-REM ─────────────────────────────────────────────────────────────────
-REM  Dependencias de IntelliHelp — Motor de Campañas
-REM  Ejecutar este archivo (o copiar-pegar las líneas) en una PC nueva
-REM  antes de correr "py interfaz.py".
-REM ─────────────────────────────────────────────────────────────────
+REM ═════════════════════════════════════════════════════════════════
+REM  PULSEMAIL — Dependencias
+REM ═════════════════════════════════════════════════════════════════
+REM
+REM  Para EJECUTAR la app desde el código fuente (modo desarrollo):
+REM    1. Instalar Python 3.11 o superior:  https://www.python.org/
+REM       Durante la instalación, marcar "Add Python to PATH".
+REM    2. Doble-click este archivo .txt → renombrarlo a .bat
+REM       (o copiar las líneas pip y ejecutarlas en una terminal)
+REM    3. Una vez instalado todo: ejecutar  py interfaz.py
+REM
+REM  Para COMPILAR a .exe distribuible (instalador profesional):
+REM    Ver el archivo  COMPILAR.md  para instrucciones completas.
+REM    Resumen: instalar Inno Setup → ejecutar build_installer.bat
+REM
+REM ═════════════════════════════════════════════════════════════════
 
-REM 1) Actualizar pip
+REM ───────────────────────────────────────────────────────────────
+REM  PASO 1 — Actualizar pip al último
+REM ───────────────────────────────────────────────────────────────
 python.exe -m pip install --upgrade pip
 
-REM 2) Flet (framework UI)
-pip install flet
 
-REM 3) html2image — renderiza el HTML del correo como imagen usando
-REM    Chrome headless. Esto permite que en la pestaña "Conversación"
-REM    cada correo se vea EXACTAMENTE igual a Gmail (logos, gradientes,
-REM    firmas con imágenes incrustadas, SVG, todo).
-REM    Requiere Chrome o Chromium instalado (Edge NO sirve).
+REM ───────────────────────────────────────────────────────────────
+REM  PASO 2 — Dependencias OBLIGATORIAS (sin esto la app NO arranca)
+REM ───────────────────────────────────────────────────────────────
+
+REM Flet — framework de UI multiplataforma
+pip install flet==0.84.0
+
+REM Pillow — manejo de imágenes (íconos, conversión PNG→ICO,
+REM trim de las capturas de Chrome, redimensionado de firma)
+pip install Pillow
+
+REM html2image — renderiza el HTML del correo como imagen usando
+REM Chrome headless. Es lo que hace que en la pestaña "Conversación"
+REM cada correo se vea EXACTAMENTE igual a Gmail (logos, gradientes,
+REM firmas con imágenes incrustadas, SVG, todo).
+REM Requiere Chrome o Chromium instalado en la PC. Edge NO sirve.
 pip install html2image
 
-REM 4) plyer — notificaciones nativas del SO (toast Windows 10/11) cuando
-REM    llega una respuesta nueva al hilo. Si no está, la app cae a un beep.
+
+REM ───────────────────────────────────────────────────────────────
+REM  PASO 3 — Dependencias OPCIONALES (la app funciona sin ellas)
+REM ───────────────────────────────────────────────────────────────
+
+REM plyer — notificaciones nativas de Windows 10/11 cuando llega
+REM una respuesta nueva al hilo. Sin esto, la app cae a un beep.
 pip install plyer
 
-REM 5) (Opcional) flet-webview — sólo funciona en mobile/web.
-REM    En desktop Windows NO se usa, pero no rompe nada si está instalado.
-pip install flet-webview
 
-REM ─────────────────────────────────────────────────────────────────
-REM  Compilar a .exe con logo y nombre propios (para distribuir):
-REM  flet pack interfaz.py --icon ITH-logo.ico --name "IntelliHelp Motor de Campañas" --product-name "IntelliHelp" --add-data "ITH-logo.png;." --add-data "icon-process.svg;." --add-data "icon-cost.svg;." --add-data "icon-prod.svg;." --add-data "icon-solution.svg;." --add-data "icon-calendar.svg;." --add-data "icon-whatsapp.svg;."
-REM ─────────────────────────────────────────────────────────────────
+REM ───────────────────────────────────────────────────────────────
+REM  PASO 4 (sólo para COMPILAR a .exe) — instalar Inno Setup
+REM ───────────────────────────────────────────────────────────────
+REM
+REM  Inno Setup es gratis. Descargar desde:
+REM    https://jrsoftware.org/isdl.php
+REM
+REM  Durante la instalación dejar la ruta por defecto:
+REM    C:\Program Files (x86)\Inno Setup 6\
+REM
+REM  Después, doble-click en  build_installer.bat  para generar:
+REM    installer_output\PulsemailSetup_v1.0.0.exe
+REM
+REM ───────────────────────────────────────────────────────────────

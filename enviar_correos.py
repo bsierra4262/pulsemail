@@ -1,4 +1,4 @@
-import os, csv, json, time, random, smtplib, imaplib, email, email.header, re, mimetypes, logging, base64, shutil, zipfile
+import os, sys, csv, json, time, random, smtplib, imaplib, email, email.header, re, mimetypes, logging, base64, shutil, zipfile
 from datetime import datetime, timedelta
 from email.message import EmailMessage
 from email.utils import formatdate, make_msgid, parsedate_to_datetime
@@ -6,7 +6,29 @@ from email.utils import formatdate, make_msgid, parsedate_to_datetime
 # ==========================================
 # 1. PARÁMETROS DEL SISTEMA Y LOGS
 # ==========================================
-CARPETA_ACTUAL = os.path.dirname(os.path.abspath(__file__))
+
+def _carpeta_app():
+    """Carpeta donde se guardan los datos del usuario (config, contactos,
+    historial, registros). Estable entre ejecuciones, también dentro de
+    un bundle PyInstaller (`flet pack`) donde `__file__` apuntaría a una
+    temp folder que se borra al cerrar la app."""
+    if getattr(sys, "frozen", False):
+        # Bundle compilado (.exe): usar el directorio del ejecutable
+        return os.path.dirname(os.path.abspath(sys.executable))
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def _carpeta_assets():
+    """Carpeta donde están los recursos empaquetados (logos, iconos SVG).
+    En PyInstaller onefile esto apunta a `sys._MEIPASS`. En modo dev,
+    apunta a la misma carpeta del script."""
+    if hasattr(sys, "_MEIPASS"):
+        return sys._MEIPASS
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+CARPETA_ACTUAL = _carpeta_app()
+CARPETA_ASSETS = _carpeta_assets()
 
 ARCHIVO_LOG = os.path.join(CARPETA_ACTUAL, "sistema_errores.log")
 logging.basicConfig(
@@ -24,11 +46,12 @@ ARCHIVO_RECHAZOS  = os.path.join(CARPETA_ACTUAL, "registro_rechazados.json")
 ARCHIVO_DEPURADOS = os.path.join(CARPETA_ACTUAL, "registro_depurados.json")
 ARCHIVO_RESPUESTAS = os.path.join(CARPETA_ACTUAL, "registro_respuestas.json")
 ARCHIVO_VISTOS    = os.path.join(CARPETA_ACTUAL, "registro_vistos.json")
+ARCHIVO_IGNORADOS = os.path.join(CARPETA_ACTUAL, "registro_ignorados.json")
 CARPETA_HISTORIAL = os.path.join(CARPETA_ACTUAL, "historial")
 
 # Configuración de los correos a enviar
 ASUNTO       = "TECNOLOGÍA PARA EMPRESAS: MEJORAR LA PRODUCTIVIDAD Y BAJAR COSTOS"
-CORREO_COPIA = "ventas@intellihelp.tech"
+CORREO_COPIA = "ventas@intellihelp.com"
 URL_WHATSAPP = "https://wa.me/5491150274827?text=Hola,%20me%20interesa%20conocer%20m%C3%A1s%20sobre%20sus%20soluciones."
 URL_CALENDLY = "https://calendly.com/rnasif-intellihelp/30min"
 
@@ -275,7 +298,7 @@ def preparar_correo(nombre, destino):
     msg.add_alternative(html, subtype="html")
 
     for archivo, id_imagen in ACTIVOS_MULTIMEDIA:
-        ruta = os.path.join(CARPETA_ACTUAL, archivo)
+        ruta = os.path.join(CARPETA_ASSETS, archivo)
         if not os.path.exists(ruta):
             continue
         with open(ruta, "rb") as img:
@@ -319,6 +342,10 @@ def revisar_rebotes(fecha_actual, enviados_hoy):
 
     cfg       = cargar_config()
     imap_host = cfg.get("imap_host", "imap.gmail.com")
+    # Cargar contactos de la campaña para filtrar — sólo contamos como
+    # rechazados los que SÍ pertenecen a NUESTRA lista (evita contar
+    # rebotes de otros correos del cliente).
+    contactos_set = emails_de_contactos()
 
     try:
         with imaplib.IMAP4_SSL(imap_host) as mail:
@@ -326,19 +353,33 @@ def revisar_rebotes(fecha_actual, enviados_hoy):
             mail.select("inbox")
 
             fecha_google = datetime.strptime(fecha_actual, "%Y-%m-%d").strftime("%d-%b-%Y")
-            estado, mensajes = mail.search(
-                None, f'(FROM "mailer-daemon@googlemail.com" SINCE "{fecha_google}")'
-            )
+            # Buscar también de "postmaster" (algunos servers lo usan en vez
+            # de mailer-daemon), no sólo googlemail.com
+            ids_total = set()
+            for remitente in ("mailer-daemon@googlemail.com",
+                              "mailer-daemon", "postmaster"):
+                try:
+                    estado, mensajes = mail.search(
+                        None, f'(FROM "{remitente}" SINCE "{fecha_google}")'
+                    )
+                    if estado == "OK" and mensajes and mensajes[0]:
+                        for n in mensajes[0].split():
+                            ids_total.add(n)
+                except Exception:
+                    continue
 
-            if estado != "OK" or not mensajes[0]:
+            if not ids_total:
                 print("Todo excelente. Ningún correo rebotó hoy.")
                 guardar_evento_historial(fecha_actual, "success",
                                          "Todo excelente. Ningún correo rebotó hoy.",
                                          enviados=enviados_hoy, rebotes=0)
                 return
 
-            for num_id in mensajes[0].split():
-                _, datos = mail.fetch(num_id, "(RFC822)")
+            for num_id in ids_total:
+                try:
+                    _, datos = mail.fetch(num_id, "(RFC822)")
+                except Exception:
+                    continue
                 for respuesta in datos:
                     if not isinstance(respuesta, tuple):
                         continue
@@ -355,9 +396,17 @@ def revisar_rebotes(fecha_actual, enviados_hoy):
 
                     for c in re.findall(r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+", texto):
                         c_limpio = c.lower()
-                        if "daemon" not in c_limpio and MI_CORREO().lower() not in c_limpio:
-                            rechazados.add(c_limpio)
-                            break
+                        if "daemon" in c_limpio or "postmaster" in c_limpio:
+                            continue
+                        if MI_CORREO().lower() in c_limpio:
+                            continue
+                        # Filtrar: sólo contamos rebotes de emails que
+                        # pertenecen a la campaña actual (contactos.csv).
+                        # Si no hay contactos cargados, aceptamos todo.
+                        if contactos_set and c_limpio not in contactos_set:
+                            continue
+                        rechazados.add(c_limpio)
+                        break
 
         historial = {}
         if os.path.exists(ARCHIVO_RECHAZOS):
@@ -479,8 +528,11 @@ def main():
 # ==========================================
 # 9. RECHAZADOS: vista global y depurados
 # ==========================================
-def cargar_rechazados_todos():
-    """Devuelve lista [{email, fecha}] de todos los rechazados conocidos, sin duplicar."""
+def cargar_rechazados_todos(filtrar_por_contactos=True):
+    """Devuelve lista [{email, fecha}] de todos los rechazados conocidos,
+    sin duplicar. Por defecto filtra: sólo los que están en contactos.csv
+    (es decir, los que pertenecen a NUESTRA campaña). Si no hay contactos
+    cargados, devuelve todos."""
     if not os.path.exists(ARCHIVO_RECHAZOS):
         return []
     try:
@@ -489,12 +541,18 @@ def cargar_rechazados_todos():
     except Exception:
         return []
 
+    contactos_set = emails_de_contactos() if filtrar_por_contactos else set()
+
     vistos = {}
     for fecha in sorted(data.keys()):
         bloque = data.get(fecha) or {}
         for c in bloque.get("correos", []):
             c_lower = (c or "").strip().lower()
             if not c_lower:
+                continue
+            # Filtrar: si tenemos contactos cargados y este email NO está
+            # entre ellos, lo descartamos (no es de la campaña actual).
+            if filtrar_por_contactos and contactos_set and c_lower not in contactos_set:
                 continue
             if c_lower not in vistos:
                 vistos[c_lower] = {"email": c_lower, "fecha": fecha}
@@ -518,10 +576,20 @@ def _guardar_depurados(conjunto):
         json.dump({"depurados": sorted(conjunto)}, f, indent=2, ensure_ascii=False)
 
 
-def marcar_depurado(email):
+def marcar_depurado(email, borrar_de_gmail=False):
+    """Marca el email como depurado. Si `borrar_de_gmail=True`, también
+    mueve a la papelera el correo de mailer-daemon/postmaster que reportó
+    el rebote (pensado para que el usuario haga un solo click y no tenga
+    que ir a Gmail a borrar manualmente)."""
     actuales = cargar_depurados()
     actuales.add((email or "").strip().lower())
     _guardar_depurados(actuales)
+    if borrar_de_gmail and email:
+        try:
+            return borrar_correo_rebote_gmail(email)
+        except Exception:
+            return 0
+    return 0
 
 
 def desmarcar_depurado(email):
@@ -568,6 +636,312 @@ def marcar_vistos(claves):
         if c:
             actuales.add(str(c))
     _guardar_vistos(actuales)
+
+
+# ── Hilos ignorados (out-of-office, unsubscribe, fuera de oficina, etc.) ──
+def cargar_ignorados():
+    """Set de claves de hilos que el usuario marcó como 'no me interesa'."""
+    if not os.path.exists(ARCHIVO_IGNORADOS):
+        return set()
+    try:
+        with open(ARCHIVO_IGNORADOS, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return set(data.get("ignorados", []))
+    except Exception:
+        return set()
+
+
+def _guardar_ignorados(conjunto):
+    try:
+        with open(ARCHIVO_IGNORADOS, "w", encoding="utf-8") as f:
+            json.dump({"ignorados": sorted(conjunto)}, f,
+                      indent=2, ensure_ascii=False)
+    except Exception:
+        pass
+
+
+def marcar_ignorado(clave):
+    if not clave:
+        return
+    actuales = cargar_ignorados()
+    actuales.add(str(clave))
+    _guardar_ignorados(actuales)
+
+
+def desmarcar_ignorado(clave):
+    actuales = cargar_ignorados()
+    actuales.discard(str(clave))
+    _guardar_ignorados(actuales)
+
+
+# Patrones que sugieren un correo automático (auto-reply, out-of-office,
+# unsubscribe, vacaciones, etc.). Se usan para sugerir ignorar pero
+# NO se ignoran automáticamente — siempre lo decide el usuario.
+_PATRONES_AUTO_REPLY = re.compile(
+    r"\b("
+    r"out\s*of\s*office|"
+    r"automatic\s*reply|"
+    r"auto[-\s]?reply|"
+    r"fuera\s*de\s*(la\s*)?oficina|"
+    r"respuesta\s*autom[aá]tica|"
+    r"vacaci[oó]n(es)?|"
+    r"unsubscribe|"
+    r"desuscribir|"
+    r"baja\s*de\s*la\s*lista|"
+    r"no[-\s]?reply|"
+    r"do[-\s]?not[-\s]?reply"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
+def parece_auto_reply(asunto):
+    """True si el asunto coincide con patrones típicos de respuesta automática."""
+    if not asunto:
+        return False
+    return bool(_PATRONES_AUTO_REPLY.search(asunto))
+
+
+# ============================================================
+# Re-escaneo forzado de rebotes (mailer-daemon + postmaster)
+# ============================================================
+# Direcciones que típicamente envían bounces.
+_REMITENTES_REBOTE = [
+    "mailer-daemon@googlemail.com",
+    "mailer-daemon",          # genérico (cualquier dominio)
+    "postmaster",
+]
+
+
+def revisar_rebotes_recientes(dias=7):
+    """Re-escanea IMAP en los últimos `dias` días buscando bounces de
+    mailer-daemon y postmaster, y reconstruye el listado de rechazados
+    sólo con los correos que TODAVÍA están en la bandeja (los que el
+    cliente eliminó manualmente desaparecen) Y que pertenecen a la
+    campaña (están en contactos.csv).
+    Devuelve dict con: total, agregados, eliminados (limpiados de la lista).
+    """
+    cfg = cargar_config()
+    correo   = (cfg.get("correo")   or "").strip()
+    password = (cfg.get("password") or "").strip()
+    imap_host = (cfg.get("imap_host") or "imap.gmail.com").strip()
+    if not correo or not password:
+        return {"total": 0, "agregados": 0, "eliminados": 0,
+                "error": "Sin credenciales"}
+
+    desde = (datetime.now() - timedelta(days=int(dias or 7))).strftime("%d-%b-%Y")
+    # Cargamos la lista de contactos de la campaña — sólo nos interesan
+    # los rebotes de emails que pertenecen a NUESTRA lista de envío.
+    contactos_set = emails_de_contactos()
+
+    # Set actual de rechazados (para detectar nuevos vs eliminados)
+    actuales_set = set()
+    historial_actual = {}
+    if os.path.exists(ARCHIVO_RECHAZOS):
+        try:
+            with open(ARCHIVO_RECHAZOS, "r", encoding="utf-8") as f:
+                historial_actual = json.load(f)
+            for fecha_k, bloque in historial_actual.items():
+                for c in (bloque.get("correos") or []):
+                    cl = (c or "").strip().lower()
+                    if cl:
+                        actuales_set.add(cl)
+        except Exception:
+            historial_actual = {}
+
+    encontrados = {}   # {fecha_str: set(emails)}
+
+    try:
+        with imaplib.IMAP4_SSL(imap_host) as mail:
+            mail.login(correo, password)
+            mail.select("inbox", readonly=True)
+
+            # Buscar correos de cada remitente típico de rebotes
+            ids_total = set()
+            for remitente in _REMITENTES_REBOTE:
+                try:
+                    estado, ids = mail.search(
+                        None, f'(FROM "{remitente}" SINCE "{desde}")'
+                    )
+                    if estado == "OK" and ids and ids[0]:
+                        for n in ids[0].split():
+                            ids_total.add(n)
+                except Exception:
+                    continue
+
+            # También por el subject (algunos servers no usan mailer-daemon)
+            for asunto_kw in ("Delivery Status Notification",
+                              "Undeliverable",
+                              "Mail Delivery Failure"):
+                try:
+                    estado, ids = mail.search(
+                        None, f'(SUBJECT "{asunto_kw}" SINCE "{desde}")'
+                    )
+                    if estado == "OK" and ids and ids[0]:
+                        for n in ids[0].split():
+                            ids_total.add(n)
+                except Exception:
+                    continue
+
+            for num_id in ids_total:
+                try:
+                    _, datos = mail.fetch(num_id, "(RFC822)")
+                except Exception:
+                    continue
+                for r in datos:
+                    if not isinstance(r, tuple):
+                        continue
+                    try:
+                        raw = email.message_from_bytes(r[1])
+                    except Exception:
+                        continue
+
+                    # Fecha del rebote
+                    fecha_str = datetime.now().strftime("%Y-%m-%d")
+                    try:
+                        dt = parsedate_to_datetime(raw.get("Date", ""))
+                        if dt:
+                            fecha_str = dt.strftime("%Y-%m-%d")
+                    except Exception:
+                        pass
+
+                    # Extraer email rebotado del cuerpo
+                    cuerpo = _texto_correo(raw)
+                    encontrado = ""
+                    for c in re.findall(
+                        r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+",
+                        cuerpo,
+                    ):
+                        cl = c.lower()
+                        if "daemon" in cl or "postmaster" in cl:
+                            continue
+                        if cl == correo.lower():
+                            continue
+                        encontrado = cl
+                        break
+
+                    if encontrado:
+                        # Sólo lo contamos si pertenece a la campaña (está en
+                        # contactos.csv). Si no hay contactos cargados,
+                        # aceptamos todo (modo legacy).
+                        if not contactos_set or encontrado in contactos_set:
+                            encontrados.setdefault(fecha_str, set()).add(encontrado)
+
+        # Reconstruir el archivo de rechazados con SOLO los encontrados
+        # (esto efectivamente "limpia" rechazados que el usuario eliminó
+        # manualmente del INBOX, como pidió el cliente)
+        nuevo_historial = {}
+        for fecha_k, emails in encontrados.items():
+            nuevo_historial[fecha_k] = {
+                "total":   len(emails),
+                "correos": sorted(emails),
+            }
+
+        with open(ARCHIVO_RECHAZOS, "w", encoding="utf-8") as f:
+            json.dump(nuevo_historial, f, indent=4, ensure_ascii=False)
+
+        nuevos_set = set()
+        for emails in encontrados.values():
+            nuevos_set |= emails
+
+        # Sincronizar el contador de "rebotes" del historial diario, así
+        # el Dashboard y Estadísticas reflejan el número correcto sin
+        # esperar a que se vuelva a correr la campaña.
+        try:
+            for fecha_k, emails in encontrados.items():
+                data_dia = cargar_historial_dia(fecha_k)
+                data_dia["rebotes"] = len(emails)
+                ruta = _ruta_historial_dia(fecha_k)
+                with open(ruta, "w", encoding="utf-8") as f:
+                    json.dump(data_dia, f, indent=4, ensure_ascii=False)
+        except Exception:
+            pass
+
+        return {
+            "total":      len(nuevos_set),
+            "agregados":  len(nuevos_set - actuales_set),
+            "eliminados": len(actuales_set - nuevos_set),
+            "error":      "",
+        }
+
+    except Exception as e:
+        logging.error(f"Error en revisar_rebotes_recientes: {e}")
+        return {"total": 0, "agregados": 0, "eliminados": 0,
+                "error": str(e)}
+
+
+def borrar_correo_rebote_gmail(email_rechazado):
+    """Busca el(los) correo(s) de mailer-daemon/postmaster en INBOX que
+    rebotaron a `email_rechazado` y los mueve a la papelera de Gmail.
+    Devuelve cantidad de correos movidos."""
+    cfg = cargar_config()
+    correo   = (cfg.get("correo")   or "").strip()
+    password = (cfg.get("password") or "").strip()
+    imap_host = (cfg.get("imap_host") or "imap.gmail.com").strip()
+    if not correo or not password or not email_rechazado:
+        return 0
+
+    email_lower = email_rechazado.lower().strip()
+    movidos = 0
+
+    try:
+        with imaplib.IMAP4_SSL(imap_host) as mail:
+            mail.login(correo, password)
+
+            # Detectar dinámicamente el buzón Trash/Papelera de esta cuenta
+            buzon_papelera = _detectar_buzon_papelera(mail)
+
+            mail.select("inbox")
+
+            ids_buscar = set()
+            for remitente in _REMITENTES_REBOTE:
+                try:
+                    estado, ids = mail.search(None, f'(FROM "{remitente}")')
+                    if estado == "OK" and ids and ids[0]:
+                        for n in ids[0].split():
+                            ids_buscar.add(n)
+                except Exception:
+                    continue
+
+            for num_id in ids_buscar:
+                try:
+                    _, datos = mail.fetch(num_id, "(RFC822)")
+                except Exception:
+                    continue
+                for r in datos:
+                    if not isinstance(r, tuple):
+                        continue
+                    try:
+                        raw = email.message_from_bytes(r[1])
+                    except Exception:
+                        continue
+                    cuerpo = _texto_correo(raw).lower()
+                    if email_lower in cuerpo:
+                        # Mover a papelera (buzón detectado dinámicamente)
+                        movido_ok = False
+                        try:
+                            estado_copy, _ = mail.copy(num_id, buzon_papelera)
+                            if estado_copy == "OK":
+                                movido_ok = True
+                        except Exception:
+                            pass
+                        if movido_ok:
+                            try:
+                                mail.store(num_id, '+FLAGS', '\\Deleted')
+                                movidos += 1
+                            except Exception:
+                                pass
+                        break
+
+            try:
+                mail.expunge()
+            except Exception:
+                pass
+
+    except Exception as e:
+        logging.error(f"Error moviendo rebote a papelera ({email_rechazado}): {e}")
+
+    return movidos
 
 
 # ==========================================
@@ -1406,6 +1780,8 @@ def exportar_backup_completo(destino_zip):
 def importar_backup_completo(origen_zip):
     """Restaura un ZIP creado por `exportar_backup_completo()` encima de la
     carpeta actual. Sobrescribe los archivos existentes (hace .bak antes).
+    Tras restaurar, verifica que los paths referenciados en config (firma
+    de imagen) existan; si no, los limpia para que la app no se bugee.
     Devuelve (ok, mensaje)."""
     if not origen_zip or not os.path.exists(origen_zip):
         return False, "El backup no existe."
@@ -1414,8 +1790,6 @@ def importar_backup_completo(origen_zip):
 
     try:
         with zipfile.ZipFile(origen_zip, "r") as zf:
-            nombres = zf.namelist()
-
             # Hacer backup de los archivos críticos antes de pisar
             for nombre in _ARCHIVOS_BACKUP:
                 ruta_local = os.path.join(CARPETA_ACTUAL, nombre)
@@ -1445,10 +1819,68 @@ def importar_backup_completo(origen_zip):
                     except Exception:
                         pass
 
+        # ── Sanitización post-import ──
+        # Si el config menciona archivos que no se restauraron (ej: una
+        # firma_imagen con path antiguo), los limpiamos para que la app
+        # no falle al renderizar el preview ni al enviar correos.
+        try:
+            cfg = cargar_config()
+            firma_img = (cfg.get("firma_imagen") or "").strip()
+            if firma_img and not os.path.exists(firma_img):
+                cfg["firma_imagen"] = ""
+                if cfg.get("firma_tipo") == "imagen":
+                    cfg["firma_tipo"] = "texto"
+                guardar_config(cfg)
+        except Exception:
+            pass
+
         return True, f"Backup restaurado desde {origen_zip}"
     except Exception as e:
         logging.error(f"Error restaurando backup: {e}")
         return False, f"Error restaurando: {e}"
+
+
+def _detectar_buzon_papelera(mail):
+    """Devuelve el nombre del buzón Trash/Papelera de la cuenta IMAP.
+    Útil para Gmail (que usa [Gmail]/Trash en EN o [Gmail]/Papelera en ES)
+    y para otras cuentas. Si no encuentra, devuelve `[Gmail]/Trash` como
+    fallback."""
+    candidatos = []
+    try:
+        estado, lineas = mail.list()
+        if estado == "OK" and lineas:
+            for raw in lineas:
+                try:
+                    txt = raw.decode("utf-8", errors="ignore") if isinstance(
+                        raw, (bytes, bytearray)) else str(raw)
+                except Exception:
+                    continue
+                txt_low = txt.lower()
+                # Marcado con \Trash flag (estándar SPECIAL-USE)
+                if "\\trash" in txt_low:
+                    # El buzón es el último elemento entre comillas
+                    m = re.search(r'"([^"]+)"\s*$', txt)
+                    if m:
+                        candidatos.insert(0, m.group(1))
+                        continue
+                # Heurística por nombre
+                for kw in ('"[Gmail]/Trash"', '"[Gmail]/Papelera"',
+                           '"[Gmail]/Bin"', '"Trash"', '"Papelera"',
+                           '"Deleted Items"'):
+                    if kw.lower() in txt_low:
+                        m = re.search(r'"([^"]+)"\s*$', txt)
+                        if m:
+                            candidatos.append(m.group(1))
+    except Exception:
+        pass
+
+    if candidatos:
+        # Devolver el primer match con prefijo Gmail si existe
+        for c in candidatos:
+            if "trash" in c.lower() or "papelera" in c.lower() or "bin" in c.lower():
+                return f'"{c}"'
+        return f'"{candidatos[0]}"'
+    return '"[Gmail]/Trash"'
 
 
 if __name__ == "__main__":
