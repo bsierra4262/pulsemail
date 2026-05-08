@@ -50,7 +50,13 @@ Es una herramienta **profesional pero simple**: una vez configurada, abrís la a
 - Scroll horizontal automático para emails largos.
 
 ### Rechazados
-- Listado de todos los correos que rebotaron (mailer-daemon).
+
+- Listado de todos los correos que rebotaron, detectados desde **dos tipos de remitentes**:
+  - **`mailer-daemon`** (Gmail, Yahoo, hosts genéricos): notifica fallos como "dirección no existe", "buzón lleno", "dominio inválido".
+  - **`postmaster`** (Microsoft Exchange, Office 365, servidores corporativos): mismo propósito pero usado por servers que siguen RFC 5321 estricto.
+  - También captura variantes como `mail-daemon` (sendmail viejo) y bounces que vienen con subjects característicos como *"Delivery Status Notification"* o *"Mail Delivery Failure"*.
+- El reconocimiento es **case-insensitive** y por substring, así que `MAILER-DAEMON@empresa.com` o `Mail Delivery Subsystem <postmaster@server.com>` también entran.
+- Sólo cuentan los rebotes de contactos que están en tu `contactos.csv` — los rebotes de correos personales que comparten cuenta Gmail se ignoran.
 - **Botón "Depurar"** que mueve a la papelera de Gmail tanto el correo de rebote como el correo original que lo causó.
 - Reconoce micro-cortes y reintenta sin perder progreso.
 - Botón "Restaurar" para deshacer una depuración.
@@ -271,8 +277,10 @@ Reabrir Pulsemail para que detecte el CSV.
 2. Marcar los emails que querés depurar.
 3. Apretar **Depurar seleccionados**.
 4. La app:
-   - Mueve el correo de mailer-daemon de tu INBOX a la papelera.
-   - Mueve el correo original que enviaste (matched por Message-ID exacto) a la papelera.
+   - Identifica el bounce en tu INBOX. Reconoce los tres remitentes estándar: `mailer-daemon` (Gmail/Yahoo/genérico), `postmaster` (Exchange/Office 365) y `mail-daemon` (sendmail). Sin importar qué proveedor del destinatario lo emitió, el correo entra.
+   - Mueve ese bounce a la papelera de Gmail.
+   - Identifica el correo original que enviaste **matcheando por Message-ID exacto** (extraído del header `In-Reply-To` del bounce). Esto garantiza que NO toca otros correos legítimos enviados a ese mismo destinatario en campañas previas o hilos de soporte.
+   - Mueve el correo original a la papelera también.
    - **Sólo toca esos dos correos**, nada más.
 5. Si te equivocaste, apretar **Restaurar** y vuelven al INBOX.
 
@@ -460,8 +468,9 @@ Ver [Sección 7](#7-buenas-prácticas-cómo-evitar-baneos-y-filtros-de-spam). Ca
 
 | Término | Significado |
 |---|---|
-| **Bounce / Rebote** | Correo que el servidor del destinatario rechazó. Llega a tu INBOX desde "mailer-daemon@..." con el detalle del fallo. |
-| **Mailer-daemon / Postmaster** | Bot del servidor de correo que envía notificaciones de no-entrega. |
+| **Bounce / Rebote** | Correo que el servidor del destinatario rechazó. Llega a tu INBOX desde un bot del servidor remoto con el detalle del fallo. Pulsemail los detecta automáticamente. |
+| **Mailer-daemon** | Bot estándar de Gmail, Yahoo y la mayoría de proveedores. Su FROM contiene "mailer-daemon" (o variantes como "mail-daemon" en sendmail histórico). |
+| **Postmaster** | Bot definido por RFC 5321, usado por Microsoft Exchange, Office 365 y muchos servidores corporativos. Cumple la misma función que mailer-daemon. Pulsemail captura ambos sin distinción. |
 | **SMTP** | Protocolo de envío de correo (TCP 587 con STARTTLS). |
 | **IMAP** | Protocolo de lectura de correo (TCP 993 con SSL). |
 | **Contraseña de aplicación** | Token de 16 caracteres generado por Google para apps que necesitan acceder a Gmail por SMTP/IMAP sin OAuth. Requiere verificación en 2 pasos. |

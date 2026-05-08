@@ -260,9 +260,40 @@ Anti-spam de toasts implementado del lado UI (`_red_avisada` flags), no acá: qu
 def revisar_rebotes(fecha_actual, enviados_hoy):
 ```
 
-Conecta a IMAP, busca `FROM mailer-daemon@googlemail.com` desde la fecha de hoy. Por cada bounce: parsea el cuerpo extrayendo el email destinatario que falló (regex), lo agrega a `registro_rechazados.json` filtrando por `contactos_set` (sólo cuentan los rebotes de NUESTRA campaña, no de correos personales del usuario que comparten cuenta Gmail).
+Conecta a IMAP, busca el INBOX desde la fecha de hoy. Por cada bounce: parsea el cuerpo extrayendo el email destinatario que falló (regex), lo agrega a `registro_rechazados.json` filtrando por `contactos_set` (sólo cuentan los rebotes de NUESTRA campaña, no de correos personales del usuario que comparten cuenta Gmail).
 
-También chequea `postmaster` y variantes — algunos servidores los usan en lugar de `mailer-daemon`.
+**Remitentes que reconoce como bounces** — la búsqueda itera tres patrones en `FROM`:
+
+```python
+("mailer-daemon@googlemail.com", "mailer-daemon", "postmaster")
+```
+
+- `mailer-daemon@googlemail.com` → bounce explícito de Gmail.
+- `mailer-daemon` → cualquier dominio que use ese local-part (Outlook, Yahoo, hosts custom).
+- `postmaster` → estándar RFC 5321; lo usan Microsoft Exchange, Office 365, muchos hosts corporativos.
+
+Dentro de la app la lista canónica vive en `_REMITENTES_REBOTE` ([enviar_correos.py:1040-1044](enviar_correos.py#L1040)) y se reutiliza en:
+
+| Función | Archivo:línea | Para qué |
+| --- | --- | --- |
+| `revisar_rebotes` | enviar_correos.py:592 | Escaneo del día corriente al final de cada campaña |
+| `revisar_rebotes_recientes` | enviar_correos.py:1092 | Re-escaneo de últimos 7 días disparado desde la UI |
+| `borrar_correo_rebote_gmail` | enviar_correos.py:1228 | Mueve a papelera el bounce específico de un email |
+| `_gmail_delete_worker` | enviar_correos.py:1452 | Cola batch — valida que el correo a borrar sea bounce real |
+| `restaurar_correo_rebote_gmail` | enviar_correos.py:1607 | Busca el bounce en Trash para restaurarlo |
+| `detectar_respuestas_y_calendly` | enviar_correos.py:2451 | Excluye bounces de la bandeja de respuestas |
+
+**Match por substring (no exact match):** la búsqueda IMAP `FROM "postmaster"` matchea cualquier header que CONTENGA "postmaster" como substring del local-part o display name. Eso significa que entran:
+
+- `MAILER-DAEMON@empresa.com` (mayúsculas, Yahoo histórico)
+- `postmaster@cliente.es`
+- `Mail Delivery Subsystem <postmaster@server.com>`
+- `mail-daemon@dominio.com` (variante con guión usada por sendmail)
+- `noreply-daemon@hostmonster.com` (algunos hosts compartidos)
+
+Esto se complementa con un segundo filtro **del lado cliente** después del FETCH: comparamos `from_hdr.lower()` contra `"daemon"`, `"postmaster"` y `"mail-daemon"` ([enviar_correos.py:1452-1453](enviar_correos.py#L1452)). Esa redundancia de cinturón + tirantes evita falsos positivos cuando un servidor incluye "postmaster" en un encabezado distinto al `From`.
+
+**Heurística de subject como fallback** ([enviar_correos.py:1103](enviar_correos.py#L1103)): algunos servers no firman como `mailer-daemon` pero sí ponen subjects característicos (`"Delivery Status Notification"`, `"Undelivered Mail Returned to Sender"`, `"Mail Delivery Failure"`). `revisar_rebotes_recientes` también busca por SUBJECT con esos patrones para captar bounces emitidos por servidores no estándar.
 
 ### 4.12 `main()` — loop principal de campaña (líneas 677-848)
 
