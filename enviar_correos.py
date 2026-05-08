@@ -47,11 +47,77 @@ ARCHIVO_DEPURADOS = os.path.join(CARPETA_ACTUAL, "registro_depurados.json")
 ARCHIVO_RESPUESTAS = os.path.join(CARPETA_ACTUAL, "registro_respuestas.json")
 ARCHIVO_VISTOS    = os.path.join(CARPETA_ACTUAL, "registro_vistos.json")
 ARCHIVO_IGNORADOS = os.path.join(CARPETA_ACTUAL, "registro_ignorados.json")
+ARCHIVO_PENDIENTE = os.path.join(CARPETA_ACTUAL, "registro_pendiente.json")
+
+# ── Control de campaña: stop manual + reintentos red ───────────
+# Reintentos máximos por correo cuando se cae internet:
+#   1000 intentos × 10 s = ~2h 47min
+MAX_REINTENTOS_RED  = 1000
+INTERVALO_REINTENTO = 10
+import threading as _t_mod
+
+_STOP_CAMPANA = _t_mod.Event()
+_RED_HOOK     = [None]   # callback(estado, intento, maximo, destino)
+
+def reset_stop_campana():
+    _STOP_CAMPANA.clear()
+
+def detener_campana():
+    _STOP_CAMPANA.set()
+
+def campana_detenida():
+    return _STOP_CAMPANA.is_set()
+
+def set_red_hook(cb):
+    """Registra callback que recibe estados de la red durante envío.
+    estado ∈ ('caido', 'inestable', 'reintentando', 'recuperado',
+              'agotado', 'detenido')."""
+    _RED_HOOK[0] = cb
+
+def _emit_red(estado, intento, maximo, destino):
+    cb = _RED_HOOK[0]
+    if cb:
+        try:
+            cb(estado, intento, maximo, destino)
+        except Exception:
+            pass
+
+
+# ── Persistencia del correo en cola de reintentos ──────────────
+def cargar_pendiente():
+    """Devuelve {destino, nombre, intentos} o None."""
+    if not os.path.exists(ARCHIVO_PENDIENTE):
+        return None
+    try:
+        with open(ARCHIVO_PENDIENTE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+def guardar_pendiente(destino, nombre, intentos):
+    try:
+        data = {
+            "destino":  destino,
+            "nombre":   nombre or "",
+            "intentos": int(intentos),
+            "fecha":    datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        with open(ARCHIVO_PENDIENTE, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+    except Exception:
+        pass
+
+def borrar_pendiente():
+    try:
+        if os.path.exists(ARCHIVO_PENDIENTE):
+            os.remove(ARCHIVO_PENDIENTE)
+    except Exception:
+        pass
 CARPETA_HISTORIAL = os.path.join(CARPETA_ACTUAL, "historial")
 
 # Configuración de los correos a enviar
 ASUNTO       = "TECNOLOGÍA PARA EMPRESAS: MEJORAR LA PRODUCTIVIDAD Y BAJAR COSTOS"
-CORREO_COPIA = "ventas@intellihelp.com"
+CORREO_COPIA = ""
 URL_WHATSAPP = "https://wa.me/5491150274827?text=Hola,%20me%20interesa%20conocer%20m%C3%A1s%20sobre%20sus%20soluciones."
 URL_CALENDLY = "https://calendly.com/rnasif-intellihelp/30min"
 
@@ -83,23 +149,88 @@ _CONFIG_DEFAULTS = {
     "firma":         "",          # firma personal del usuario (texto plano)
     "firma_tipo":    "texto",     # 'texto' | 'imagen'
     "firma_imagen":  "",          # ruta absoluta a la imagen de firma
+    "correos_copia": "",          # CC: lista separada por coma o vacío
+    "logo_personalizado": "",     # path absoluto al logo del cliente
+    "url_calendly":      "",      # URL botón "Agendá una reunión"
+    "url_whatsapp":      "",      # URL botón "WhatsApp"
 }
 
-def cargar_config():
-    if not os.path.exists(ARCHIVO_CONFIG):
-        return dict(_CONFIG_DEFAULTS)
+
+def URL_CALENDLY_CFG():
+    """Devuelve la URL configurada por el usuario o la por defecto."""
+    v = (get_config_value("url_calendly") or "").strip()
+    return v or URL_CALENDLY
+
+
+def URL_WHATSAPP_CFG():
+    v = (get_config_value("url_whatsapp") or "").strip()
+    return v or URL_WHATSAPP
+
+
+def _parsear_cc(valor):
+    """Convierte el string del config 'a@x.com, b@y.com' en lista limpia."""
+    if not valor:
+        return []
+    partes = re.split(r"[,;\s]+", str(valor))
+    return [p.strip() for p in partes if "@" in p]
+
+# ── Cache con TTL para lecturas de disco frecuentes ──
+# Permite que cambiar entre pestañas sea instantáneo aunque internamente
+# se llamen funciones que leen JSON de disco (config, contactos,
+# rechazados, depurados, vistos, ignorados).
+_CACHE = {}        # key -> (mtime_archivo, ts_cache, valor)
+_CACHE_TTL = 3.0   # segundos
+
+
+def _cached_read(clave, archivo, loader):
+    """Lee `archivo` usando `loader()` si:
+      - no está en cache, O
+      - el archivo cambió en disco (mtime), O
+      - pasó más de _CACHE_TTL segundos.
+    Retorna lo que devuelve `loader()` (sin parámetros)."""
+    import time as _t
     try:
-        with open(ARCHIVO_CONFIG, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        cfg = dict(_CONFIG_DEFAULTS)
-        cfg.update(data)
-        return cfg
+        mtime = os.path.getmtime(archivo) if os.path.exists(archivo) else 0
     except Exception:
-        return dict(_CONFIG_DEFAULTS)
+        mtime = 0
+    ahora = _t.time()
+    entrada = _CACHE.get(clave)
+    if entrada is not None:
+        mt_old, ts_old, valor_old = entrada
+        if mt_old == mtime and (ahora - ts_old) < _CACHE_TTL:
+            return valor_old
+    valor = loader()
+    _CACHE[clave] = (mtime, ahora, valor)
+    return valor
+
+
+def _cache_invalidate(clave=None):
+    """Invalida el cache (o una clave puntual). Llamar después de
+    escribir un archivo para que la próxima lectura sea fresca."""
+    if clave is None:
+        _CACHE.clear()
+    else:
+        _CACHE.pop(clave, None)
+
+
+def cargar_config():
+    def _loader():
+        if not os.path.exists(ARCHIVO_CONFIG):
+            return dict(_CONFIG_DEFAULTS)
+        try:
+            with open(ARCHIVO_CONFIG, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            cfg = dict(_CONFIG_DEFAULTS)
+            cfg.update(data)
+            return cfg
+        except Exception:
+            return dict(_CONFIG_DEFAULTS)
+    return _cached_read("config", ARCHIVO_CONFIG, _loader)
 
 def guardar_config(cfg: dict):
     with open(ARCHIVO_CONFIG, "w", encoding="utf-8") as f:
         json.dump(cfg, f, indent=4, ensure_ascii=False)
+    _cache_invalidate("config")
 
 def get_config_value(key):
     return cargar_config().get(key, _CONFIG_DEFAULTS.get(key, ""))
@@ -235,16 +366,22 @@ def listar_dias_historial() -> list:
 def preparar_correo(nombre, destino):
     correo_remitente = MI_CORREO()
     msg = EmailMessage()
-    msg["Subject"], msg["From"], msg["To"], msg["Cc"] = (
-        f"{ASUNTO} | {nombre}",
-        correo_remitente,
-        destino,
-        CORREO_COPIA,
-    )
+    # CC: leemos del config (configurable desde la UI). Si está vacío,
+    # no agregamos cabecera Cc (Gmail no la incluye en el correo).
+    cc_lista = _parsear_cc(get_config_value("correos_copia"))
+    msg["Subject"] = f"{ASUNTO} | {nombre}"
+    msg["From"]    = correo_remitente
+    msg["To"]      = destino
+    if cc_lista:
+        msg["Cc"]  = ", ".join(cc_lista)
+
+    # URLs configurables por el usuario (si no, defaults del módulo)
+    url_cal = URL_CALENDLY_CFG()
+    url_wsp = URL_WHATSAPP_CFG()
 
     msg.set_content(
         f"Estimado/a {nombre}:\n\nAutomatizá tu empresa. Producí más, gastá menos.\n"
-        f"Agendá una reunión: {URL_CALENDLY}\nWhatsApp: {URL_WHATSAPP}"
+        f"Agendá una reunión: {url_cal}\nWhatsApp: {url_wsp}"
     )
 
     html = f"""
@@ -282,8 +419,8 @@ def preparar_correo(nombre, destino):
                 </td>
             </tr></table>
             <table width="100%" cellpadding="0" cellspacing="0"><tr><td align="left">
-                <table cellpadding="0" cellspacing="0" align="left" class="m-stack" style="margin-right: 10px;"><tr><td><a href="{URL_CALENDLY}" target="_blank" style="display: block; background-color: #663399; color: #ffffff; font-weight: 600; font-size: 14px; padding: 13px 20px; border-radius: 12px; text-decoration: none;"><img src="cid:icon_calendar" width="14" height="14" style="vertical-align: middle; margin-right: 6px;" /><span style="vertical-align: middle;">Agendá una reunión</span></a></td></tr></table>
-                <table cellpadding="0" cellspacing="0" align="left" class="m-stack"><tr><td><a href="{URL_WHATSAPP}" target="_blank" style="display: block; background-color: #25D366; color: #ffffff; font-weight: 600; font-size: 14px; padding: 13px 20px; border-radius: 12px; text-decoration: none;"><img src="cid:icon_whatsapp" width="14" height="14" style="vertical-align: middle; margin-right: 6px;" /><span style="vertical-align: middle;">WhatsApp</span></a></td></tr></table>
+                <table cellpadding="0" cellspacing="0" align="left" class="m-stack" style="margin-right: 10px;"><tr><td><a href="{url_cal}" target="_blank" style="display: block; background-color: #663399; color: #ffffff; font-weight: 600; font-size: 14px; padding: 13px 20px; border-radius: 12px; text-decoration: none;"><img src="cid:icon_calendar" width="14" height="14" style="vertical-align: middle; margin-right: 6px;" /><span style="vertical-align: middle;">Agendá una reunión</span></a></td></tr></table>
+                <table cellpadding="0" cellspacing="0" align="left" class="m-stack"><tr><td><a href="{url_wsp}" target="_blank" style="display: block; background-color: #25D366; color: #ffffff; font-weight: 600; font-size: 14px; padding: 13px 20px; border-radius: 12px; text-decoration: none;"><img src="cid:icon_whatsapp" width="14" height="14" style="vertical-align: middle; margin-right: 6px;" /><span style="vertical-align: middle;">WhatsApp</span></a></td></tr></table>
             </td></tr></table>
         </td></tr>
         <tr><td style="background-color: #161922; padding: 14px 28px;">
@@ -297,15 +434,25 @@ def preparar_correo(nombre, destino):
     """
     msg.add_alternative(html, subtype="html")
 
+    # Logo personalizado del usuario (si lo configuró). Sustituye al
+    # ITH-logo.png en el cid:logo_intellihelp del HTML del correo.
+    logo_user = (get_config_value("logo_personalizado") or "").strip()
+    activos = []
     for archivo, id_imagen in ACTIVOS_MULTIMEDIA:
-        ruta = os.path.join(CARPETA_ASSETS, archivo)
+        if id_imagen == "logo_intellihelp" and logo_user and os.path.exists(logo_user):
+            activos.append((logo_user, id_imagen, True))
+        else:
+            activos.append((os.path.join(CARPETA_ASSETS, archivo), id_imagen, False))
+
+    for ruta, id_imagen, es_absoluto in activos:
         if not os.path.exists(ruta):
             continue
         with open(ruta, "rb") as img:
             datos = img.read()
+        ext = os.path.splitext(ruta)[1].lower()
         tipo = (
             "image/svg+xml"
-            if archivo.endswith(".svg")
+            if ext == ".svg"
             else mimetypes.guess_type(ruta)[0] or "application/octet-stream"
         )
         t, st = tipo.split("/")
@@ -316,21 +463,110 @@ def preparar_correo(nombre, destino):
     return msg
 
 
-def enviar_correo(msg, destino):
+def enviar_correo(msg, destino, intentos_previos=0, nombre=""):
+    """Envía un correo con reintentos acotados por red.
+
+    Retorna uno de:
+      "enviado"    - éxito
+      "rechazado"  - destinatario inválido (SMTPRecipientsRefused).
+                     Avanzar al siguiente.
+      "auth"       - credenciales rotas. Abortar campaña.
+      "agotado"    - se agotaron los MAX_REINTENTOS_RED. Abortar.
+                     Queda guardado en `registro_pendiente.json`.
+      "detenido"   - el usuario apretó "Detener". Queda guardado en
+                     `registro_pendiente.json` para retomar luego.
+
+    `intentos_previos`: si ya se hicieron N intentos en una sesión
+    anterior (cargados desde pendiente), arrancamos desde ahí — así
+    el tope de 1000 es global por correo, no por sesión.
+    """
     cfg  = cargar_config()
     host = cfg.get("smtp_host", "smtp.gmail.com")
     port = int(cfg.get("smtp_port", 587))
-    try:
-        with smtplib.SMTP(host, port) as server:
-            server.starttls()
-            server.login(MI_CORREO(), MI_PASSWORD())
-            server.send_message(msg)
-        return True
-    except smtplib.SMTPRecipientsRefused:
-        logging.warning(f"Google avisó que este correo está mal escrito: {destino}")
-    except Exception as e:
-        logging.error(f"Se cortó internet o hubo un error enviando a {destino}. Detalle: {e}")
-    return False
+
+    intento = max(0, int(intentos_previos))
+    aviso_red = False
+
+    while intento < MAX_REINTENTOS_RED:
+        # Stop manual del usuario antes de cada intento de conexión
+        if campana_detenida():
+            guardar_pendiente(destino, nombre, intento)
+            _emit_red("detenido", intento, MAX_REINTENTOS_RED, destino)
+            return "detenido"
+
+        intento += 1
+        try:
+            with smtplib.SMTP(host, port, timeout=30) as server:
+                server.starttls()
+                server.login(MI_CORREO(), MI_PASSWORD())
+                server.send_message(msg)
+            if aviso_red:
+                _emit_red("recuperado", intento, MAX_REINTENTOS_RED, destino)
+                print(f" Conexión recuperada. Enviado a {destino} "
+                      f"en el intento {intento}.")
+            # Limpiar pendiente si lo había
+            borrar_pendiente()
+            return "enviado"
+
+        except smtplib.SMTPRecipientsRefused:
+            logging.warning(
+                f"Google avisó que este correo está mal escrito: {destino}"
+            )
+            borrar_pendiente()
+            return "rechazado"
+
+        except smtplib.SMTPAuthenticationError as e:
+            logging.error(
+                f"Credenciales SMTP rechazadas al enviar a {destino}: {e}"
+            )
+            borrar_pendiente()
+            return "auth"
+
+        except Exception as e:
+            err_str = str(e)
+            # Notificaciones escalonadas para no spamear:
+            #   intento 1   → "caido"        (acaba de cortarse)
+            #   intento 30  → "inestable"    (~5 min sin volver)
+            #   cada 100    → "reintentando" (avance periódico)
+            if intento == 1:
+                aviso_red = True
+                _emit_red("caido", intento, MAX_REINTENTOS_RED, destino)
+                logging.error(
+                    f"Sin conexión enviando a {destino}. "
+                    f"Reintentos hasta {MAX_REINTENTOS_RED}. {err_str[:80]}"
+                )
+                print(f" Sin conexión enviando a {destino}. "
+                      f"Reintento cada {INTERVALO_REINTENTO}s "
+                      f"hasta {MAX_REINTENTOS_RED} intentos.")
+            elif intento == 30:
+                _emit_red("inestable", intento, MAX_REINTENTOS_RED, destino)
+            elif intento % 100 == 0:
+                _emit_red("reintentando", intento, MAX_REINTENTOS_RED, destino)
+                print(f" Reintento {intento}/{MAX_REINTENTOS_RED} para "
+                      f"{destino}...")
+
+            # Persistimos el pendiente cada 10 intentos así sobrevivimos
+            # a un crash/cerrar app sin perder el correo en cola.
+            if intento % 10 == 0:
+                guardar_pendiente(destino, nombre, intento)
+
+            # Espera interrumpible: chequeamos stop event cada segundo
+            for _ in range(INTERVALO_REINTENTO):
+                if campana_detenida():
+                    guardar_pendiente(destino, nombre, intento)
+                    _emit_red("detenido", intento, MAX_REINTENTOS_RED, destino)
+                    return "detenido"
+                time.sleep(1)
+            continue
+
+    # Salimos del while → agotamos los reintentos sin éxito
+    guardar_pendiente(destino, nombre, intento)
+    _emit_red("agotado", intento, MAX_REINTENTOS_RED, destino)
+    logging.error(
+        f"Se agotaron los {MAX_REINTENTOS_RED} reintentos para {destino}. "
+        f"Guardado en pendiente para retomar."
+    )
+    return "agotado"
 
 
 # ==========================================
@@ -439,6 +675,10 @@ def revisar_rebotes(fecha_actual, enviados_hoy):
 # 8. MOTOR PRINCIPAL
 # ==========================================
 def main():
+    # Reset del flag de stop al comenzar la campaña — si veníamos de
+    # un "Detener" previo, ya no aplica para esta corrida nueva.
+    reset_stop_campana()
+
     limite = LIMITE_DIARIO()
     estado = cargar_estado()
     ultimo_correo = estado.get("ultimo_email", "")
@@ -461,14 +701,69 @@ def main():
         guardar_evento_historial(hoy, "error", msg)
         return
 
+    # ── Retomar pendiente: si en una sesión anterior se cortó internet
+    #    (o el usuario apretó Detener) y quedó un correo en `registro_
+    #    pendiente.json`, lo intentamos PRIMERO antes de seguir el CSV.
+    #    El tope de 1000 reintentos arranca desde el contador previo, así
+    #    el límite de ~3hs es global por correo, no por sesión.
+    pendiente = cargar_pendiente()
+    if pendiente and pendiente.get("destino"):
+        p_destino  = pendiente["destino"]
+        p_nombre   = pendiente.get("nombre") or "Cliente"
+        p_intentos = int(pendiente.get("intentos") or 0)
+        msg_p = (f"Retomando correo pendiente: {p_destino} "
+                 f"(intentos previos: {p_intentos}/{MAX_REINTENTOS_RED}).")
+        print(msg_p)
+        guardar_evento_historial(hoy, "info", msg_p)
+        resultado = enviar_correo(
+            preparar_correo(p_nombre, p_destino), p_destino,
+            intentos_previos=p_intentos, nombre=p_nombre,
+        )
+        if resultado == "enviado":
+            enviados += 1
+            guardar_estado(p_destino, enviados, hoy)
+            msg = f"Enviado con éxito a: {p_destino} (Van {enviados} de {limite})"
+            print(msg)
+            guardar_evento_historial(hoy, "success", msg, enviados=enviados)
+        elif resultado == "rechazado":
+            msg = f"Correo pendiente {p_destino} rechazado por Gmail. Avanzando."
+            print(msg)
+            guardar_evento_historial(hoy, "warning", msg)
+            # ultimo_correo se actualiza al rechazado para no repetirlo
+            guardar_estado(p_destino, enviados, hoy)
+            ultimo_correo = p_destino
+        elif resultado in ("detenido", "agotado", "auth"):
+            # No se pudo: salimos sin tocar el CSV. Pendiente queda en disco.
+            motivo = {
+                "detenido": "Campaña detenida por el usuario.",
+                "agotado":  (f"Sin conexión tras {MAX_REINTENTOS_RED} reintentos. "
+                              "Campaña detenida automáticamente."),
+                "auth":     "Credenciales SMTP rechazadas.",
+            }[resultado]
+            print(motivo)
+            guardar_evento_historial(hoy, "error", motivo, enviados=enviados)
+            return
+
     with open(ARCHIVO_CSV, "r", encoding="utf-8") as f:
         lista_clientes = list(csv.DictReader(f))
+
+    # Recargar último_correo después de procesar pendiente — puede haberse
+    # actualizado si el pendiente fue enviado o rechazado.
+    estado_post = cargar_estado()
+    if estado_post.get("fecha") == hoy:
+        ultimo_correo = estado_post.get("ultimo_email", ultimo_correo)
 
     saltar_hasta_ultimo = bool(ultimo_correo)
     if saltar_hasta_ultimo:
         print("Avanzando automáticamente hasta encontrar dónde nos quedamos la última vez...")
 
     for fila in lista_clientes:
+        if campana_detenida():
+            msg = "Campaña detenida por el usuario."
+            print(msg)
+            guardar_evento_historial(hoy, "warning", msg, enviados=enviados)
+            return
+
         if enviados >= limite:
             print("\nLlegamos al máximo de envíos por hoy. Pausando programa.")
             guardar_evento_historial(hoy, "warning",
@@ -497,7 +792,12 @@ def main():
             or "Cliente"
         )
 
-        if enviar_correo(preparar_correo(nombre, destino), destino):
+        resultado = enviar_correo(
+            preparar_correo(nombre, destino), destino,
+            intentos_previos=0, nombre=nombre,
+        )
+
+        if resultado == "enviado":
             enviados += 1
             guardar_estado(destino, enviados, hoy)
             msg = f"Enviado con éxito a: {destino} (Van {enviados} de {limite})"
@@ -507,11 +807,32 @@ def main():
             if enviados < limite:
                 espera = random.randint(TIEMPO_MINIMO, TIEMPO_MAXIMO)
                 print(f" Esperando {espera} segundos antes del siguiente...")
-                time.sleep(espera)
-        else:
+                # Sleep interrumpible: si el usuario pide detener durante
+                # la pausa entre correos, salimos al instante.
+                for _ in range(espera):
+                    if campana_detenida():
+                        msg = "Campaña detenida por el usuario."
+                        print(msg)
+                        guardar_evento_historial(hoy, "warning", msg,
+                                                  enviados=enviados)
+                        return
+                    time.sleep(1)
+        elif resultado == "rechazado":
             msg = f"Error al enviar a: {destino}"
             print(msg)
             guardar_evento_historial(hoy, "error", msg)
+            # Avanzamos: el ultimo_email NO se actualiza para que
+            # `revisar_rebotes` lo detecte como rebote.
+        elif resultado in ("detenido", "agotado", "auth"):
+            motivo = {
+                "detenido": "Campaña detenida por el usuario.",
+                "agotado":  (f"Sin conexión tras {MAX_REINTENTOS_RED} reintentos. "
+                              "Campaña detenida automáticamente."),
+                "auth":     "Credenciales SMTP rechazadas.",
+            }[resultado]
+            print(motivo)
+            guardar_evento_historial(hoy, "error", motivo, enviados=enviados)
+            return
 
     if enviados == 0 and ultimo_correo:
         msg = "No se enviaron correos nuevos. Ya terminamos la lista entera."
@@ -532,48 +853,52 @@ def cargar_rechazados_todos(filtrar_por_contactos=True):
     """Devuelve lista [{email, fecha}] de todos los rechazados conocidos,
     sin duplicar. Por defecto filtra: sólo los que están en contactos.csv
     (es decir, los que pertenecen a NUESTRA campaña). Si no hay contactos
-    cargados, devuelve todos."""
-    if not os.path.exists(ARCHIVO_RECHAZOS):
-        return []
-    try:
-        with open(ARCHIVO_RECHAZOS, "r", encoding="utf-8") as f:
-            data = json.load(f)
-    except Exception:
-        return []
+    cargados, devuelve todos. Cacheado por mtime."""
+    clave = f"rechazados_todos_{filtrar_por_contactos}"
+    def _loader():
+        if not os.path.exists(ARCHIVO_RECHAZOS):
+            return []
+        try:
+            with open(ARCHIVO_RECHAZOS, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            return []
 
-    contactos_set = emails_de_contactos() if filtrar_por_contactos else set()
+        contactos_set = emails_de_contactos() if filtrar_por_contactos else set()
 
-    vistos = {}
-    for fecha in sorted(data.keys()):
-        bloque = data.get(fecha) or {}
-        for c in bloque.get("correos", []):
-            c_lower = (c or "").strip().lower()
-            if not c_lower:
-                continue
-            # Filtrar: si tenemos contactos cargados y este email NO está
-            # entre ellos, lo descartamos (no es de la campaña actual).
-            if filtrar_por_contactos and contactos_set and c_lower not in contactos_set:
-                continue
-            if c_lower not in vistos:
-                vistos[c_lower] = {"email": c_lower, "fecha": fecha}
-    return list(vistos.values())
+        vistos = {}
+        for fecha in sorted(data.keys()):
+            bloque = data.get(fecha) or {}
+            for c in bloque.get("correos", []):
+                c_lower = (c or "").strip().lower()
+                if not c_lower:
+                    continue
+                if filtrar_por_contactos and contactos_set and c_lower not in contactos_set:
+                    continue
+                if c_lower not in vistos:
+                    vistos[c_lower] = {"email": c_lower, "fecha": fecha}
+        return list(vistos.values())
+    return _cached_read(clave, ARCHIVO_RECHAZOS, _loader)
 
 
 def cargar_depurados():
     """Set de correos marcados como ya depurados (ocultos en la pestaña)."""
-    if not os.path.exists(ARCHIVO_DEPURADOS):
-        return set()
-    try:
-        with open(ARCHIVO_DEPURADOS, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        return set((c or "").lower() for c in data.get("depurados", []))
-    except Exception:
-        return set()
+    def _loader():
+        if not os.path.exists(ARCHIVO_DEPURADOS):
+            return set()
+        try:
+            with open(ARCHIVO_DEPURADOS, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return set((c or "").lower() for c in data.get("depurados", []))
+        except Exception:
+            return set()
+    return _cached_read("depurados", ARCHIVO_DEPURADOS, _loader)
 
 
 def _guardar_depurados(conjunto):
     with open(ARCHIVO_DEPURADOS, "w", encoding="utf-8") as f:
         json.dump({"depurados": sorted(conjunto)}, f, indent=2, ensure_ascii=False)
+    _cache_invalidate("depurados")
 
 
 def marcar_depurado(email, borrar_de_gmail=False):
@@ -600,20 +925,23 @@ def desmarcar_depurado(email):
 
 def cargar_vistos():
     """Set de claves de hilos/respuestas ya vistas por el usuario."""
-    if not os.path.exists(ARCHIVO_VISTOS):
-        return set()
-    try:
-        with open(ARCHIVO_VISTOS, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        return set(data.get("vistos", []))
-    except Exception:
-        return set()
+    def _loader():
+        if not os.path.exists(ARCHIVO_VISTOS):
+            return set()
+        try:
+            with open(ARCHIVO_VISTOS, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return set(data.get("vistos", []))
+        except Exception:
+            return set()
+    return _cached_read("vistos", ARCHIVO_VISTOS, _loader)
 
 
 def _guardar_vistos(conjunto):
     try:
         with open(ARCHIVO_VISTOS, "w", encoding="utf-8") as f:
             json.dump({"vistos": sorted(conjunto)}, f, indent=2, ensure_ascii=False)
+        _cache_invalidate("vistos")
     except Exception:
         pass
 
@@ -641,14 +969,16 @@ def marcar_vistos(claves):
 # ── Hilos ignorados (out-of-office, unsubscribe, fuera de oficina, etc.) ──
 def cargar_ignorados():
     """Set de claves de hilos que el usuario marcó como 'no me interesa'."""
-    if not os.path.exists(ARCHIVO_IGNORADOS):
-        return set()
-    try:
-        with open(ARCHIVO_IGNORADOS, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        return set(data.get("ignorados", []))
-    except Exception:
-        return set()
+    def _loader():
+        if not os.path.exists(ARCHIVO_IGNORADOS):
+            return set()
+        try:
+            with open(ARCHIVO_IGNORADOS, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return set(data.get("ignorados", []))
+        except Exception:
+            return set()
+    return _cached_read("ignorados", ARCHIVO_IGNORADOS, _loader)
 
 
 def _guardar_ignorados(conjunto):
@@ -656,6 +986,7 @@ def _guardar_ignorados(conjunto):
         with open(ARCHIVO_IGNORADOS, "w", encoding="utf-8") as f:
             json.dump({"ignorados": sorted(conjunto)}, f,
                       indent=2, ensure_ascii=False)
+        _cache_invalidate("ignorados")
     except Exception:
         pass
 
@@ -891,8 +1222,8 @@ def borrar_correo_rebote_gmail(email_rechazado):
             # Detectar dinámicamente el buzón Trash/Papelera de esta cuenta
             buzon_papelera = _detectar_buzon_papelera(mail)
 
+            # ── 1) Borrar el correo de mailer-daemon / postmaster del INBOX
             mail.select("inbox")
-
             ids_buscar = set()
             for remitente in _REMITENTES_REBOTE:
                 try:
@@ -917,7 +1248,6 @@ def borrar_correo_rebote_gmail(email_rechazado):
                         continue
                     cuerpo = _texto_correo(raw).lower()
                     if email_lower in cuerpo:
-                        # Mover a papelera (buzón detectado dinámicamente)
                         movido_ok = False
                         try:
                             estado_copy, _ = mail.copy(num_id, buzon_papelera)
@@ -938,10 +1268,394 @@ def borrar_correo_rebote_gmail(email_rechazado):
             except Exception:
                 pass
 
+            # ── 2) Borrar el correo ENVIADO original al destinatario.
+            # Buscamos en todos los buzones de "enviados" comunes.
+            for buzon_sent in _BUZONES_SENT:
+                try:
+                    estado_sel, _ = mail.select(buzon_sent, readonly=False)
+                    if estado_sel != "OK":
+                        continue
+                    estado, ids = mail.search(
+                        None, f'(TO "{email_rechazado}")'
+                    )
+                    if estado == "OK" and ids and ids[0]:
+                        for num_id in ids[0].split():
+                            try:
+                                estado_copy, _ = mail.copy(num_id, buzon_papelera)
+                                if estado_copy == "OK":
+                                    mail.store(num_id, '+FLAGS', '\\Deleted')
+                                    movidos += 1
+                            except Exception:
+                                continue
+                        try:
+                            mail.expunge()
+                        except Exception:
+                            pass
+                    # Salimos al primer buzón Sent que existió
+                    break
+                except Exception:
+                    continue
+
     except Exception as e:
+        # Silencioso: si no hay nada para borrar, no es un error real para
+        # el usuario. Sólo se loguea para debug.
+        msg_err = str(e).lower()
+        if "no such" in msg_err or "doesn't exist" in msg_err or "not found" in msg_err:
+            return movidos  # no es error
         logging.error(f"Error moviendo rebote a papelera ({email_rechazado}): {e}")
 
     return movidos
+
+
+# ── Cola IMAP batch ─────────────────────────────────────────────
+# Cuando el usuario depura varios emails seguidos, en vez de abrir/cerrar
+# una conexión IMAP por cada uno (lento), encolamos todos en una sola
+# conexión. Un thread worker procesa la cola, mantiene la sesión IMAP
+# abierta y hace todos los deletes batch.
+import threading as _threading
+_GMAIL_DEL_QUEUE   = []
+_GMAIL_DEL_LOCK    = _threading.Lock()
+_GMAIL_DEL_RUNNING = [False]
+
+
+def encolar_borrado_gmail(email_rechazado, callback=None):
+    """Encola `email_rechazado` para borrar de Gmail. Si no hay worker
+    corriendo, lo lanza. callback(email, movidos) se ejecuta cuando
+    cada email termina de procesarse."""
+    if not email_rechazado:
+        return
+    with _GMAIL_DEL_LOCK:
+        _GMAIL_DEL_QUEUE.append((email_rechazado, callback))
+        if _GMAIL_DEL_RUNNING[0]:
+            return  # ya hay un worker, se va a comer este item también
+        _GMAIL_DEL_RUNNING[0] = True
+    _threading.Thread(target=_gmail_delete_worker, daemon=True).start()
+
+
+def _gmail_delete_worker():
+    """Worker que consume la cola con UNA sola conexión IMAP. Mucho más
+    rápido que abrir IMAP por cada email."""
+    cfg = cargar_config()
+    correo   = (cfg.get("correo")   or "").strip()
+    password = (cfg.get("password") or "").strip()
+    imap_host = (cfg.get("imap_host") or "imap.gmail.com").strip()
+    if not correo or not password:
+        with _GMAIL_DEL_LOCK:
+            _GMAIL_DEL_RUNNING[0] = False
+            _GMAIL_DEL_QUEUE.clear()
+        return
+
+    es_gmail = "gmail" in imap_host.lower() or "googlemail" in imap_host.lower()
+
+    try:
+        with imaplib.IMAP4_SSL(imap_host) as mail:
+            mail.login(correo, password)
+            buzon_papelera = _detectar_buzon_papelera(mail)
+
+            # Detectar buzón Sent que existe en esta cuenta (una sola vez)
+            buzon_sent_actual = None
+            for buzon_sent in _BUZONES_SENT:
+                try:
+                    estado_sel, _ = mail.select(buzon_sent, readonly=True)
+                    if estado_sel == "OK":
+                        buzon_sent_actual = buzon_sent
+                        break
+                except Exception:
+                    continue
+
+            # Helper: mueve físicamente el mensaje (UID) a la papelera.
+            # Usamos UID MOVE (RFC 6851) cuando está disponible — es una
+            # operación atómica del servidor. Gmail lo soporta. Si el
+            # servidor no implementa MOVE, caemos a UID COPY + UID STORE
+            # \Deleted + UID EXPUNGE (todo por UID, no por seq number,
+            # para evitar invalidaciones por concurrencia).
+            def _mover_uid_a_papelera(uid):
+                # Intento 1: UID MOVE (atómico)
+                try:
+                    estado, _ = mail.uid('MOVE', uid, buzon_papelera)
+                    if estado == "OK":
+                        return True
+                except Exception:
+                    pass
+                # Intento 2: UID COPY + UID STORE + UID EXPUNGE
+                try:
+                    estado_copy, _ = mail.uid('COPY', uid, buzon_papelera)
+                    if estado_copy != "OK":
+                        return False
+                    mail.uid('STORE', uid, '+FLAGS', '\\Deleted')
+                    # UID EXPUNGE sólo borra el UID puntual (no toda la
+                    # carpeta), evitando matar mensajes ajenos con \Deleted
+                    try:
+                        mail.uid('EXPUNGE', uid)
+                    except Exception:
+                        # Servidor no soporta UID EXPUNGE → expunge total
+                        try:
+                            mail.expunge()
+                        except Exception:
+                            pass
+                    return True
+                except Exception:
+                    return False
+
+            while True:
+                with _GMAIL_DEL_LOCK:
+                    if not _GMAIL_DEL_QUEUE:
+                        _GMAIL_DEL_RUNNING[0] = False
+                        return
+                    email_obj, cb = _GMAIL_DEL_QUEUE.pop(0)
+
+                movidos = 0
+                email_lower = email_obj.lower().strip()
+
+                # ── 1) Buscar bounce(s) del rebote en INBOX ──
+                # Sacamos UIDs (no seq numbers) para que sigan siendo
+                # válidos aunque otra operación borre algo en paralelo.
+                try:
+                    mail.select("inbox", readonly=False)
+                except Exception:
+                    pass
+
+                uids_inbox = []
+                try:
+                    estado, ids = mail.uid(
+                        'SEARCH', None, f'(BODY "{email_obj}")'
+                    )
+                    if estado == "OK" and ids and ids[0]:
+                        uids_inbox = ids[0].split()
+                except Exception:
+                    pass
+
+                # IDs originales del correo enviado que rebotó.
+                # Los extraemos del header In-Reply-To del bounce — eso
+                # apunta exactamente al Message-ID del correo que mandamos.
+                # Esto garantiza que sólo borramos ESE correo del Sent y
+                # no cualquier otro correo legítimo enviado al mismo email.
+                ids_originales = set()
+
+                for uid in uids_inbox:
+                    try:
+                        _, datos = mail.uid(
+                            'FETCH', uid, '(BODY.PEEK[HEADER])'
+                        )
+                    except Exception:
+                        continue
+                    es_bounce = False
+                    in_reply_to = ""
+                    for r in datos:
+                        if not isinstance(r, tuple):
+                            continue
+                        try:
+                            raw = email.message_from_bytes(r[1])
+                        except Exception:
+                            continue
+                        from_hdr = (raw.get("From", "") or "").lower()
+                        if ("daemon" in from_hdr or "postmaster" in from_hdr
+                                or "mail-daemon" in from_hdr):
+                            es_bounce = True
+                            in_reply_to = (
+                                raw.get("In-Reply-To", "")
+                                or raw.get("References", "")
+                                or ""
+                            ).strip()
+                        break
+
+                    if not es_bounce:
+                        continue
+
+                    # Mover el bounce a la papelera
+                    if _mover_uid_a_papelera(uid):
+                        movidos += 1
+
+                    # Si pudimos extraer el Message-ID original, marcarlo
+                    # para borrar también su gemelo en Sent.
+                    if in_reply_to:
+                        # Tomamos sólo el primer <id> si vienen varios
+                        m = re.search(r"<[^>]+>", in_reply_to)
+                        if m:
+                            ids_originales.add(m.group(0))
+
+                # ── 2) Mover el correo enviado original (matching exacto
+                #     por Message-ID) a la papelera ──
+                # Buscamos en TODAS las carpetas posibles (Sent, Inbox,
+                # All Mail). Esto cubre el caso "restaurar y volver a
+                # depurar": después de restaurar, el correo enviado puede
+                # estar en INBOX (no en Sent), así que buscar sólo en Sent
+                # lo perdería. Buscamos por HEADER Message-ID exacto, así
+                # que es imposible tocar un correo legítimo de otro id.
+                if ids_originales:
+                    buzones_a_revisar = []
+                    if buzon_sent_actual:
+                        buzones_a_revisar.append(buzon_sent_actual)
+                    buzones_a_revisar.append("inbox")
+                    # All Mail (Gmail) — contiene archivados/movidos también
+                    for b_am in _BUZONES_ALL_MAIL:
+                        buzones_a_revisar.append(b_am)
+
+                    uids_movidos_global = set()
+                    for buzon_busq in buzones_a_revisar:
+                        try:
+                            estado_sel, _ = mail.select(
+                                buzon_busq, readonly=False
+                            )
+                            if estado_sel != "OK":
+                                continue
+                        except Exception:
+                            continue
+                        for msg_id_original in ids_originales:
+                            try:
+                                estado, ids = mail.uid(
+                                    'SEARCH', None,
+                                    'HEADER', 'Message-ID',
+                                    msg_id_original,
+                                )
+                            except Exception:
+                                continue
+                            if estado != "OK" or not ids or not ids[0]:
+                                continue
+                            for uid_sent in ids[0].split():
+                                # Evitar contar 2x el mismo Gmail-msg que
+                                # aparece en Sent + All Mail (mismo X-GM-MSGID)
+                                clave = (buzon_busq, uid_sent)
+                                if clave in uids_movidos_global:
+                                    continue
+                                uids_movidos_global.add(clave)
+                                if _mover_uid_a_papelera(uid_sent):
+                                    movidos += 1
+
+                if cb:
+                    try:
+                        cb(email_obj, movidos)
+                    except Exception:
+                        pass
+
+    except Exception as e:
+        msg_err = str(e).lower()
+        if not any(k in msg_err for k in ("eof", "timeout", "timed out",
+                                          "no such", "doesn't exist",
+                                          "not found")):
+            logging.error(f"Worker batch delete falló: {e}")
+    finally:
+        with _GMAIL_DEL_LOCK:
+            _GMAIL_DEL_RUNNING[0] = False
+
+
+def restaurar_correo_rebote_gmail(email_rechazado):
+    """Si en la PAPELERA hay correos relacionados con `email_rechazado`
+    (rebote de mailer-daemon o el original enviado), los mueve de vuelta
+    a INBOX. Si no hay nada en papelera, no hace nada (no es error).
+    Devuelve cantidad de correos restaurados."""
+    cfg = cargar_config()
+    correo   = (cfg.get("correo")   or "").strip()
+    password = (cfg.get("password") or "").strip()
+    imap_host = (cfg.get("imap_host") or "imap.gmail.com").strip()
+    if not correo or not password or not email_rechazado:
+        return 0
+
+    email_lower = email_rechazado.lower().strip()
+    restaurados = 0
+    es_gmail = "gmail" in imap_host.lower() or "googlemail" in imap_host.lower()
+
+    try:
+        with imaplib.IMAP4_SSL(imap_host) as mail:
+            mail.login(correo, password)
+            buzon_papelera = _detectar_buzon_papelera(mail)
+            try:
+                estado_sel, _ = mail.select(buzon_papelera)
+            except Exception:
+                return 0
+            if estado_sel != "OK":
+                return 0
+
+            def _restaurar_a_inbox(num_id):
+                # UID MOVE de la papelera al INBOX. Operación atómica del
+                # servidor, sin riesgo de permadelete por race condition.
+                # Convertimos num_id (seq number del search) a UID primero.
+                try:
+                    estado_uid, datos_uid = mail.fetch(num_id, '(UID)')
+                    if estado_uid != "OK" or not datos_uid:
+                        return False
+                    m = re.search(rb'UID (\d+)', datos_uid[0] or b'')
+                    if not m:
+                        return False
+                    uid = m.group(1)
+                except Exception:
+                    return False
+                try:
+                    estado, _ = mail.uid('MOVE', uid, '"INBOX"')
+                    if estado == "OK":
+                        return True
+                except Exception:
+                    pass
+                try:
+                    estado_copy, _ = mail.uid('COPY', uid, '"INBOX"')
+                    if estado_copy == "OK":
+                        mail.uid('STORE', uid, '+FLAGS', '\\Deleted')
+                        try:
+                            mail.uid('EXPUNGE', uid)
+                        except Exception:
+                            try:
+                                mail.expunge()
+                            except Exception:
+                                pass
+                        return True
+                except Exception:
+                    pass
+                return False
+
+            # Buscar bounces (mailer-daemon/postmaster) que mencionen el email
+            ids_b = set()
+            for remitente in _REMITENTES_REBOTE:
+                try:
+                    estado, ids = mail.search(None, f'(FROM "{remitente}")')
+                    if estado == "OK" and ids and ids[0]:
+                        for n in ids[0].split():
+                            ids_b.add(n)
+                except Exception:
+                    continue
+
+            for num_id in ids_b:
+                try:
+                    _, datos = mail.fetch(num_id, "(RFC822)")
+                except Exception:
+                    continue
+                for r in datos:
+                    if not isinstance(r, tuple):
+                        continue
+                    try:
+                        raw = email.message_from_bytes(r[1])
+                    except Exception:
+                        continue
+                    cuerpo = _texto_correo(raw).lower()
+                    if email_lower in cuerpo:
+                        if _restaurar_a_inbox(num_id):
+                            restaurados += 1
+                        break
+
+            # Buscar también el correo original (TO email_rechazado) en papelera
+            try:
+                estado, ids = mail.search(
+                    None, f'(TO "{email_rechazado}")'
+                )
+                if estado == "OK" and ids and ids[0]:
+                    for num_id in ids[0].split():
+                        if _restaurar_a_inbox(num_id):
+                            restaurados += 1
+            except Exception:
+                pass
+
+            if not es_gmail:
+                try:
+                    mail.expunge()
+                except Exception:
+                    pass
+
+    except Exception as e:
+        msg_err = str(e).lower()
+        if "no such" in msg_err or "doesn't exist" in msg_err or "not found" in msg_err:
+            return 0
+        logging.error(f"Error restaurando rebote ({email_rechazado}): {e}")
+
+    return restaurados
 
 
 # ==========================================
@@ -985,22 +1699,27 @@ def obtener_estadisticas_globales():
 # 11. CONTACTOS: utilidades
 # ==========================================
 def emails_de_contactos():
-    """Devuelve set de todos los correos válidos del CSV (los 3 campos)."""
-    correos = set()
-    if not os.path.exists(ARCHIVO_CSV):
+    """Devuelve set de todos los correos válidos del CSV (los 3 campos).
+    Cacheado por mtime — si el CSV no cambió, devuelve el set anterior
+    sin reabrir el archivo (para campañas con 30k+ contactos esto
+    evita relecturas costosas en cada cambio de pestaña)."""
+    def _loader():
+        correos = set()
+        if not os.path.exists(ARCHIVO_CSV):
+            return correos
+        try:
+            with open(ARCHIVO_CSV, "r", encoding="utf-8") as f:
+                for fila in csv.DictReader(f):
+                    for campo in ("Correo electrónico",
+                                  "Correo electrónico secundario",
+                                  "Correo electrónico terciario"):
+                        valor = (fila.get(campo) or "").strip().lower()
+                        if valor:
+                            correos.add(valor)
+        except Exception:
+            pass
         return correos
-    try:
-        with open(ARCHIVO_CSV, "r", encoding="utf-8") as f:
-            for fila in csv.DictReader(f):
-                for campo in ("Correo electrónico",
-                              "Correo electrónico secundario",
-                              "Correo electrónico terciario"):
-                    valor = (fila.get(campo) or "").strip().lower()
-                    if valor:
-                        correos.add(valor)
-    except Exception:
-        pass
-    return correos
+    return _cached_read("emails_contactos", ARCHIVO_CSV, _loader)
 
 
 def contar_contactos():
@@ -1025,21 +1744,24 @@ _DOMINIOS_CALENDLY = ("calendly.com",)
 
 
 def _cargar_respuestas_archivo():
-    if not os.path.exists(ARCHIVO_RESPUESTAS):
-        return {"respuestas": [], "calendly": []}
-    try:
-        with open(ARCHIVO_RESPUESTAS, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        data.setdefault("respuestas", [])
-        data.setdefault("calendly", [])
-        return data
-    except Exception:
-        return {"respuestas": [], "calendly": []}
+    def _loader():
+        if not os.path.exists(ARCHIVO_RESPUESTAS):
+            return {"respuestas": [], "calendly": []}
+        try:
+            with open(ARCHIVO_RESPUESTAS, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            data.setdefault("respuestas", [])
+            data.setdefault("calendly", [])
+            return data
+        except Exception:
+            return {"respuestas": [], "calendly": []}
+    return _cached_read("respuestas", ARCHIVO_RESPUESTAS, _loader)
 
 
 def _guardar_respuestas_archivo(data):
     with open(ARCHIVO_RESPUESTAS, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
+    _cache_invalidate("respuestas")
 
 
 def cargar_respuestas():
@@ -1179,6 +1901,17 @@ _BUZONES_SENT = [
     '"[Google Mail]/Sent Mail"',
 ]
 
+# "All Mail" en Gmail contiene TODOS los correos (Inbox + archivados +
+# movidos a Importantes + cualquier etiqueta). Es la mejor fuente para
+# reconstruir un hilo completo aunque el cliente haya archivado/movido
+# manualmente alguno de los mensajes.
+_BUZONES_ALL_MAIL = [
+    '"[Gmail]/All Mail"',
+    '"[Gmail]/Todos"',
+    '"[Gmail]/Todos los correos"',
+    '"[Google Mail]/All Mail"',
+]
+
 
 def _parse_mensaje_imap(raw_msg, direccion):
     asunto    = _decodificar_cabecera(raw_msg.get("Subject", ""))
@@ -1248,36 +1981,76 @@ def obtener_hilo(remitente, asunto=None, dias=180):
         vistos_ids.add(clave)
         mensajes.append(m)
 
+    mi_correo_low = (MI_CORREO() or "").lower()
+
     try:
         with imaplib.IMAP4_SSL(imap_host) as mail:
             mail.login(MI_CORREO(), MI_PASSWORD())
 
-            # ── Recibidos (FROM remitente) ───────────────────────────
-            try:
-                mail.select("inbox", readonly=True)
-                estado, ids = mail.search(
-                    None, f'(FROM "{remitente}" SINCE "{desde}")'
-                )
-                if estado == "OK" and ids and ids[0]:
-                    for num in ids[0].split():
-                        try:
-                            _, fetched = mail.fetch(num, "(RFC822)")
-                            for r in fetched:
-                                if isinstance(r, tuple):
-                                    _agregar(email.message_from_bytes(r[1]), "entrante")
-                        except Exception:
-                            continue
-            except Exception:
-                pass
-
-            # ── Enviados (TO remitente) ──────────────────────────────
-            for buzon in _BUZONES_SENT:
+            # ── Estrategia: usar [Gmail]/All Mail ──
+            # All Mail contiene TODOS los correos del usuario sin importar
+            # etiquetas/carpetas (Inbox, Importantes, Archivados, Sent…).
+            # Es la forma más confiable de reconstruir un hilo completo
+            # aunque el cliente haya movido manualmente algún mensaje.
+            buzon_principal = None
+            for buzon in _BUZONES_ALL_MAIL:
                 try:
                     estado, _ = mail.select(buzon, readonly=True)
-                    if estado != "OK":
+                    if estado == "OK":
+                        buzon_principal = buzon
+                        break
+                except Exception:
+                    continue
+
+            if buzon_principal:
+                # En All Mail, un mismo email puede ser entrante O saliente.
+                # Buscamos por participación: cualquier mensaje donde
+                # `remitente` aparezca en From o To.
+                ids_total = set()
+                for query in (
+                    f'(FROM "{remitente}" SINCE "{desde}")',
+                    f'(TO "{remitente}" SINCE "{desde}")',
+                    f'(CC "{remitente}" SINCE "{desde}")',
+                ):
+                    try:
+                        estado, ids = mail.search(None, query)
+                        if estado == "OK" and ids and ids[0]:
+                            for n in ids[0].split():
+                                ids_total.add(n)
+                    except Exception:
                         continue
+
+                # Fetch en BATCH: una sola llamada con todos los IDs
+                # separados por coma. Es 5-10x más rápido que un fetch
+                # por mensaje porque ahorra los round-trips IMAP.
+                if ids_total:
+                    id_list = b",".join(ids_total)
+                    try:
+                        _, fetched = mail.fetch(id_list, "(RFC822)")
+                        for r in fetched:
+                            if not isinstance(r, tuple):
+                                continue
+                            try:
+                                raw = email.message_from_bytes(r[1])
+                            except Exception:
+                                continue
+                            from_em = _extraer_email(
+                                _decodificar_cabecera(raw.get("From", ""))
+                            ).lower()
+                            direccion = (
+                                "saliente" if from_em == mi_correo_low
+                                else "entrante"
+                            )
+                            _agregar(raw, direccion)
+                    except Exception:
+                        pass
+            else:
+                # Fallback: cuenta sin All Mail (no es Gmail) → buscamos
+                # en INBOX y carpeta de Enviados como antes.
+                try:
+                    mail.select("inbox", readonly=True)
                     estado, ids = mail.search(
-                        None, f'(TO "{remitente}" SINCE "{desde}")'
+                        None, f'(FROM "{remitente}" SINCE "{desde}")'
                     )
                     if estado == "OK" and ids and ids[0]:
                         for num in ids[0].split():
@@ -1286,12 +2059,33 @@ def obtener_hilo(remitente, asunto=None, dias=180):
                                 for r in fetched:
                                     if isinstance(r, tuple):
                                         _agregar(email.message_from_bytes(r[1]),
-                                                  "saliente")
+                                                  "entrante")
                             except Exception:
                                 continue
-                        break  # usamos el primer buzón que matchea
                 except Exception:
-                    continue
+                    pass
+
+                for buzon in _BUZONES_SENT:
+                    try:
+                        estado, _ = mail.select(buzon, readonly=True)
+                        if estado != "OK":
+                            continue
+                        estado, ids = mail.search(
+                            None, f'(TO "{remitente}" SINCE "{desde}")'
+                        )
+                        if estado == "OK" and ids and ids[0]:
+                            for num in ids[0].split():
+                                try:
+                                    _, fetched = mail.fetch(num, "(RFC822)")
+                                    for r in fetched:
+                                        if isinstance(r, tuple):
+                                            _agregar(email.message_from_bytes(r[1]),
+                                                      "saliente")
+                                except Exception:
+                                    continue
+                            break
+                    except Exception:
+                        continue
     except Exception as e:
         logging.error(f"Error obteniendo hilo de {remitente}: {e}")
         return []
@@ -1593,71 +2387,132 @@ def detectar_respuestas_y_calendly(dias=30):
         desde = datetime.now() - timedelta(days=30)
     fecha_imap = desde.strftime("%d-%b-%Y")
 
+    # Tracking de UID máximo visto: en lugar de re-escanear los últimos
+    # 30 días cada vez (lento, 100s de fetches), sólo buscamos UIDs
+    # mayores al último procesado. Primer escaneo: usa SINCE; los
+    # siguientes son casi instantáneos porque sólo bajan correos nuevos.
+    last_uid = int(data.get("_last_uid", 0) or 0)
+
     try:
         with imaplib.IMAP4_SSL(imap_host) as mail:
             mail.login(MI_CORREO(), MI_PASSWORD())
             mail.select("inbox")
 
-            estado, msgs = mail.search(None, f'(SINCE "{fecha_imap}")')
+            if last_uid > 0:
+                estado, msgs = mail.uid(
+                    "SEARCH", None, f"UID {last_uid + 1}:*"
+                )
+            else:
+                estado, msgs = mail.uid(
+                    "SEARCH", None, f'(SINCE "{fecha_imap}")'
+                )
             if estado != "OK" or not msgs or not msgs[0]:
                 _guardar_respuestas_archivo(data)
                 return data
 
-            ids = msgs[0].split()
-            for num_id in ids:
+            uids = msgs[0].split()
+            max_uid_visto = last_uid
+
+            for uid_b in uids:
                 try:
-                    _, fetched = mail.fetch(num_id, "(RFC822)")
+                    uid_i = int(uid_b)
                 except Exception:
                     continue
+                if uid_i <= last_uid:
+                    continue
+                if uid_i > max_uid_visto:
+                    max_uid_visto = uid_i
+
+                # Paso 1: sólo headers — ~10x más rápido que RFC822 completo.
+                try:
+                    _, fetched = mail.uid(
+                        "FETCH", uid_b, "(BODY.PEEK[HEADER])"
+                    )
+                except Exception:
+                    continue
+
+                msg = None
                 for respuesta in fetched:
-                    if not isinstance(respuesta, tuple):
-                        continue
-                    msg = email.message_from_bytes(respuesta[1])
-                    remitente_raw = _decodificar_cabecera(msg.get("From", ""))
-                    remitente     = _extraer_email(remitente_raw)
-                    asunto        = _decodificar_cabecera(msg.get("Subject", ""))
-                    fecha_msg     = _decodificar_cabecera(msg.get("Date", ""))
-                    uid           = msg.get("Message-ID", "") or num_id.decode("utf-8", "ignore")
+                    if isinstance(respuesta, tuple):
+                        try:
+                            msg = email.message_from_bytes(respuesta[1])
+                        except Exception:
+                            msg = None
+                        break
+                if msg is None:
+                    continue
 
-                    if not remitente or "daemon" in remitente:
-                        continue
-                    if remitente == (MI_CORREO() or "").lower():
-                        continue
+                remitente_raw = _decodificar_cabecera(msg.get("From", ""))
+                remitente     = _extraer_email(remitente_raw)
+                asunto        = _decodificar_cabecera(msg.get("Subject", ""))
+                fecha_msg     = _decodificar_cabecera(msg.get("Date", ""))
+                uid_key       = msg.get("Message-ID", "") or uid_b.decode("utf-8", "ignore")
 
-                    es_calendly = any(d in remitente for d in _DOMINIOS_CALENDLY)
+                if not remitente or "daemon" in remitente:
+                    continue
+                if remitente == (MI_CORREO() or "").lower():
+                    continue
 
-                    if es_calendly:
-                        if uid in vistos_cal:
-                            continue
-                        cuerpo = _texto_correo(msg)
-                        invitado = ""
-                        for c in re.findall(r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+",
-                                            cuerpo):
-                            cl = c.lower()
-                            if cl in contactos:
-                                invitado = cl
+                es_calendly = any(d in remitente for d in _DOMINIOS_CALENDLY)
+
+                if es_calendly:
+                    if uid_key in vistos_cal:
+                        continue
+                    # Calendly necesita el cuerpo para sacar el invitado.
+                    invitado = ""
+                    try:
+                        _, fetched_full = mail.uid("FETCH", uid_b, "(RFC822)")
+                        for r in fetched_full:
+                            if isinstance(r, tuple):
+                                msg_full = email.message_from_bytes(r[1])
+                                cuerpo = _texto_correo(msg_full)
+                                for c in re.findall(
+                                    r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+",
+                                    cuerpo
+                                ):
+                                    cl = c.lower()
+                                    if cl in contactos:
+                                        invitado = cl
+                                        break
                                 break
-                        data["calendly"].append({
-                            "uid":      uid,
-                            "from":     remitente,
-                            "subject":  asunto,
-                            "date":     fecha_msg,
-                            "invitado": invitado,
-                        })
-                        vistos_cal.add(uid)
-                    elif remitente in contactos:
-                        clave = (uid, remitente)
-                        if clave in vistos_resp:
-                            continue
-                        data["respuestas"].append({
-                            "uid":     uid,
-                            "from":    remitente,
-                            "subject": asunto,
-                            "date":    fecha_msg,
-                        })
-                        vistos_resp.add(clave)
+                    except Exception:
+                        pass
+                    data["calendly"].append({
+                        "uid":      uid_key,
+                        "from":     remitente,
+                        "subject":  asunto,
+                        "date":     fecha_msg,
+                        "invitado": invitado,
+                    })
+                    vistos_cal.add(uid_key)
+                elif remitente in contactos:
+                    clave = (uid_key, remitente)
+                    if clave in vistos_resp:
+                        continue
+                    data["respuestas"].append({
+                        "uid":     uid_key,
+                        "from":    remitente,
+                        "subject": asunto,
+                        "date":    fecha_msg,
+                    })
+                    vistos_resp.add(clave)
+
+            data["_last_uid"] = max_uid_visto
     except Exception as e:
-        logging.error(f"No se pudo escanear respuestas: {e}")
+        # Errores transitorios de red (SSL EOF, timeouts) NO los logueamos
+        # como ERROR — son comunes con polling frecuente y no requieren
+        # acción del usuario. Sólo se reportan a nivel debug.
+        msg_err = str(e).lower()
+        transient = any(k in msg_err for k in (
+            "eof occurred", "timed out", "timeout",
+            "connection reset", "connection aborted",
+            "connection refused",
+            "network is unreachable", "temporary failure",
+        ))
+        if transient:
+            logging.debug(f"Escaneo respuestas: error transitorio: {e}")
+        else:
+            logging.error(f"No se pudo escanear respuestas: {e}")
 
     _guardar_respuestas_archivo(data)
     return data

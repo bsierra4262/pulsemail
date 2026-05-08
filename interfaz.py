@@ -166,7 +166,19 @@ def _hti_init():
                 "--hide-scrollbars",
                 # virtual-time-budget bajo = Chrome no espera tanto a recursos
                 "--virtual-time-budget=2500",
+                # GPU OFF total — evita "Failed to create shared context for
+                # virtualization" en PCs sin aceleración HW (VMs, Citrix,
+                # equipos viejos). Forzamos software rendering vía SwiftShader
+                # y aislamos el GPU process en el mismo proceso para que no
+                # haga IPC fallida.
                 "--disable-gpu",
+                "--disable-gpu-compositing",
+                "--disable-gpu-sandbox",
+                "--disable-accelerated-2d-canvas",
+                "--disable-accelerated-video-decode",
+                "--use-gl=swiftshader",
+                "--in-process-gpu",
+                "--disable-dev-shm-usage",
                 "--no-sandbox",
                 # JS deshabilitado: los HTML de correo no lo necesitan y
                 # ahorra bastante tiempo de "waiting for ready"
@@ -207,11 +219,16 @@ def _html_a_imagen(html_str, message_id):
     # Override de margin/padding para que el render no quede con borde
     # blanco gigante alrededor del contenido. Inyectamos un <style> que
     # gana por especificidad/orden.
+    # No forzamos ancho fijo: dejamos que el contenido tome su tamaño
+    # natural y luego el trim de PIL recorta el bbox exacto. Así el render
+    # se adapta a cualquier correo (anchos, narrows, cortos, largos) sin
+    # generar franjas blancas. El bgcolor blanco del html/body es lo que
+    # permite a getbbox detectar dónde termina el contenido real.
     style_override = (
         "<style>"
         "html,body{margin:0!important;padding:0!important;"
         "background:#ffffff!important;}"
-        "body{font-family:Arial,sans-serif;}"
+        "body{font-family:Arial,sans-serif;max-width:900px;}"
         "table{border-collapse:collapse;}"
         "img{max-width:100%;height:auto;}"
         "</style>"
@@ -254,51 +271,41 @@ def _html_a_imagen(html_str, message_id):
     # bordes del contenido tienen pixels casi-blancos (#fafafa, #f8f8f8
     # etc.) que bbox(255,255,255) no detecta. Usamos un threshold para
     # tratarlos también como "blanco" y recortar agresivamente.
+    # Trim agresivo del whitespace alrededor del contenido real.
+    # Estrategia:
+    #   1) Cuantizamos los pixels casi-blancos (anti-aliasing, sombras
+    #      muy claras tipo #fafafa) a blanco puro #ffffff.
+    #   2) Restamos contra una imagen totalmente blanca → todo lo que
+    #      NO es contenido queda en negro.
+    #   3) PIL.getbbox() devuelve el rectángulo exacto que contiene
+    #      pixels no-cero = bounding box del contenido real.
+    # Esto es muchísimo más confiable que iterar pixel por pixel y
+    # se adapta automáticamente a cualquier correo (corto, largo,
+    # estrecho, ancho), sin importar DPI ni viewport de Chrome.
     try:
-        from PIL import Image as _PIL_Image
+        from PIL import Image as _PIL_Image, ImageChops as _PIL_ImageChops
         img = _PIL_Image.open(path).convert("RGB")
         ancho, alto = img.size
-        pixels = img.load()
-        UMBRAL = 245  # cualquier RGB con todos los canales >= 245 = "blanco"
 
-        def _es_blanco(r, g, b):
-            return r >= UMBRAL and g >= UMBRAL and b >= UMBRAL
+        # Punto de quiebre: pixels con todos los canales >= 245 los
+        # convertimos a blanco puro para que la diferencia los ignore.
+        UMBRAL = 245
+        def _quantize(c):
+            return 255 if c >= UMBRAL else c
+        tabla = bytes(_quantize(i) for i in range(256))
+        img_q = img.point(lambda p: tabla[p])
 
-        def _fila_es_blanca(y):
-            # Sample cada 3 pixels para velocidad (trim tolera ruido)
-            for x in range(0, ancho, 3):
-                r, g, b = pixels[x, y]
-                if not _es_blanco(r, g, b):
-                    return False
-            return True
+        fondo = _PIL_Image.new("RGB", img_q.size, (255, 255, 255))
+        diff  = _PIL_ImageChops.difference(img_q, fondo)
+        bbox  = diff.getbbox()
 
-        def _col_es_blanca(x):
-            for y in range(0, alto, 3):
-                r, g, b = pixels[x, y]
-                if not _es_blanco(r, g, b):
-                    return False
-            return True
-
-        top = 0
-        while top < alto and _fila_es_blanca(top):
-            top += 1
-        bottom = alto - 1
-        while bottom > top and _fila_es_blanca(bottom):
-            bottom -= 1
-        left = 0
-        while left < ancho and _col_es_blanca(left):
-            left += 1
-        right = ancho - 1
-        while right > left and _col_es_blanca(right):
-            right -= 1
-
-        # Si quedó algo de contenido, recortamos con un pequeño margen
-        if right > left and bottom > top:
-            margen = 4
-            l = max(0, left - margen)
-            t = max(0, top - margen)
-            r = min(ancho,  right  + margen + 1)
-            b = min(alto,   bottom + margen + 1)
+        if bbox:
+            l, t, r, b = bbox
+            margen = 6
+            l = max(0, l - margen)
+            t = max(0, t - margen)
+            r = min(ancho, r + margen)
+            b = min(alto,  b + margen)
             cropped = img.crop((l, t, r, b))
             cropped.save(path)
     except Exception:
@@ -381,6 +388,11 @@ _VISTA_INICIAL = ["dashboard"]
 # Sub-pestaña activa de Configuración (cuenta | firma | servidores | apariencia)
 # Persiste también entre rebuilds.
 _CFG_TAB_INICIAL = ["cuenta"]
+
+# Timestamp de la última vez que el watcher detectó respuestas/calendly
+# nuevos. Se usa para polling adaptativo: si hubo actividad reciente
+# (< 5 min) polea más rápido; si la cuenta está quieta polea más lento.
+_ULTIMA_ACTIVIDAD_RESPUESTA = [0.0]
 
 
 def aplicar_tema(modo):
@@ -952,18 +964,102 @@ def main(page: ft.Page):
             alignment=ft.MainAxisAlignment.CENTER, spacing=8,
         )
 
+    # Anti-spam de notificaciones de red: marcamos qué estados ya
+    # avisamos para no machacar al usuario con 30 toasts iguales.
+    _red_avisada = {"caido": False, "inestable": False, "agotado": False}
+
+    def _on_red_estado(estado, intento, maximo, destino):
+        """Hook que recibe notificaciones del módulo de envío.
+        Convierte cada cambio de estado de red en un toast +
+        línea en el historial de eventos."""
+        try:
+            if estado == "caido" and not _red_avisada["caido"]:
+                _red_avisada["caido"] = True
+                titulo = "Pulsemail — Sin conexión"
+                cuerpo = (f"Se cortó internet enviando a {destino}. "
+                          f"Reintentando hasta {maximo} veces.")
+                agregar_log("warning", cuerpo)
+                notificar_sistema(titulo, cuerpo)
+            elif estado == "inestable" and not _red_avisada["inestable"]:
+                _red_avisada["inestable"] = True
+                titulo = "Pulsemail — Conexión inestable"
+                cuerpo = (f"Microcortes detectados en {destino}. "
+                          f"Reintento {intento}/{maximo}. Si querés, "
+                          f"detené la campaña y retomala más tarde.")
+                agregar_log("warning", cuerpo)
+                notificar_sistema(titulo, cuerpo)
+            elif estado == "reintentando":
+                # Sólo log discreto, sin toast (cada 100 intentos)
+                agregar_log("info",
+                             f"Reintento {intento}/{maximo} para {destino}.")
+            elif estado == "recuperado":
+                _red_avisada["caido"] = False
+                _red_avisada["inestable"] = False
+                _red_avisada["agotado"] = False
+                titulo = "Pulsemail — Conexión recuperada"
+                cuerpo = (f"Volvió la red. Enviado a {destino} en el "
+                          f"intento {intento}.")
+                agregar_log("success", cuerpo)
+                notificar_sistema(titulo, cuerpo)
+            elif estado == "agotado" and not _red_avisada["agotado"]:
+                _red_avisada["agotado"] = True
+                titulo = "Pulsemail — Campaña detenida"
+                cuerpo = (f"Sin internet tras {maximo} reintentos para "
+                          f"{destino}. La campaña se detuvo. Cuando "
+                          f"vuelva la red, iniciala de nuevo: retoma "
+                          f"desde el correo pendiente.")
+                agregar_log("error", cuerpo)
+                notificar_sistema(titulo, cuerpo)
+            elif estado == "detenido":
+                cuerpo = (f"Campaña detenida en {destino} (intento "
+                          f"{intento}/{maximo}). Guardado para retomar.")
+                agregar_log("warning", cuerpo)
+        except Exception:
+            pass
+
+    enviar_correos.set_red_hook(_on_red_estado)
+
     def arrancar(e):
+        # Si la campaña está corriendo, este mismo botón pasa a ser
+        # "Detener". Le pedimos al módulo de envío que aborte; el thread
+        # del trabajador chequeará el flag y guardará el correo en cola
+        # (`registro_pendiente.json`) antes de salir.
         if campana_activa[0]:
+            enviar_correos.detener_campana()
+            btn_iniciar.disabled = True
+            btn_iniciar.content  = _contenido_btn(
+                "Deteniendo...", ft.Icons.HOURGLASS_TOP_ROUNDED
+            )
+            safe_update()
             return
+
         cfg = enviar_correos.cargar_config()
         if not cfg.get("correo") or not cfg.get("password"):
             agregar_log("error", "No hay cuenta configurada. Ir a Configuración primero.")
             return
+        # Reset banderas anti-spam y stop event para esta nueva corrida
+        for k in _red_avisada:
+            _red_avisada[k] = False
+        enviar_correos.reset_stop_campana()
+
         campana_activa[0]    = True
-        btn_iniciar.disabled = True
+        btn_iniciar.disabled = False
         ring_estado.visible  = True
         texto_estado.value   = "Campaña en ejecución..."
-        btn_iniciar.content  = _contenido_btn("En proceso...", ft.Icons.HOURGLASS_TOP_ROUNDED)
+        btn_iniciar.content  = _contenido_btn(
+            "Detener campaña", ft.Icons.STOP_CIRCLE_ROUNDED
+        )
+        # En modo detener el botón es ROJO para que el usuario lo
+        # identifique como "acción destructiva".
+        btn_iniciar.style = ft.ButtonStyle(
+            bgcolor={ft.ControlState.DEFAULT: C_ROJO,
+                     ft.ControlState.HOVERED: "#c34061"},
+            shape=ft.RoundedRectangleBorder(radius=10),
+            elevation={ft.ControlState.DEFAULT: 0,
+                       ft.ControlState.HOVERED: 4},
+            animation_duration=200,
+            padding=ft.Padding(28, 16, 28, 16),
+        )
         safe_update()
 
         def trabajador():
@@ -975,8 +1071,23 @@ def main(page: ft.Page):
                 campana_activa[0]    = False
                 btn_iniciar.disabled = False
                 ring_estado.visible  = False
-                texto_estado.value   = "Campaña finalizada."
-                btn_iniciar.content  = _contenido_btn("Iniciar campaña", ft.Icons.SEND_ROUNDED)
+                # Mensaje de estado dependiente de cómo terminó
+                if enviar_correos.campana_detenida():
+                    texto_estado.value = "Campaña detenida."
+                else:
+                    texto_estado.value = "Campaña finalizada."
+                btn_iniciar.content  = _contenido_btn(
+                    "Iniciar campaña", ft.Icons.SEND_ROUNDED
+                )
+                btn_iniciar.style = ft.ButtonStyle(
+                    bgcolor={ft.ControlState.DEFAULT: C_VERDE,
+                             ft.ControlState.HOVERED: C_VERDE_DARK},
+                    shape=ft.RoundedRectangleBorder(radius=10),
+                    elevation={ft.ControlState.DEFAULT: 0,
+                               ft.ControlState.HOVERED: 4},
+                    animation_duration=200,
+                    padding=ft.Padding(28, 16, 28, 16),
+                )
                 safe_update()
 
         threading.Thread(target=trabajador, daemon=True).start()
@@ -1129,7 +1240,11 @@ def main(page: ft.Page):
         data_row_min_height=44,
         column_spacing=32,
         horizontal_lines=ft.BorderSide(1, C_BORDE),
-        expand=True,
+        # NO expand=True: si el DataTable se estira al ancho del padre,
+        # los emails largos quedan truncados y el scroll horizontal del
+        # Row contenedor nunca se activa. Sin expand, la tabla toma su
+        # ancho natural según contenido y la Row hace scroll en pantallas
+        # chicas.
     )
 
     def _render_pagina_contactos():
@@ -1790,19 +1905,41 @@ def main(page: ft.Page):
 
         threading.Thread(target=trabajador, daemon=True).start()
 
+    # Lock para serializar refrescar_rechazados — evita duplicación visual
+    # cuando dos threads (ej: render inicial + watcher daemon) llaman al
+    # mismo tiempo
+    _lock_refrescar_rech = threading.Lock()
+
     def refrescar_rechazados():
+        if not _lock_refrescar_rech.acquire(blocking=False):
+            return  # ya hay otro refresh en curso, evitamos duplicar
+        try:
+            _refrescar_rechazados_inner()
+        finally:
+            _lock_refrescar_rech.release()
+
+    def _refrescar_rechazados_inner():
         rechazados   = enviar_correos.cargar_rechazados_todos()
         depurados    = enviar_correos.cargar_depurados()
         mostrar_dep  = chk_mostrar_depurados.value
 
-        # Dedupe defensivo por email (por si el JSON trae duplicados de algún backfill)
+        # Dedupe defensivo por email — normaliza espacios, mayúsculas y
+        # caracteres invisibles (zero-width, etc.) para asegurar que
+        # nunca se renderea el mismo email dos veces aunque el JSON tenga
+        # variantes raras del mismo email.
         vistos = set()
         unicos = []
         for r in rechazados:
-            em = (r.get("email") or "").lower().strip()
+            em_raw = r.get("email") or ""
+            # Normalización agresiva: lower + strip + quita caracteres no-printables
+            em = "".join(ch for ch in em_raw.lower().strip()
+                         if ch.isprintable())
             if em and em not in vistos:
                 vistos.add(em)
-                unicos.append(r)
+                # Reemplazamos el email del item con la versión normalizada
+                r_nuevo = dict(r)
+                r_nuevo["email"] = em
+                unicos.append(r_nuevo)
         rechazados = unicos
 
         # Filtrar primero (más rápido) y después paginar.
@@ -1850,9 +1987,27 @@ def main(page: ft.Page):
 
             def _toggle_dep(e, correo=item["email"], ya=es_dep):
                 if ya:
+                    # Restaurar: sacar de depurados + mover correos de
+                    # papelera a INBOX (si todavía están)
                     enviar_correos.desmarcar_depurado(correo)
-                    _flash(f"{correo} restaurado", C_AZUL)
+                    _flash(f"Restaurando {correo}...", C_AZUL, 3)
                     refrescar_rechazados()
+                    if bool(chk_borrar_gmail.value):
+                        def _bg_restore():
+                            try:
+                                restaurados = enviar_correos.restaurar_correo_rebote_gmail(correo)
+                                if restaurados:
+                                    _flash(
+                                        f"↺ {correo}: {restaurados} correo"
+                                        f"{'s' if restaurados != 1 else ''} "
+                                        "restaurado a INBOX desde la papelera.",
+                                        C_AZUL, 4,
+                                    )
+                                # Si 0, el usuario ya los borró definitivamente —
+                                # no podemos restaurar. Silencioso.
+                            except Exception:
+                                pass
+                        threading.Thread(target=_bg_restore, daemon=True).start()
                     return
 
                 # 1) Marcar depurado en JSON + refrescar UI AL INSTANTE
@@ -1861,35 +2016,29 @@ def main(page: ft.Page):
                 _flash(f"✓ {correo} depurado", C_EXITO, 3)
                 refrescar_rechazados()
 
-                # 2) En background, si está activado, borrar el rebote
-                #    correspondiente de Gmail (lento por IMAP).
+                # 2) Si está activado, encolar el borrado de Gmail.
+                #    La cola usa UNA conexión IMAP para borrar varios
+                #    rebotes seguidos → mucho más rápido que abrir IMAP
+                #    cada vez (que tardaba ~5s por correo).
                 if bool(chk_borrar_gmail.value):
-                    def _bg_delete():
-                        try:
-                            movidos = enviar_correos.borrar_correo_rebote_gmail(
-                                correo
+                    def _on_done(em, movidos):
+                        if movidos:
+                            _flash(
+                                f"🗑 {em}: {movidos} correo"
+                                f"{'s' if movidos != 1 else ''} "
+                                "movido a la papelera de Gmail.",
+                                C_EXITO, 3,
                             )
-                            if movidos:
-                                _flash(
-                                    f"🗑 {correo}: {movidos} rebote"
-                                    f"{'s' if movidos != 1 else ''} "
-                                    "movido a la papelera de Gmail.",
-                                    C_EXITO, 4,
-                                )
+                            try:
                                 agregar_log(
                                     "info",
-                                    f"Rebote de {correo} movido a "
-                                    f"papelera de Gmail.",
+                                    f"Borrado de Gmail completado para {em} "
+                                    f"({movidos} mensajes a papelera).",
                                 )
-                            # Si movidos==0, no avisamos: el correo de
-                            # mailer-daemon ya no estaba en INBOX
-                            # (el cliente lo borró antes).
-                        except Exception as _ex:
-                            _flash(
-                                f"No se pudo borrar de Gmail: {_ex}",
-                                C_NARANJA, 4,
-                            )
-                    threading.Thread(target=_bg_delete, daemon=True).start()
+                            except Exception:
+                                pass
+
+                    enviar_correos.encolar_borrado_gmail(correo, _on_done)
 
             btn_copiar = ft.IconButton(
                 icon=ft.Icons.CONTENT_COPY_ROUNDED,
@@ -3168,12 +3317,6 @@ def main(page: ft.Page):
                                 on_click=_copiar_resp,
                             ),
                             ft.IconButton(
-                                icon=ft.Icons.OPEN_IN_NEW_ROUNDED,
-                                icon_color=C_TEXTO_3,
-                                tooltip="Abrir en cliente externo (mailto)",
-                                on_click=_abrir_mailto_externo,
-                            ),
-                            ft.IconButton(
                                 icon=(ft.Icons.VISIBILITY_ROUNDED if es_ignorado
                                        else ft.Icons.VISIBILITY_OFF_ROUNDED),
                                 icon_color=(C_AZUL if es_ignorado
@@ -3483,13 +3626,15 @@ def main(page: ft.Page):
                     html_crudo = m.get("body_html") or ""
 
                     # Render HTML como imagen renderizada por Chrome headless.
-                    # `fit="contain"` + sin width fijo => llena el ancho del
-                    # contenedor manteniendo aspect ratio. Así no queda
-                    # centrada con bordes blancos a los lados.
+                    # `fit="fitWidth"` => la imagen siempre llena el ancho
+                    # del contenedor manteniendo aspect ratio (se ve igual
+                    # en monitores de cualquier resolución). El alto se
+                    # ajusta automáticamente al contenido.
                     img_render = ft.Image(
                         src="",
-                        fit="contain",
+                        fit="fitWidth",
                         visible=False,
+                        expand=False,
                     )
                     placeholder = ft.Container(
                         height=120,
@@ -3516,8 +3661,12 @@ def main(page: ft.Page):
                         visible=False,
                     )
 
-                    # Stack: placeholder mientras renderiza, luego imagen
+                    # Container que se EXPANDE al ancho disponible. La
+                    # imagen adentro usa `fit="fitWidth"` y queda escalada
+                    # al ancho real, sin importar la resolución de la
+                    # pantalla del usuario.
                     contenedor_img = ft.Container(
+                        expand=True,
                         bgcolor=C_BLANCO,
                         border=borde_all(1, C_BORDE),
                         border_radius=ft.BorderRadius(8, 8, 8, 8),
@@ -3860,6 +4009,39 @@ def main(page: ft.Page):
         text_style=ft.TextStyle(font_family="Saira"),
         expand=True,
     )
+    tf_correos_copia = ft.TextField(
+        label="Correos en copia (CC) — opcional",
+        value=cfg_actual.get("correos_copia", ""),
+        hint_text="ventas@empresa.com, jefe@empresa.com",
+        prefix_icon=ft.Icons.GROUP_ADD_ROUNDED,
+        border_color=C_BORDE,
+        focused_border_color=C_MORADO,
+        label_style=ft.TextStyle(color=C_TEXTO_2, font_family="Saira"),
+        text_style=ft.TextStyle(font_family="Saira"),
+        expand=True,
+    )
+    tf_url_calendly = ft.TextField(
+        label="URL del botón Calendly",
+        value=cfg_actual.get("url_calendly", ""),
+        hint_text="https://calendly.com/tu-usuario/30min",
+        prefix_icon=ft.Icons.EVENT_AVAILABLE_ROUNDED,
+        border_color=C_BORDE,
+        focused_border_color=C_MORADO,
+        label_style=ft.TextStyle(color=C_TEXTO_2, font_family="Saira"),
+        text_style=ft.TextStyle(font_family="Saira"),
+        expand=True,
+    )
+    tf_url_whatsapp = ft.TextField(
+        label="URL del botón WhatsApp",
+        value=cfg_actual.get("url_whatsapp", ""),
+        hint_text="https://wa.me/541112345678?text=Hola",
+        prefix_icon=ft.Icons.CHAT_ROUNDED,
+        border_color=C_BORDE,
+        focused_border_color=C_MORADO,
+        label_style=ft.TextStyle(color=C_TEXTO_2, font_family="Saira"),
+        text_style=ft.TextStyle(font_family="Saira"),
+        expand=True,
+    )
     tf_smtp_host = ft.TextField(
         label="Servidor SMTP",
         value=cfg_actual.get("smtp_host", "smtp.gmail.com"),
@@ -4036,6 +4218,123 @@ def main(page: ft.Page):
         "imagen": ft.ElevatedButton("Imagen", icon=ft.Icons.IMAGE_ROUNDED,
                                     on_click=lambda e: _set_firma_tipo("imagen")),
     }
+
+    # ── Logo personalizado del cliente ───────────────────────────
+    # Se muestra en el sidebar y se incrusta en cada correo enviado
+    # (reemplaza al logo embebido del bundle).
+    logo_personalizado_actual = [cfg_actual.get("logo_personalizado", "")]
+    img_logo_preview = ft.Image(
+        src=logo_personalizado_actual[0] if (
+            logo_personalizado_actual[0]
+            and os.path.exists(logo_personalizado_actual[0])
+        ) else "",
+        fit="contain",
+        width=240,
+        height=80,
+        visible=bool(logo_personalizado_actual[0]
+                     and os.path.exists(logo_personalizado_actual[0])),
+    )
+    lbl_logo_path = ft.Text(
+        logo_personalizado_actual[0] or "(usando logo por defecto)",
+        size=11, color=C_TEXTO_3, italic=True, font_family="Saira",
+    )
+
+    def _on_logo_path(original):
+        if not original or not os.path.exists(original):
+            return
+        # Rescalado opcional: si la imagen es muy grande, la reducimos
+        # a 600px de ancho para que el correo pese poco y el sidebar
+        # cargue rápido.
+        try:
+            from PIL import Image as _PILImg
+            img = _PILImg.open(original)
+            if img.width > 600:
+                ratio = 600 / float(img.width)
+                new_h = max(1, int(img.height * ratio))
+                resized = img.resize((600, new_h), _PILImg.LANCZOS)
+                base, ext = os.path.splitext(original)
+                final_path = base + "_pulsemail_logo" + (ext or ".png")
+                resized.save(final_path)
+            else:
+                final_path = original
+        except Exception:
+            final_path = original
+        logo_personalizado_actual[0] = final_path
+        img_logo_preview.src     = final_path
+        img_logo_preview.visible = True
+        lbl_logo_path.value      = final_path
+        cfg_p = enviar_correos.cargar_config()
+        cfg_p["logo_personalizado"] = final_path
+        enviar_correos.guardar_config(cfg_p)
+        # Actualizar el sidebar en vivo
+        try:
+            sidebar_logo_img.src = final_path
+            sidebar_logo_img.update()
+        except Exception:
+            pass
+        safe_update(img_logo_preview, lbl_logo_path)
+
+    def _abrir_dialogo_logo(e=None):
+        def _picker():
+            try:
+                import tkinter as _tk
+                from tkinter import filedialog as _fd
+                root = _tk.Tk()
+                root.withdraw()
+                root.attributes("-topmost", True)
+                path = _fd.askopenfilename(
+                    parent=root,
+                    title="Seleccioná tu logo",
+                    filetypes=[
+                        ("Imágenes", "*.png *.jpg *.jpeg *.gif *.webp *.bmp"),
+                        ("Todos los archivos", "*.*"),
+                    ],
+                )
+                root.destroy()
+                if path:
+                    _on_logo_path(path)
+            except Exception as ex:
+                try:
+                    agregar_log("error",
+                                f"No se pudo abrir el selector: {ex}")
+                except Exception:
+                    pass
+        threading.Thread(target=_picker, daemon=True).start()
+
+    def _quitar_logo(e=None):
+        logo_personalizado_actual[0] = ""
+        img_logo_preview.src = ""
+        img_logo_preview.visible = False
+        lbl_logo_path.value = "(usando logo por defecto)"
+        cfg_p = enviar_correos.cargar_config()
+        cfg_p["logo_personalizado"] = ""
+        enviar_correos.guardar_config(cfg_p)
+        # Volver al logo embebido en el sidebar
+        try:
+            default_logo = os.path.join(CARPETA_ASSETS, "ITH-logo.png")
+            sidebar_logo_img.src = default_logo
+            sidebar_logo_img.update()
+        except Exception:
+            pass
+        safe_update(img_logo_preview, lbl_logo_path)
+
+    btn_subir_logo = ft.OutlinedButton(
+        "Cargar logo…",
+        icon=ft.Icons.UPLOAD_FILE_ROUNDED,
+        on_click=_abrir_dialogo_logo,
+        style=ft.ButtonStyle(
+            color={ft.ControlState.DEFAULT: C_MORADO},
+            side={ft.ControlState.DEFAULT: ft.BorderSide(1.2, C_MORADO)},
+            shape=ft.RoundedRectangleBorder(radius=8),
+            padding=ft.Padding(14, 10, 14, 10),
+        ),
+    )
+    btn_quitar_logo = ft.TextButton(
+        "Usar logo por defecto",
+        icon=ft.Icons.RESTORE_ROUNDED,
+        on_click=_quitar_logo,
+        style=ft.ButtonStyle(color=C_ROJO),
+    )
     _refrescar_botones_firma()
 
     btn_subir_firma = ft.OutlinedButton(
@@ -4098,6 +4397,9 @@ def main(page: ft.Page):
             "smtp_port":     int(tf_smtp_port.value.strip() or 587),
             "imap_host":     tf_imap_host.value.strip(),
             "firma":         (tf_firma.value or "").rstrip(),
+            "correos_copia": (tf_correos_copia.value or "").strip(),
+            "url_calendly":  (tf_url_calendly.value or "").strip(),
+            "url_whatsapp":  (tf_url_whatsapp.value or "").strip(),
         })
         enviar_correos.guardar_config(cfg)
 
@@ -4216,6 +4518,30 @@ def main(page: ft.Page):
                 ),
                 ft.Row(spacing=12, controls=[tf_correo, tf_password]),
                 ft.Row(spacing=12, controls=[tf_limite]),
+                ft.Container(
+                    padding=ft.Padding(0, 8, 0, 0),
+                    content=ft.Text(
+                        "Las direcciones que pongas en CC reciben copia de "
+                        "TODOS los envíos de la campaña. Separá por coma. "
+                        "Dejá vacío para enviar sin copia.",
+                        size=11, color=C_TEXTO_3, italic=True,
+                        font_family="Saira",
+                    ),
+                ),
+                ft.Row(spacing=12, controls=[tf_correos_copia]),
+                ft.Divider(height=1, color=C_BORDE),
+                ft.Text("Botones del correo",
+                        size=12, weight=ft.FontWeight.BOLD,
+                        color=C_TEXTO_2, font_family="Saira"),
+                ft.Text(
+                    "URLs que abren los botones \"Agendá una reunión\" y "
+                    "\"WhatsApp\" del template. Pegá el enlace y listo. Si "
+                    "los dejás vacíos se usan los de IntelliHelp por defecto.",
+                    size=11, color=C_TEXTO_3, italic=True,
+                    font_family="Saira",
+                ),
+                ft.Row(spacing=12, controls=[tf_url_calendly]),
+                ft.Row(spacing=12, controls=[tf_url_whatsapp]),
             ],
         ),
     )
@@ -4294,6 +4620,9 @@ def main(page: ft.Page):
             spacing=14,
             scroll=ft.ScrollMode.AUTO,
             controls=[
+                ft.Text("Tema",
+                        size=12, weight=ft.FontWeight.BOLD,
+                        color=C_TEXTO_2, font_family="Saira"),
                 ft.Text(
                     f"Tema actual: {_tema_efectivo}  "
                     f"(preferencia guardada: {_pref_tema})",
@@ -4309,6 +4638,27 @@ def main(page: ft.Page):
                     "El cambio se aplica al instante.",
                     size=11, color=C_TEXTO_3, italic=True,
                     font_family="Saira",
+                ),
+                ft.Divider(height=1, color=C_BORDE),
+                ft.Text("Logo del cliente",
+                        size=12, weight=ft.FontWeight.BOLD,
+                        color=C_TEXTO_2, font_family="Saira"),
+                ft.Text(
+                    "El logo aparece en el sidebar de la app y se incrusta "
+                    "en cada correo enviado (reemplaza al logo por defecto). "
+                    "Se rescala a 600px de ancho. PNG/JPG/WEBP.",
+                    size=11, color=C_TEXTO_3, font_family="Saira",
+                ),
+                ft.Row(
+                    spacing=10,
+                    controls=[btn_subir_logo, btn_quitar_logo, lbl_logo_path],
+                ),
+                ft.Container(
+                    bgcolor=C_FONDO,
+                    border_radius=ft.BorderRadius(8, 8, 8, 8),
+                    padding=ft.Padding(10, 10, 10, 10),
+                    border=borde_all(1, C_BORDE),
+                    content=img_logo_preview,
                 ),
             ],
         ),
@@ -4918,8 +5268,11 @@ def main(page: ft.Page):
             tf_limite.value    = str(cfg_r.get("limite_diario", 250))
             tf_smtp_host.value = cfg_r.get("smtp_host", "smtp.gmail.com")
             tf_smtp_port.value = str(cfg_r.get("smtp_port", 587))
-            tf_imap_host.value = cfg_r.get("imap_host", "imap.gmail.com")
-            tf_firma.value     = cfg_r.get("firma", "")
+            tf_imap_host.value     = cfg_r.get("imap_host", "imap.gmail.com")
+            tf_firma.value         = cfg_r.get("firma", "")
+            tf_correos_copia.value = cfg_r.get("correos_copia", "")
+            tf_url_calendly.value  = cfg_r.get("url_calendly", "")
+            tf_url_whatsapp.value  = cfg_r.get("url_whatsapp", "")
             contenedor_vista.content = vista_configuracion
             lbl_topbar_titulo.value  = "Configuración"
             btn_iniciar.visible      = False
@@ -5078,6 +5431,9 @@ def main(page: ft.Page):
                     total_nuevas = nuevas_resp + nuevas_cal
 
                     if total_nuevas > 0:
+                        # Marcar timestamp de actividad para polling adaptativo
+                        _ULTIMA_ACTIVIDAD_RESPUESTA[0] = _time.time()
+
                         # Notificación del SO (toast Windows o fallback beep)
                         try:
                             if nuevas_resp > 0 and nuevas_cal > 0:
@@ -5107,8 +5463,6 @@ def main(page: ft.Page):
                             pass
 
                         if vista_actual[0] == "respuestas":
-                            # El usuario está mirando: refrescamos la lista
-                            # (el badge "nueva" sale solo gracias a registro_vistos)
                             _render_respuestas()
                         else:
                             respuestas_no_vistas[0] += total_nuevas
@@ -5119,17 +5473,43 @@ def main(page: ft.Page):
                             )
                 except Exception:
                     pass
-            # Gmail rate-limita logins IMAP frecuentes con
-            # "Application-specific password required". 12-20s evita el
-            # bloqueo y sigue siendo casi en tiempo real para el usuario.
-            _time.sleep(12 if vista_actual[0] == "respuestas" else 20)
+
+            # Polling ADAPTATIVO: si hubo actividad reciente, polea más
+            # rápido (sospecha que vienen más respuestas en cadena).
+            # Si la cuenta está quieta, polea más lento para respetar el
+            # rate-limit de Gmail (evita "Application-specific password").
+            _now = _time.time()
+            desde_actividad = _now - _ULTIMA_ACTIVIDAD_RESPUESTA[0]
+            mirando_respuestas = (vista_actual[0] == "respuestas")
+
+            if desde_actividad < 300:        # actividad en últimos 5 min
+                sleep_t = 5 if mirando_respuestas else 8
+            elif desde_actividad < 1800:     # entre 5 y 30 min
+                sleep_t = 10 if mirando_respuestas else 15
+            else:                            # más de 30 min sin actividad
+                sleep_t = 15 if mirando_respuestas else 25
+            _time.sleep(sleep_t)
 
     if not _INIT_HECHO[0]:
         threading.Thread(target=watcher_respuestas, daemon=True).start()
     _INIT_HECHO[0] = True
 
     # ── Header del sidebar: nombre del producto + logo del cliente ──
-    logo_path = os.path.join(CARPETA_ASSETS, "ITH-logo.png")
+    # Si el usuario configuró un logo personalizado en Configuración →
+    # Apariencia, lo usamos. Si no, fallback al logo embebido (ITH-logo.png
+    # del bundle). Path SIEMPRE absoluto: en .exe compilado el cwd no es
+    # CARPETA_ASSETS y un src relativo no encuentra la imagen.
+    _logo_user = (cfg_actual.get("logo_personalizado") or "").strip()
+    if _logo_user and os.path.exists(_logo_user):
+        logo_path = _logo_user
+    else:
+        logo_path = os.path.join(CARPETA_ASSETS, "ITH-logo.png")
+    sidebar_logo_img = ft.Image(
+        src=logo_path,
+        width=110,
+        height=46,
+        fit="contain",
+    )
     sidebar_header = ft.Container(
         bgcolor=C_BLANCO,
         padding=ft.Padding(20, 22, 20, 22),
@@ -5143,17 +5523,11 @@ def main(page: ft.Page):
             horizontal_alignment=ft.CrossAxisAlignment.CENTER,
             spacing=10,
             controls=[
-                # Logo del cliente sobre fondo claro (no se confunde con el morado)
                 ft.Container(
                     bgcolor=C_FONDO,
                     border_radius=ft.BorderRadius(12, 12, 12, 12),
                     padding=ft.Padding(14, 10, 14, 10),
-                    content=ft.Image(
-                        src="ITH-logo.png",
-                        width=110,
-                        height=46,
-                        fit="contain",
-                    ),
+                    content=sidebar_logo_img,
                 ) if os.path.exists(logo_path) else ft.Container(),
                 # Nombre del producto
                 ft.Row(

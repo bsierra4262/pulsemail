@@ -48,6 +48,11 @@ REM plyer — notificaciones nativas de Windows 10/11 cuando llega
 REM una respuesta nueva al hilo. Sin esto, la app cae a un beep.
 pip install plyer
 
+REM PyInstaller — REQUERIDO para compilar a .exe con `flet pack`.
+REM Si no lo instalás, build_installer.bat falla con
+REM "No module named 'PyInstaller'".
+pip install pyinstaller
+
 
 REM ───────────────────────────────────────────────────────────────
 REM  PASO 4 (sólo para COMPILAR a .exe) — instalar Inno Setup

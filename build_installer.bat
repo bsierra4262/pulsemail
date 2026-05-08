@@ -65,7 +65,11 @@ flet pack interfaz.py ^
     --add-data "icon-solution.svg;." ^
     --add-data "icon-calendar.svg;." ^
     --add-data "icon-whatsapp.svg;." ^
-    --add-data "enviar_correos.py;."
+    --add-data "enviar_correos.py;." ^
+    --hidden-import "plyer.platforms.win.notification" ^
+    --hidden-import "plyer.platforms.win" ^
+    --hidden-import "plyer.platforms" ^
+    --hidden-import "plyer"
 
 if errorlevel 1 (
     echo.
