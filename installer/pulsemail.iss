@@ -16,7 +16,11 @@
 #define MyAppName       "Pulsemail"
 #define MyAppFullName   "Pulsemail — Outreach Suite"
 #define MyAppPublisher  "Pulsemail"
-#define MyAppVersion    "1.0.0"
+; La versión se lee del archivo VERSION en la raíz del proyecto.
+; Fuente única de verdad: bumpear con `python bump_version.py patch`
+; y todos los artefactos (build_installer.bat, este .iss, CHANGELOG)
+; quedan sincronizados.
+#define MyAppVersion    Trim(FileRead(FileOpen("..\VERSION")))
 #define MyAppExeName    "Pulsemail.exe"
 #define MyAppURL        "https://pulsemail.app"
 

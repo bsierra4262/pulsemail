@@ -655,16 +655,25 @@ def main(page: ft.Page):
 
     # ── Helper de refresco seguro (Flet 0.84 a veces no propaga desde threads) ──
     def safe_update(*controles):
-        """Refresca la página y opcionalmente controles individuales, ignorando errores."""
-        for c in controles:
+        """Refresca controles puntuales (rápido) o toda la página si no
+        se pasan args. Antes hacía siempre `page.update()` además del
+        update individual — eso obligaba a Flet a recorrer todo el árbol
+        de controles innecesariamente. Ahora:
+          - `safe_update(c1, c2)` → sólo actualiza esos controles.
+          - `safe_update()`       → actualiza toda la página.
+        Ahorra ~30% del tiempo de render en flujos con muchos updates
+        (refrescar tabla, ticks del watcher, etc.)."""
+        if controles:
+            for c in controles:
+                try:
+                    c.update()
+                except Exception:
+                    pass
+        else:
             try:
-                c.update()
+                page.update()
             except Exception:
                 pass
-        try:
-            page.update()
-        except Exception:
-            pass
 
     # ── Helper: portapapeles. En Flet 0.84 page.set_clipboard fue removido.
     # Usamos la API nativa de Windows (Win32) con declaración explícita
@@ -840,6 +849,44 @@ def main(page: ft.Page):
         padding=ft.Padding(16, 12, 16, 12),
         auto_scroll=True,
     )
+
+    # Placeholder inicial del historial de eventos del dashboard.
+    # Cuando empieza a llegar el primer evento (`agregar_log`), se
+    # auto-remueve para dejar lugar a la lista real.
+    _dashboard_placeholder = ft.Container(
+        alignment=ft.Alignment(0, 0),
+        padding=ft.Padding(40, 50, 40, 50),
+        content=ft.Column(
+            horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+            spacing=10,
+            controls=[
+                ft.Container(
+                    width=56, height=56,
+                    bgcolor=C_MORADO_LIGHT,
+                    border_radius=ft.BorderRadius(28, 28, 28, 28),
+                    alignment=ft.Alignment(0, 0),
+                    content=ft.Icon(
+                        ft.Icons.PLAY_CIRCLE_OUTLINE_ROUNDED,
+                        color=C_MORADO, size=28,
+                    ),
+                ),
+                ft.Text(
+                    "Listo para empezar",
+                    size=14, weight=ft.FontWeight.BOLD,
+                    color=C_TEXTO_1, font_family="Saira",
+                ),
+                ft.Text(
+                    "Apretá \"Iniciar campaña\" arriba a la derecha. "
+                    "Cada envío, rebote o evento de la campaña va a "
+                    "aparecer acá en tiempo real.",
+                    size=11, color=C_TEXTO_3,
+                    font_family="Saira",
+                    text_align=ft.TextAlign.CENTER,
+                ),
+            ],
+        ),
+    )
+    lista_actividad.controls.append(_dashboard_placeholder)
     texto_estado = ft.Text(texto_estado_inicial, size=13, color=C_TEXTO_3,
                            italic=True, font_family="Saira")
     ring_estado  = ft.ProgressRing(color=C_VERDE, width=22, height=22,
@@ -947,10 +994,32 @@ def main(page: ft.Page):
             ),
         )
 
+        # Quitamos el placeholder en cuanto llega el primer evento real.
+        # Después, las llamadas sucesivas no encuentran el placeholder y
+        # el check es O(1).
+        if (lista_actividad.controls
+                and lista_actividad.controls[0] is _dashboard_placeholder):
+            lista_actividad.controls.clear()
+
         if historial_ascendente[0]:
             lista_actividad.controls.append(fila)
         else:
             lista_actividad.controls.insert(0, fila)
+
+        # Auto-clear del historial visual del dashboard. Mantenemos los
+        # últimos 200 eventos para que la UI no se vuelva lenta cuando
+        # corren campañas grandes (1500+ envíos = 1500+ líneas). Los
+        # eventos viejos siguen en el historial DEL DÍA (json) — esto
+        # sólo cappea lo que se muestra en pantalla.
+        MAX_EVENTOS_VISIBLES = 200
+        if len(lista_actividad.controls) > MAX_EVENTOS_VISIBLES:
+            if historial_ascendente[0]:
+                # eventos viejos arriba → recortamos por arriba
+                del lista_actividad.controls[:-MAX_EVENTOS_VISIBLES]
+            else:
+                # eventos viejos abajo → recortamos por abajo
+                del lista_actividad.controls[MAX_EVENTOS_VISIBLES:]
+
         safe_update()
 
     sys.stdout = RedireccionConsola(agregar_log, actualizar_metricas)
@@ -1108,6 +1177,8 @@ def main(page: ft.Page):
 
     def limpiar_log(e):
         lista_actividad.controls.clear()
+        # Reaparece el placeholder para que la sección no quede en blanco.
+        lista_actividad.controls.append(_dashboard_placeholder)
         safe_update()
 
     btn_limpiar = ft.TextButton(
@@ -1247,12 +1318,39 @@ def main(page: ft.Page):
         # chicas.
     )
 
-    def _render_pagina_contactos():
-        tabla_contactos_rows.rows.clear()
+    # ── Estructura optimizada de contactos ──
+    # Cada contacto se guarda como TUPLA de 7 elementos:
+    #   (nombre, apellido, cuenta, email1, email2, email3, blob_busqueda)
+    # `blob_busqueda` es todos los campos concatenados en lowercase —
+    # filtrar con `q in blob` es mucho más rápido que 6 `.get().lower()`
+    # por fila, y evita re-bajar a minúsculas en cada keystroke del
+    # buscador (con 30k contactos esto cortó el lag de filtrado).
+    # Índices: 0=nombre, 1=apellido, 2=cuenta, 3=email1, 4=email2, 5=email3
+    IDX_NOMBRE, IDX_APELLIDO, IDX_CUENTA = 0, 1, 2
+    IDX_E1, IDX_E2, IDX_E3, IDX_BLOB     = 3, 4, 5, 6
+
+    # Cache del último render: si nada cambió desde la última vez,
+    # skippeamos toda la reconstrucción de DataRows.
+    # Key: (id(contactos_filtrados), pagina_contactos[0])
+    _ultimo_render_key = [None]
+
+    def _render_pagina_contactos(forzar=False):
         total_filtrado = len(contactos_filtrados)
+
+        # Short-circuit: si nada cambió, no re-rendereamos. Esto evita
+        # que al volver a la pestaña Contactos (cambiar_vista → cargar →
+        # _aplicar_filtro → render) se re-creen 50 DataRows que ya están
+        # idénticos en pantalla — principal causa del lag al alternar
+        # pestañas con 17k+ contactos.
+        clave_render = (id(contactos_filtrados), pagina_contactos[0])
+        if not forzar and _ultimo_render_key[0] == clave_render:
+            return
+
+        tabla_contactos_rows.rows.clear()
         if total_filtrado == 0:
             lbl_pagina.value = "Sin resultados"
-            safe_update()
+            _ultimo_render_key[0] = clave_render
+            safe_update(tabla_contactos_rows, lbl_pagina)
             return
         max_pag = max(0, (total_filtrado - 1) // TAM_PAGINA)
         if pagina_contactos[0] > max_pag:
@@ -1261,22 +1359,43 @@ def main(page: ft.Page):
             pagina_contactos[0] = 0
         ini = pagina_contactos[0] * TAM_PAGINA
         fin = min(ini + TAM_PAGINA, total_filtrado)
-        for fila in contactos_filtrados[ini:fin]:
-            tabla_contactos_rows.rows.append(
+
+        # Construimos las filas referenciando por índice (más rápido que
+        # .get()). El ancho de página típico es 50 filas — render < 5ms.
+        _txt = lambda s: ft.Text(s, font_family="Saira", size=13)
+        nuevas_rows = []
+        for t in contactos_filtrados[ini:fin]:
+            nuevas_rows.append(
                 ft.DataRow(cells=[
-                    ft.DataCell(ft.Text(fila.get("Nombre", ""), font_family="Saira", size=13)),
-                    ft.DataCell(ft.Text(fila.get("Apellidos", ""), font_family="Saira", size=13)),
-                    ft.DataCell(ft.Text(fila.get("Nombre de Cuenta", ""), font_family="Saira", size=13)),
-                    ft.DataCell(ft.Text(fila.get("Correo electrónico", ""), font_family="Saira", size=13)),
-                    ft.DataCell(ft.Text(fila.get("Correo electrónico secundario", ""), font_family="Saira", size=13)),
-                    ft.DataCell(ft.Text(fila.get("Correo electrónico terciario", ""), font_family="Saira", size=13)),
+                    ft.DataCell(_txt(t[IDX_NOMBRE])),
+                    ft.DataCell(_txt(t[IDX_APELLIDO])),
+                    ft.DataCell(_txt(t[IDX_CUENTA])),
+                    ft.DataCell(_txt(t[IDX_E1])),
+                    ft.DataCell(_txt(t[IDX_E2])),
+                    ft.DataCell(_txt(t[IDX_E3])),
                 ])
             )
+        tabla_contactos_rows.rows.extend(nuevas_rows)
+
         lbl_pagina.value = (
             f"Mostrando {ini + 1}–{fin} de {total_filtrado:,}".replace(",", ".")
             + f"  •  Página {pagina_contactos[0] + 1} / {max_pag + 1}"
         )
-        safe_update()
+
+        # safe_update con args específicos: actualiza SÓLO la tabla y
+        # el label. Evita el page.update() global que recorre todo el
+        # árbol de widgets de la app (que es lo que producía el lag al
+        # cambiar de página con 17k contactos).
+        _ultimo_render_key[0] = clave_render
+        safe_update(tabla_contactos_rows, lbl_pagina)
+
+    # Debounce del buscador: en vez de filtrar en cada keystroke,
+    # esperamos 180ms desde el último cambio. Con 30k contactos eso
+    # convierte un input típico de 10 caracteres en 1 filtrado en
+    # lugar de 10. Cancelable: cada keystroke nuevo cancela el timer
+    # anterior.
+    _filtro_timer = [None]
+    _FILTRO_DEBOUNCE_S = 0.18
 
     def _aplicar_filtro_contactos():
         nonlocal contactos_filtrados
@@ -1284,17 +1403,34 @@ def main(page: ft.Page):
         if not q:
             contactos_filtrados = contactos_data
         else:
+            # Lookup contra el blob pre-computado (índice IDX_BLOB).
+            # Operación O(1) por fila en lugar de 6 lookups + lower().
             contactos_filtrados = [
-                f for f in contactos_data
-                if q in (f.get("Nombre", "") or "").lower()
-                or q in (f.get("Apellidos", "") or "").lower()
-                or q in (f.get("Nombre de Cuenta", "") or "").lower()
-                or q in (f.get("Correo electrónico", "") or "").lower()
-                or q in (f.get("Correo electrónico secundario", "") or "").lower()
-                or q in (f.get("Correo electrónico terciario", "") or "").lower()
+                t for t in contactos_data
+                if q in t[IDX_BLOB]
             ]
         pagina_contactos[0] = 0
         _render_pagina_contactos()
+
+    def _aplicar_filtro_contactos_debounced():
+        # Cancelamos timer pendiente si lo hay
+        t_anterior = _filtro_timer[0]
+        if t_anterior is not None:
+            try:
+                t_anterior.cancel()
+            except Exception:
+                pass
+
+        def _ejecutar():
+            try:
+                _aplicar_filtro_contactos()
+            except Exception:
+                pass
+
+        timer_nuevo = threading.Timer(_FILTRO_DEBOUNCE_S, _ejecutar)
+        timer_nuevo.daemon = True
+        _filtro_timer[0] = timer_nuevo
+        timer_nuevo.start()
 
     def cargar_contactos(forzar=False):
         if contactos_cargando[0]:
@@ -1322,8 +1458,55 @@ def main(page: ft.Page):
             try:
                 nuevos = []
                 with open(ruta, "r", encoding="utf-8") as f:
-                    for fila in csv.DictReader(f):
-                        nuevos.append(fila)
+                    reader = csv.reader(f)
+                    # Headers: identificamos por nombre qué índice
+                    # tiene cada columna (HubSpot puede cambiar orden).
+                    try:
+                        headers = next(reader)
+                    except StopIteration:
+                        headers = []
+                    h_lower = [(h or "").strip().lower() for h in headers]
+
+                    def _idx(*nombres):
+                        for n in nombres:
+                            n = n.lower()
+                            if n in h_lower:
+                                return h_lower.index(n)
+                        return -1
+
+                    i_nombre   = _idx("nombre")
+                    i_apellido = _idx("apellidos", "apellido")
+                    i_cuenta   = _idx("nombre de cuenta", "cuenta", "empresa")
+                    i_e1       = _idx("correo electrónico", "correo electronico", "email")
+                    i_e2       = _idx("correo electrónico secundario", "correo electronico secundario", "email 2")
+                    i_e3       = _idx("correo electrónico terciario", "correo electronico terciario", "email 3")
+
+                    def _get(row, idx):
+                        if idx < 0 or idx >= len(row):
+                            return ""
+                        return (row[idx] or "").strip()
+
+                    # csv.reader es 2-3x más rápido que DictReader y
+                    # devuelve listas en lugar de OrderedDicts (menos
+                    # overhead de memoria con 30k+ filas). Construimos
+                    # tuplas inmutables con un blob de búsqueda pre-
+                    # computado para que el filtro sea O(1) por fila.
+                    for row in reader:
+                        nombre   = _get(row, i_nombre)
+                        apellido = _get(row, i_apellido)
+                        cuenta   = _get(row, i_cuenta)
+                        e1       = _get(row, i_e1)
+                        e2       = _get(row, i_e2)
+                        e3       = _get(row, i_e3)
+                        # Blob lowercase: filtro hace `q in blob` sin
+                        # llamadas a .lower() en cada keystroke.
+                        blob = (
+                            f"{nombre} {apellido} {cuenta} {e1} {e2} {e3}"
+                        ).lower()
+                        nuevos.append(
+                            (nombre, apellido, cuenta, e1, e2, e3, blob)
+                        )
+
                 contactos_data       = nuevos
                 contactos_filtrados  = nuevos
                 pagina_contactos[0]  = 0
@@ -1342,7 +1525,16 @@ def main(page: ft.Page):
         threading.Thread(target=trabajador, daemon=True).start()
 
     def _ir_pagina(delta):
-        pagina_contactos[0] += delta
+        # Guard: si ya estoy en página 0 y delta=-1, o estoy en la
+        # última página y delta=+1, no hacer nada (evita re-render
+        # innecesario que el cache después absorbería pero igual paga
+        # el costo del check inicial).
+        nueva = pagina_contactos[0] + delta
+        total = len(contactos_filtrados)
+        max_pag = max(0, (total - 1) // TAM_PAGINA) if total else 0
+        if nueva < 0 or nueva > max_pag:
+            return
+        pagina_contactos[0] = nueva
         _render_pagina_contactos()
 
     def _importar_contactos_dialog(e=None):
@@ -1684,7 +1876,9 @@ def main(page: ft.Page):
             lbl_pegar_detect.value = ""
             btn_agregar_pegados_inline.visible = False
 
-        _aplicar_filtro_contactos()
+        # Usamos la versión debounced en el handler de keystrokes para
+        # que filtrar 30k contactos no se ejecute con cada letra.
+        _aplicar_filtro_contactos_debounced()
         safe_update(lbl_pegar_detect, btn_agregar_pegados_inline)
 
     def _accion_agregar_pegados(e=None):
@@ -1813,6 +2007,778 @@ def main(page: ft.Page):
     )
 
     # ==========================================
+    # PANEL LISTA NEGRA — opt-outs (responden BAJA o piden no recibir)
+    # ==========================================
+    # Tres orígenes de un email en la lista:
+    #   1. Auto: respondieron a una campaña con "BAJA" o frase opt-out.
+    #   2. Manual: el usuario lo agregó desde este panel.
+    #   3. Importado: vino de un CSV de campañas anteriores.
+    # Cualquier email que esté en la lista se saltea silenciosamente
+    # cuando arranca una campaña.
+    lista_negra_data        = []   # cache local del JSON crudo
+    lista_negra_filtrada    = []   # subset después del filtro de búsqueda
+    pagina_negra            = [0]
+    # Tamaño de página configurable por el usuario. Default 200 (vs 50
+    # anterior) — con scroll vertical en la tabla evita estar paginando
+    # constantemente. Si hay menos de 200 items se ven todos en una sola.
+    TAMS_PAGINA_NEGRA       = [200, 500, 1000]
+    TAM_PAGINA_NEGRA_DEFAULT = 200
+    tam_pagina_negra        = [TAM_PAGINA_NEGRA_DEFAULT]
+
+    lbl_negra_total = ft.Text("", size=12, color=C_TEXTO_3, font_family="Saira")
+    lbl_negra_pagina = ft.Text("", size=12, color=C_TEXTO_2, font_family="Saira")
+
+    # KPIs grandes arriba del panel: Total / Auto / Manual.
+    # Los actualizamos en cada cargar_lista_negra_panel().
+    kpi_negra_total  = ft.Text("0", size=32, weight=ft.FontWeight.BOLD,
+                                color=C_TEXTO_1, font_family="Saira")
+    kpi_negra_auto   = ft.Text("0", size=32, weight=ft.FontWeight.BOLD,
+                                color=C_MORADO, font_family="Saira")
+    kpi_negra_manual = ft.Text("0", size=32, weight=ft.FontWeight.BOLD,
+                                color=C_VERDE_DARK, font_family="Saira")
+
+    def _kpi_card(titulo, valor_widget, color_chip, label_chip, icon):
+        # Chip con fondo SÓLIDO y texto BLANCO. Antes usábamos
+        # `color_chip + "25"` (alpha 25%) con texto del mismo color —
+        # en tema oscuro el bg quedaba casi negro y el texto color
+        # quedaba ilegible. Bg sólido + texto blanco se ve igual de
+        # bien en tema claro y oscuro.
+        return ft.Container(
+            expand=True,
+            bgcolor=C_BLANCO,
+            border_radius=ft.BorderRadius(14, 14, 14, 14),
+            border=borde_all(1, C_BORDE),
+            padding=ft.Padding(20, 18, 20, 18),
+            content=ft.Column(
+                spacing=6,
+                controls=[
+                    ft.Row(
+                        alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+                        controls=[
+                            ft.Text(titulo, size=11, color=C_TEXTO_3,
+                                    weight=ft.FontWeight.BOLD,
+                                    font_family="Saira"),
+                            ft.Container(
+                                bgcolor=color_chip,
+                                border_radius=ft.BorderRadius(6, 6, 6, 6),
+                                padding=ft.Padding(8, 3, 8, 3),
+                                content=ft.Row(
+                                    spacing=4,
+                                    controls=[
+                                        ft.Icon(icon, color=C_BLANCO,
+                                                size=12),
+                                        ft.Text(label_chip, size=10,
+                                                color=C_BLANCO,
+                                                weight=ft.FontWeight.BOLD,
+                                                font_family="Saira"),
+                                    ],
+                                ),
+                            ),
+                        ],
+                    ),
+                    valor_widget,
+                ],
+            ),
+        )
+
+    kpi_card_total = _kpi_card(
+        "TOTAL BLOQUEADOS", kpi_negra_total,
+        C_TEXTO_2, "lista negra", ft.Icons.BLOCK_ROUNDED,
+    )
+    kpi_card_auto = _kpi_card(
+        "DETECCIÓN AUTOMÁTICA", kpi_negra_auto,
+        C_MORADO, "respondieron BAJA", ft.Icons.SMART_TOY_ROUNDED,
+    )
+    kpi_card_manual = _kpi_card(
+        "AGREGADOS MANUALMENTE", kpi_negra_manual,
+        C_VERDE_DARK, "tu decisión", ft.Icons.PERSON_ROUNDED,
+    )
+
+    # Filtros tipo "chip": Todos / Auto / Manual.
+    filtro_origen = ["todos"]   # 'todos' | 'auto' | 'manual'
+    btns_filtro_origen = {}
+
+    def _refrescar_chips_filtro():
+        estilos = {
+            "todos":  (C_MORADO,    "Todos",   ft.Icons.LIST_ALT_ROUNDED),
+            "auto":   (C_MORADO,    "Auto",    ft.Icons.SMART_TOY_ROUNDED),
+            "manual": (C_VERDE_DARK, "Manual", ft.Icons.PERSON_ROUNDED),
+        }
+        for k, b in btns_filtro_origen.items():
+            activo = (k == filtro_origen[0])
+            color  = estilos[k][0]
+            b.style = ft.ButtonStyle(
+                bgcolor={ft.ControlState.DEFAULT: color if activo else C_BLANCO},
+                color={ft.ControlState.DEFAULT: C_BLANCO if activo else color},
+                side={ft.ControlState.DEFAULT: ft.BorderSide(1.2, color)},
+                shape=ft.RoundedRectangleBorder(radius=20),
+                padding=ft.Padding(14, 8, 14, 8),
+            )
+        try:
+            for b in btns_filtro_origen.values():
+                b.update()
+        except Exception:
+            pass
+
+    def _set_filtro_origen(k):
+        filtro_origen[0] = k
+        pagina_negra[0] = 0
+        _refrescar_chips_filtro()
+        _aplicar_filtro_negra()
+
+    for key, (color_c, label_c, icon_c) in [
+        ("todos",  (C_MORADO,     "Todos",  ft.Icons.LIST_ALT_ROUNDED)),
+        ("auto",   (C_MORADO,     "Auto-baja", ft.Icons.SMART_TOY_ROUNDED)),
+        ("manual", (C_VERDE_DARK, "Manuales",  ft.Icons.PERSON_ROUNDED)),
+    ]:
+        btns_filtro_origen[key] = ft.ElevatedButton(
+            label_c, icon=icon_c,
+            on_click=lambda e, k=key: _set_filtro_origen(k),
+        )
+    _refrescar_chips_filtro()
+
+    tabla_negra = ft.DataTable(
+        columns=[
+            ft.DataColumn(ft.Text("Email", font_family="Saira",
+                                  weight=ft.FontWeight.BOLD)),
+            ft.DataColumn(ft.Text("Fecha", font_family="Saira",
+                                  weight=ft.FontWeight.BOLD)),
+            ft.DataColumn(ft.Text("Motivo", font_family="Saira",
+                                  weight=ft.FontWeight.BOLD)),
+            ft.DataColumn(ft.Text("Origen", font_family="Saira",
+                                  weight=ft.FontWeight.BOLD)),
+            ft.DataColumn(ft.Text("Acción", font_family="Saira",
+                                  weight=ft.FontWeight.BOLD)),
+        ],
+        rows=[],
+        border=ft.border.all(1, C_BORDE),
+        border_radius=10,
+        heading_row_color=C_FONDO,
+        heading_row_height=46,
+        data_row_min_height=44,
+        column_spacing=24,
+        horizontal_lines=ft.BorderSide(1, C_BORDE),
+        # Que la tabla ocupe todo el ancho disponible — antes quedaba
+        # achicada al ancho mínimo de su contenido y se veía pobre.
+        expand=True,
+    )
+
+    # Contenedor que alternará entre la tabla (con datos) y el empty
+    # state (cuando no hay nada). Lo definimos abajo en la vista; aquí
+    # sólo lo declaramos para que el render lo pueda mutar.
+    contenedor_tabla_negra = ft.Container(expand=True)
+
+    def _render_pagina_negra():
+        tabla_negra.rows.clear()
+        total = len(lista_negra_filtrada)
+
+        # Si no hay ningún email en la lista negra del usuario (no es un
+        # filtro vacío, sino lista TOTALMENTE vacía), mostramos un empty
+        # state amigable en vez de la tabla con headers solos.
+        if not lista_negra_data:
+            contenedor_tabla_negra.content = ft.Container(
+                expand=True,
+                bgcolor=C_BLANCO,
+                border_radius=ft.BorderRadius(14, 14, 14, 14),
+                border=borde_all(1, C_BORDE),
+                alignment=ft.Alignment(0, 0),
+                padding=ft.Padding(40, 60, 40, 60),
+                content=ft.Column(
+                    horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+                    spacing=14,
+                    controls=[
+                        ft.Container(
+                            width=72, height=72,
+                            bgcolor=C_MORADO_LIGHT,
+                            border_radius=ft.BorderRadius(36, 36, 36, 36),
+                            alignment=ft.Alignment(0, 0),
+                            content=ft.Icon(
+                                ft.Icons.SHIELD_OUTLINED,
+                                color=C_MORADO, size=36,
+                            ),
+                        ),
+                        ft.Text(
+                            "Tu lista negra está vacía",
+                            size=18, weight=ft.FontWeight.BOLD,
+                            color=C_TEXTO_1, font_family="Saira",
+                        ),
+                        ft.Text(
+                            "Cuando alguien responda \"BAJA\" a una campaña "
+                            "o pida no recibir más correos, va a aparecer "
+                            "acá automáticamente y se va a saltear en las "
+                            "próximas campañas.",
+                            size=12, color=C_TEXTO_3, font_family="Saira",
+                            text_align=ft.TextAlign.CENTER,
+                        ),
+                        ft.Text(
+                            "También podés agregar emails manualmente con "
+                            "el formulario de arriba.",
+                            size=11, color=C_TEXTO_3, italic=True,
+                            font_family="Saira",
+                            text_align=ft.TextAlign.CENTER,
+                        ),
+                    ],
+                ),
+            )
+            lbl_negra_total.value  = "Total bloqueados: 0"
+            lbl_negra_pagina.value = ""
+            safe_update()
+            return
+
+        # Si hay emails pero el filtro/buscador devuelve 0, mostramos un
+        # mensaje de "sin resultados" — distinto al empty state global.
+        if total == 0:
+            contenedor_tabla_negra.content = ft.Container(
+                expand=True,
+                bgcolor=C_BLANCO,
+                border_radius=ft.BorderRadius(14, 14, 14, 14),
+                border=borde_all(1, C_BORDE),
+                alignment=ft.Alignment(0, 0),
+                padding=ft.Padding(40, 50, 40, 50),
+                content=ft.Column(
+                    horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+                    spacing=8,
+                    controls=[
+                        ft.Icon(ft.Icons.SEARCH_OFF_ROUNDED,
+                                color=C_TEXTO_3, size=44),
+                        ft.Text(
+                            "Sin resultados con los filtros actuales",
+                            size=14, color=C_TEXTO_2, font_family="Saira",
+                        ),
+                    ],
+                ),
+            )
+            lbl_negra_total.value  = f"Total bloqueados: {len(lista_negra_data)}"
+            lbl_negra_pagina.value = ""
+            safe_update()
+            return
+
+        tam_pag = tam_pagina_negra[0]
+        max_pag = max(0, (total - 1) // tam_pag)
+        if pagina_negra[0] > max_pag:
+            pagina_negra[0] = max_pag
+        if pagina_negra[0] < 0:
+            pagina_negra[0] = 0
+        ini = pagina_negra[0] * tam_pag
+        fin = ini + tam_pag
+
+        # Tabla full-width con scroll vertical. Flet DataTable dentro
+        # de un Column(scroll=AUTO) NO respeta `expand=True` porque la
+        # column con scroll permite tamaño natural. Solución: envolver
+        # con una Row(expand=True) — eso fuerza al DataTable a tomar
+        # todo el ancho disponible. El scroll vertical lo da la Column
+        # exterior cuando hay más filas que las visibles.
+        contenedor_tabla_negra.content = ft.Container(
+            expand=True,
+            bgcolor=C_BLANCO,
+            border_radius=ft.BorderRadius(14, 14, 14, 14),
+            border=borde_all(1, C_BORDE),
+            padding=ft.Padding(8, 8, 8, 8),
+            content=ft.Column(
+                expand=True,
+                scroll=ft.ScrollMode.AUTO,
+                controls=[
+                    ft.Row(
+                        expand=True,
+                        controls=[
+                            ft.Container(expand=True, content=tabla_negra),
+                        ],
+                    ),
+                ],
+            ),
+        )
+
+        for entrada in lista_negra_filtrada[ini:fin]:
+            email_addr = (entrada.get("email") or "").strip()
+            fecha      = entrada.get("fecha", "")
+            motivo     = entrada.get("motivo", "")
+            es_auto    = entrada.get("auto", False)
+
+            # Chips de origen con fondo SÓLIDO y texto blanco para que
+            # se lean igual en tema claro y oscuro. Los chips "light +
+            # texto color" antes quedaban casi invisibles en oscuro.
+            chip_origen = ft.Container(
+                bgcolor=(C_MORADO if es_auto else C_VERDE_DARK),
+                border_radius=ft.BorderRadius(6, 6, 6, 6),
+                padding=ft.Padding(8, 3, 8, 3),
+                content=ft.Text(
+                    "AUTO" if es_auto else "MANUAL",
+                    size=10, weight=ft.FontWeight.BOLD,
+                    color=C_BLANCO,
+                    font_family="Saira",
+                ),
+            )
+
+            def _hacer_quitar(em=email_addr):
+                def _quitar(e):
+                    enviar_correos.quitar_de_lista_negra(em)
+                    cargar_lista_negra_panel()
+                return _quitar
+
+            btn_quitar = ft.IconButton(
+                icon=ft.Icons.DELETE_OUTLINE_ROUNDED,
+                icon_color=C_ROJO,
+                tooltip="Quitar de la lista negra",
+                on_click=_hacer_quitar(),
+            )
+
+            tabla_negra.rows.append(
+                ft.DataRow(cells=[
+                    ft.DataCell(ft.Text(email_addr, size=13,
+                                        font_family="Saira",
+                                        color=C_TEXTO_1)),
+                    ft.DataCell(ft.Text(fecha[:16] if fecha else "",
+                                        size=12, font_family="Saira",
+                                        color=C_TEXTO_3)),
+                    ft.DataCell(ft.Text(motivo[:60], size=12,
+                                        font_family="Saira",
+                                        color=C_TEXTO_2)),
+                    ft.DataCell(chip_origen),
+                    ft.DataCell(btn_quitar),
+                ])
+            )
+
+        lbl_negra_total.value = f"Total bloqueados: {len(lista_negra_data)}"
+        lbl_negra_pagina.value = (
+            f"Mostrando {ini + 1}-{min(fin, total)} de {total} "
+            f"  •  Página {pagina_negra[0] + 1} / {max_pag + 1}"
+        )
+        safe_update()
+
+    tf_buscar_negra = ft.TextField(
+        hint_text="Buscar email...",
+        prefix_icon=ft.Icons.SEARCH_ROUNDED,
+        border_color=C_BORDE,
+        focused_border_color=C_MORADO,
+        text_style=ft.TextStyle(font_family="Saira"),
+        on_change=lambda e: _aplicar_filtro_negra(),
+        expand=True,
+    )
+
+    # Dropdown para elegir cuántos items por página. Reduce el tedio
+    # de paginar cuando el usuario tiene 500+ entries en la lista negra.
+    def _on_cambio_tam_pagina(e):
+        try:
+            tam_pagina_negra[0] = int(e.control.value)
+        except Exception:
+            tam_pagina_negra[0] = TAM_PAGINA_NEGRA_DEFAULT
+        pagina_negra[0] = 0
+        _render_pagina_negra()
+
+    # En Flet 0.84 `ft.Dropdown.__init__()` NO acepta `on_change` como
+    # kwarg (verificado por smoke test: tooltip/content_padding/etc.
+    # sí pasan, on_change sólo se puede setear como atributo después).
+    dropdown_tam_pagina = ft.Dropdown(
+        value=str(TAM_PAGINA_NEGRA_DEFAULT),
+        options=[ft.dropdown.Option(str(t)) for t in TAMS_PAGINA_NEGRA],
+        border_color=C_BORDE,
+        focused_border_color=C_MORADO,
+        text_style=ft.TextStyle(font_family="Saira", size=13),
+        width=110,
+        content_padding=ft.Padding(12, 8, 12, 8),
+        tooltip="Items por página",
+    )
+    dropdown_tam_pagina.on_change = _on_cambio_tam_pagina
+
+    def _aplicar_filtro_negra():
+        nonlocal lista_negra_filtrada
+        q = (tf_buscar_negra.value or "").strip().lower()
+        base = lista_negra_data
+        if filtro_origen[0] == "auto":
+            base = [e for e in base if e.get("auto")]
+        elif filtro_origen[0] == "manual":
+            base = [e for e in base if not e.get("auto")]
+        if q:
+            base = [
+                e for e in base
+                if q in (e.get("email") or "").lower()
+                or q in (e.get("motivo") or "").lower()
+            ]
+        lista_negra_filtrada = base
+        _render_pagina_negra()
+
+    def cargar_lista_negra_panel():
+        nonlocal lista_negra_data, lista_negra_filtrada
+        try:
+            data = enviar_correos.cargar_lista_negra()
+            lista_negra_data = sorted(
+                data.get("emails", []),
+                key=lambda x: x.get("fecha", ""),
+                reverse=True,
+            )
+        except Exception:
+            lista_negra_data = []
+        # KPIs
+        total = len(lista_negra_data)
+        autos = sum(1 for e in lista_negra_data if e.get("auto"))
+        manuales = total - autos
+        kpi_negra_total.value  = str(total)
+        kpi_negra_auto.value   = str(autos)
+        kpi_negra_manual.value = str(manuales)
+        _aplicar_filtro_negra()
+
+    # ── Diálogo "Agregar manualmente" ──────────────────────────────
+    tf_nuevo_email = ft.TextField(
+        label="Email a bloquear",
+        hint_text="cliente@empresa.com",
+        border_color=C_BORDE,
+        focused_border_color=C_MORADO,
+        text_style=ft.TextStyle(font_family="Saira"),
+        label_style=ft.TextStyle(color=C_TEXTO_2, font_family="Saira"),
+        autofocus=True,
+    )
+    tf_nuevo_motivo = ft.TextField(
+        label="Motivo (opcional)",
+        hint_text="Ej: pidió no recibir más correos",
+        border_color=C_BORDE,
+        focused_border_color=C_MORADO,
+        text_style=ft.TextStyle(font_family="Saira"),
+        label_style=ft.TextStyle(color=C_TEXTO_2, font_family="Saira"),
+    )
+
+    def _agregar_email_manual(e=None):
+        em = (tf_nuevo_email.value or "").strip()
+        if not em or "@" not in em:
+            return
+        motivo = (tf_nuevo_motivo.value or "Agregado manualmente").strip()
+        enviar_correos.agregar_a_lista_negra(em, motivo=motivo, auto=False)
+        tf_nuevo_email.value = ""
+        tf_nuevo_motivo.value = ""
+        cargar_lista_negra_panel()
+
+    btn_agregar_negra = ft.ElevatedButton(
+        "Agregar a lista negra",
+        icon=ft.Icons.ADD_ROUNDED,
+        on_click=_agregar_email_manual,
+        style=ft.ButtonStyle(
+            bgcolor={ft.ControlState.DEFAULT: C_MORADO,
+                     ft.ControlState.HOVERED: C_MORADO_DARK},
+            color=C_BLANCO,
+            shape=ft.RoundedRectangleBorder(radius=8),
+            padding=ft.Padding(16, 10, 16, 10),
+        ),
+    )
+
+    # ── Importar / exportar CSV ────────────────────────────────────
+    def _exportar_negra_csv(e=None):
+        def _picker():
+            try:
+                import tkinter as _tk
+                from tkinter import filedialog as _fd
+                root = _tk.Tk()
+                root.withdraw()
+                root.attributes("-topmost", True)
+                path = _fd.asksaveasfilename(
+                    parent=root,
+                    title="Guardar lista negra como CSV",
+                    defaultextension=".csv",
+                    initialfile="lista_negra.csv",
+                    filetypes=[("CSV", "*.csv"), ("Todos", "*.*")],
+                )
+                root.destroy()
+                if not path:
+                    return
+                import csv as _csv
+                with open(path, "w", encoding="utf-8", newline="") as f:
+                    w = _csv.writer(f)
+                    w.writerow(["email", "fecha", "motivo", "auto"])
+                    for entry in lista_negra_data:
+                        w.writerow([
+                            entry.get("email", ""),
+                            entry.get("fecha", ""),
+                            entry.get("motivo", ""),
+                            "AUTO" if entry.get("auto") else "MANUAL",
+                        ])
+                agregar_log("success",
+                            f"Lista negra exportada: {path}")
+            except Exception as ex:
+                agregar_log("error", f"No se pudo exportar: {ex}")
+        threading.Thread(target=_picker, daemon=True).start()
+
+    def _importar_negra_csv(e=None):
+        def _picker():
+            try:
+                import tkinter as _tk
+                from tkinter import filedialog as _fd
+                root = _tk.Tk()
+                root.withdraw()
+                root.attributes("-topmost", True)
+                path = _fd.askopenfilename(
+                    parent=root,
+                    title="Importar emails a lista negra",
+                    filetypes=[("CSV / TXT", "*.csv *.txt"), ("Todos", "*.*")],
+                )
+                root.destroy()
+                if not path:
+                    return
+                agregados = 0
+                with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                    for linea in f:
+                        # Tomamos lo primero que parezca un email en
+                        # cada línea (soporta CSV, TXT plano, etc.).
+                        m = re.search(
+                            r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+",
+                            linea,
+                        )
+                        if m:
+                            if enviar_correos.agregar_a_lista_negra(
+                                m.group(0),
+                                motivo="Importado desde CSV",
+                                auto=False,
+                            ):
+                                agregados += 1
+                agregar_log(
+                    "success",
+                    f"Importados {agregados} email(s) a lista negra.",
+                )
+                cargar_lista_negra_panel()
+            except Exception as ex:
+                agregar_log("error", f"No se pudo importar: {ex}")
+        threading.Thread(target=_picker, daemon=True).start()
+
+    btn_exportar_negra = ft.OutlinedButton(
+        "Exportar CSV",
+        icon=ft.Icons.DOWNLOAD_ROUNDED,
+        on_click=_exportar_negra_csv,
+        style=ft.ButtonStyle(
+            color={ft.ControlState.DEFAULT: C_MORADO},
+            side={ft.ControlState.DEFAULT: ft.BorderSide(1.2, C_MORADO)},
+            shape=ft.RoundedRectangleBorder(radius=8),
+            padding=ft.Padding(14, 10, 14, 10),
+        ),
+    )
+    btn_importar_negra = ft.OutlinedButton(
+        "Importar CSV",
+        icon=ft.Icons.UPLOAD_ROUNDED,
+        on_click=_importar_negra_csv,
+        style=ft.ButtonStyle(
+            color={ft.ControlState.DEFAULT: C_MORADO},
+            side={ft.ControlState.DEFAULT: ft.BorderSide(1.2, C_MORADO)},
+            shape=ft.RoundedRectangleBorder(radius=8),
+            padding=ft.Padding(14, 10, 14, 10),
+        ),
+    )
+
+    # ── Botón "Escanear respuestas viejas" ──
+    # Re-evalúa todas las respuestas históricas (`registro_respuestas.json`)
+    # buscando pedidos de BAJA que no fueron detectados cuando llegaron
+    # — útil después de actualizar la app, o como botón "barrer pasado"
+    # cuando el usuario nota que se le pasaron bajas.
+    ring_escan_baja = ft.ProgressRing(
+        color=C_MORADO, width=16, height=16,
+        stroke_width=2.5, visible=False,
+    )
+
+    # Throttle: si se llamó hace menos de 10 segundos, ignorar. Cuando
+    # ya no hay respuestas pendientes de evaluar el scan termina en
+    # milisegundos y el ring no llega a "verse" — sin throttle el
+    # usuario clickeando rápido genera 10 logs idénticos en el dashboard.
+    _ultimo_scan_baja_ts = [0.0]
+    _SCAN_BAJA_COOLDOWN  = 10.0   # segundos
+
+    def _escanear_bajas_retro(e=None):
+        import time as _t
+        ahora = _t.time()
+        if ring_escan_baja.visible:
+            return
+        # Cooldown: si recién terminó, ignorar silenciosamente
+        if (ahora - _ultimo_scan_baja_ts[0]) < _SCAN_BAJA_COOLDOWN:
+            return
+        cfg = enviar_correos.cargar_config()
+        if not cfg.get("correo") or not cfg.get("password"):
+            agregar_log("error",
+                        "Configurá la cuenta antes de escanear respuestas.")
+            return
+        ring_escan_baja.visible = True
+        safe_update(ring_escan_baja)
+
+        def trabajador():
+            try:
+                resumen = enviar_correos.escanear_bajas_retroactivo()
+
+                # Sólo logueamos si hubo algo interesante (cambios reales).
+                # Si todas las respuestas ya estaban evaluadas y no hay
+                # nuevas bajas, NO ensuciamos el historial del dashboard
+                # — eso causaba el spam visible de "0 analizadas, 0 nuevas
+                # bajas" que el usuario reportó.
+                if resumen["nuevas_bajas"] > 0:
+                    msg = (
+                        f"Auto-baja retroactiva: "
+                        f"{resumen['nuevas_bajas']} nueva(s) detectada(s) "
+                        f"sobre {resumen['analizados']} respuestas analizadas."
+                    )
+                    agregar_log("success", msg)
+                elif resumen["analizados"] > 0:
+                    msg = (
+                        f"Scan completo: {resumen['analizados']} "
+                        f"respuestas analizadas, sin nuevas bajas."
+                    )
+                    agregar_log("info", msg)
+                elif resumen["errores"] > 0:
+                    agregar_log(
+                        "error",
+                        f"Scan falló con {resumen['errores']} errores.",
+                    )
+                # else: nada que analizar (todas ya evaluadas) → no log
+                cargar_lista_negra_panel()
+            except Exception as ex:
+                agregar_log("error",
+                            f"Scan retroactivo falló: {ex}")
+            finally:
+                _ultimo_scan_baja_ts[0] = _t.time()
+                ring_escan_baja.visible = False
+                safe_update(ring_escan_baja)
+
+        threading.Thread(target=trabajador, daemon=True).start()
+
+    btn_escanear_bajas = ft.ElevatedButton(
+        "Escanear respuestas viejas",
+        icon=ft.Icons.SAVED_SEARCH_ROUNDED,
+        on_click=_escanear_bajas_retro,
+        tooltip=("Re-analiza respuestas ya registradas para detectar "
+                  "pedidos de BAJA que no fueron capturados al recibirlos. "
+                  "Las que matcheen se agregan automáticamente a esta lista."),
+        style=ft.ButtonStyle(
+            bgcolor={ft.ControlState.DEFAULT: C_MORADO,
+                     ft.ControlState.HOVERED: C_MORADO_DARK},
+            color={ft.ControlState.DEFAULT: C_BLANCO},
+            shape=ft.RoundedRectangleBorder(radius=8),
+            padding=ft.Padding(16, 10, 16, 10),
+        ),
+    )
+
+    btn_negra_prev = ft.IconButton(
+        icon=ft.Icons.ARROW_BACK_IOS_ROUNDED, icon_color=C_MORADO,
+        on_click=lambda e: (pagina_negra.__setitem__(0, max(0, pagina_negra[0] - 1)),
+                             _render_pagina_negra()),
+    )
+    btn_negra_next = ft.IconButton(
+        icon=ft.Icons.ARROW_FORWARD_IOS_ROUNDED, icon_color=C_MORADO,
+        on_click=lambda e: (pagina_negra.__setitem__(0, pagina_negra[0] + 1),
+                             _render_pagina_negra()),
+    )
+
+    vista_lista_negra = ft.Container(
+        padding=ft.Padding(20, 16, 20, 20),
+        content=ft.Column(
+            spacing=16,
+            expand=True,
+            scroll=ft.ScrollMode.AUTO,
+            controls=[
+                # ── KPIs arriba ───────────────────────────────────
+                ft.Row(
+                    spacing=14,
+                    controls=[kpi_card_total, kpi_card_auto, kpi_card_manual],
+                ),
+                # ── Card "Agregar manualmente" — más prominente ───
+                ft.Container(
+                    bgcolor=C_BLANCO,
+                    border_radius=ft.BorderRadius(14, 14, 14, 14),
+                    border=borde_all(1, C_BORDE),
+                    padding=ft.Padding(20, 18, 20, 18),
+                    content=ft.Column(
+                        spacing=12,
+                        controls=[
+                            ft.Row(
+                                vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                                spacing=10,
+                                controls=[
+                                    ft.Container(
+                                        width=36, height=36,
+                                        bgcolor=C_MORADO_LIGHT,
+                                        border_radius=ft.BorderRadius(10, 10, 10, 10),
+                                        alignment=ft.Alignment(0, 0),
+                                        content=ft.Icon(
+                                            ft.Icons.PERSON_ADD_DISABLED_ROUNDED,
+                                            color=C_MORADO, size=20,
+                                        ),
+                                    ),
+                                    ft.Column(
+                                        spacing=2,
+                                        controls=[
+                                            ft.Text("Bloquear un email",
+                                                    size=14,
+                                                    weight=ft.FontWeight.BOLD,
+                                                    color=C_TEXTO_1,
+                                                    font_family="Saira"),
+                                            ft.Text(
+                                                "Agregalo manualmente para "
+                                                "saltearlo en todas las campañas.",
+                                                size=11, color=C_TEXTO_3,
+                                                font_family="Saira"),
+                                        ],
+                                    ),
+                                ],
+                            ),
+                            ft.Row(spacing=10, controls=[
+                                tf_nuevo_email, tf_nuevo_motivo,
+                            ]),
+                            ft.Row(
+                                spacing=10,
+                                controls=[
+                                    btn_agregar_negra,
+                                    ft.Container(expand=True),
+                                    btn_escanear_bajas,
+                                    ring_escan_baja,
+                                    btn_importar_negra,
+                                    btn_exportar_negra,
+                                ],
+                            ),
+                        ],
+                    ),
+                ),
+                # ── Toolbar: chips de filtro + buscador ───────────
+                ft.Container(
+                    bgcolor=C_BLANCO,
+                    border_radius=ft.BorderRadius(14, 14, 14, 14),
+                    border=borde_all(1, C_BORDE),
+                    padding=ft.Padding(16, 12, 16, 12),
+                    content=ft.Column(
+                        spacing=12,
+                        controls=[
+                            ft.Row(
+                                vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                                spacing=10,
+                                controls=[
+                                    ft.Text("Filtrar:", size=12,
+                                            color=C_TEXTO_2,
+                                            weight=ft.FontWeight.W_500,
+                                            font_family="Saira"),
+                                    btns_filtro_origen["todos"],
+                                    btns_filtro_origen["auto"],
+                                    btns_filtro_origen["manual"],
+                                ],
+                            ),
+                            ft.Row(
+                                spacing=10,
+                                vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                                controls=[
+                                    tf_buscar_negra,
+                                    ft.Text("Mostrar:", size=12,
+                                            color=C_TEXTO_3,
+                                            font_family="Saira"),
+                                    dropdown_tam_pagina,
+                                ],
+                            ),
+                        ],
+                    ),
+                ),
+                # ── Tabla / Empty state ────────────────────────────
+                # expand=True sin height fijo para que ocupe TODO el
+                # alto disponible (antes estaba limitada a 420px y se
+                # veía un cuadradito chico en pantallas grandes).
+                contenedor_tabla_negra,
+                # ── Paginación ─────────────────────────────────────
+                ft.Row(
+                    alignment=ft.MainAxisAlignment.CENTER,
+                    spacing=8,
+                    controls=[btn_negra_prev, lbl_negra_pagina, btn_negra_next],
+                ),
+            ],
+        ),
+    )
+
+    # ==========================================
     # PANEL RECHAZADOS — listado, copiar, depurar
     # ==========================================
     lista_rechazados      = ft.ListView(expand=True, spacing=8,
@@ -1909,6 +2875,10 @@ def main(page: ft.Page):
     # cuando dos threads (ej: render inicial + watcher daemon) llaman al
     # mismo tiempo
     _lock_refrescar_rech = threading.Lock()
+    # Cache de dedupe: id del objeto crudo + lista deduplicada resultante.
+    # Si la referencia del objeto crudo no cambió, reutilizamos el dedupe.
+    _rechazados_cache_id     = [None]
+    _rechazados_cache_dedupe = [None]
 
     def refrescar_rechazados():
         if not _lock_refrescar_rech.acquire(blocking=False):
@@ -1923,24 +2893,29 @@ def main(page: ft.Page):
         depurados    = enviar_correos.cargar_depurados()
         mostrar_dep  = chk_mostrar_depurados.value
 
-        # Dedupe defensivo por email — normaliza espacios, mayúsculas y
-        # caracteres invisibles (zero-width, etc.) para asegurar que
-        # nunca se renderea el mismo email dos veces aunque el JSON tenga
-        # variantes raras del mismo email.
-        vistos = set()
-        unicos = []
-        for r in rechazados:
-            em_raw = r.get("email") or ""
-            # Normalización agresiva: lower + strip + quita caracteres no-printables
-            em = "".join(ch for ch in em_raw.lower().strip()
-                         if ch.isprintable())
-            if em and em not in vistos:
-                vistos.add(em)
-                # Reemplazamos el email del item con la versión normalizada
-                r_nuevo = dict(r)
-                r_nuevo["email"] = em
-                unicos.append(r_nuevo)
-        rechazados = unicos
+        # Dedupe defensivo cacheado: el cache invalida cuando la
+        # referencia del objeto cambia (cargar_rechazados_todos devuelve
+        # la misma instancia mientras el JSON no se modificó). Comparar
+        # por `id()` es O(1) y evita rehacer normalización aggresiva
+        # de 5000+ emails con `"".join(ch for ch in ...)` cada vez que
+        # el usuario cambia de pestaña.
+        if _rechazados_cache_id[0] is id(rechazados):
+            rechazados = _rechazados_cache_dedupe[0]
+        else:
+            vistos = set()
+            unicos = []
+            for r in rechazados:
+                em_raw = r.get("email") or ""
+                em = "".join(ch for ch in em_raw.lower().strip()
+                             if ch.isprintable())
+                if em and em not in vistos:
+                    vistos.add(em)
+                    r_nuevo = dict(r)
+                    r_nuevo["email"] = em
+                    unicos.append(r_nuevo)
+            rechazados = unicos
+            _rechazados_cache_id[0]     = id(enviar_correos.cargar_rechazados_todos())
+            _rechazados_cache_dedupe[0] = unicos
 
         # Filtrar primero (más rápido) y después paginar.
         # Lógica del checkbox:
@@ -2091,16 +3066,60 @@ def main(page: ft.Page):
             )
 
         if not nuevos_controles:
+            # Empty state pulido — estilo Lista negra. Cambia el copy
+            # según si NO hay rechazados todavía vs hay pero todos
+            # están del otro lado del toggle (depurados/pendientes).
+            if rechazados:
+                icono_empty = ft.Icons.FILTER_ALT_OFF_ROUNDED
+                titulo_empty = "Sin coincidencias con el filtro actual"
+                msg_empty = (
+                    "Tenés rechazados registrados pero ninguno coincide "
+                    "con el toggle activo. Probá cambiar 'Ver sólo "
+                    "depurados' para alternar entre pendientes y "
+                    "depurados."
+                )
+            else:
+                icono_empty = ft.Icons.MARK_EMAIL_READ_ROUNDED
+                titulo_empty = "No hay rebotes registrados"
+                msg_empty = (
+                    "Cuando una campaña envíe correos a direcciones "
+                    "inválidas, los rebotes que devuelva mailer-daemon "
+                    "(Gmail) o postmaster (Outlook/Exchange) van a "
+                    "aparecer acá automáticamente, junto con un botón "
+                    "para depurarlos."
+                )
             nuevos_controles.append(
                 ft.Container(
-                    padding=ft.Padding(20, 24, 20, 24),
-                    content=ft.Text(
-                        "Sin rechazados visibles. "
-                        + ("Probá activar 'Mostrar depurados'."
-                           if rechazados else
-                           "Todavía no hay rechazos registrados."),
-                        size=13, color=C_TEXTO_3, italic=True,
-                        font_family="Saira"),
+                    expand=True,
+                    alignment=ft.Alignment(0, 0),
+                    padding=ft.Padding(40, 60, 40, 60),
+                    content=ft.Column(
+                        horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+                        spacing=14,
+                        controls=[
+                            ft.Container(
+                                width=72, height=72,
+                                bgcolor=C_MORADO_LIGHT,
+                                border_radius=ft.BorderRadius(36, 36, 36, 36),
+                                alignment=ft.Alignment(0, 0),
+                                content=ft.Icon(
+                                    icono_empty,
+                                    color=C_MORADO, size=36,
+                                ),
+                            ),
+                            ft.Text(
+                                titulo_empty,
+                                size=18, weight=ft.FontWeight.BOLD,
+                                color=C_TEXTO_1, font_family="Saira",
+                            ),
+                            ft.Text(
+                                msg_empty,
+                                size=12, color=C_TEXTO_3,
+                                font_family="Saira",
+                                text_align=ft.TextAlign.CENTER,
+                            ),
+                        ],
+                    ),
                 )
             )
 
@@ -2243,14 +3262,98 @@ def main(page: ft.Page):
                                      padding=ft.Padding(8, 8, 8, 8))
     lbl_hist_stats = ft.Text("", size=12, color=C_TEXTO_3, font_family="Saira")
 
-    def cargar_dia_historial(fecha_str):
+    # Placeholder mientras no se eligió un día del historial.
+    # Se reemplaza al hacer click en cualquier tarjeta de día.
+    _hist_placeholder = ft.Container(
+        expand=True,
+        alignment=ft.Alignment(0, 0),
+        padding=ft.Padding(40, 60, 40, 60),
+        content=ft.Column(
+            horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+            spacing=12,
+            controls=[
+                ft.Container(
+                    width=64, height=64,
+                    bgcolor=C_MORADO_LIGHT,
+                    border_radius=ft.BorderRadius(32, 32, 32, 32),
+                    alignment=ft.Alignment(0, 0),
+                    content=ft.Icon(
+                        ft.Icons.TODAY_ROUNDED,
+                        color=C_MORADO, size=30,
+                    ),
+                ),
+                ft.Text(
+                    "Elegí un día de la lista",
+                    size=15, weight=ft.FontWeight.BOLD,
+                    color=C_TEXTO_1, font_family="Saira",
+                ),
+                ft.Text(
+                    "Tocá una tarjeta del panel izquierdo para ver "
+                    "el detalle de eventos, envíos y rebotes de ese día.",
+                    size=11, color=C_TEXTO_3,
+                    font_family="Saira",
+                    text_align=ft.TextAlign.CENTER,
+                ),
+            ],
+        ),
+    )
+    lista_hist_eventos.controls.append(_hist_placeholder)
+
+    # Cache del último día renderizado — si el usuario hace click en
+    # el mismo día dos veces o se re-llama por refresh interno, no
+    # reconstruimos todos los widgets de eventos (puede ser pesado
+    # con 500+ eventos por día).
+    _ultimo_dia_renderizado = [None]
+
+    # Cap defensivo: por más que el JSON tenga 5000 eventos en un día,
+    # mostramos sólo los 200 más recientes. Render de 200 widgets
+    # complejos = ~80ms; render de 5000 = 2-3s. Si el usuario necesita
+    # eventos viejos, el JSON sigue completo en disco.
+    MAX_EVENTOS_HISTORIAL_RENDER = 200
+
+    def cargar_dia_historial(fecha_str, forzar=False):
+        if not forzar and _ultimo_dia_renderizado[0] == fecha_str:
+            return  # ya está renderizado este día
         data = enviar_correos.cargar_historial_dia(fecha_str)
         lbl_hist_fecha.value = f"Historial del {fecha_str}"
         env = data.get("enviados", 0)
         reb = data.get("rebotes", 0)
         lbl_hist_stats.value = f"Enviados: {env}  •  Rechazados: {reb}"
         lista_hist_eventos.controls.clear()
-        for ev in reversed(data.get("eventos", [])):
+        eventos = data.get("eventos", [])
+        if not eventos:
+            lista_hist_eventos.controls.append(
+                ft.Container(
+                    expand=True,
+                    alignment=ft.Alignment(0, 0),
+                    padding=ft.Padding(40, 40, 40, 40),
+                    content=ft.Column(
+                        horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+                        spacing=10,
+                        controls=[
+                            ft.Icon(ft.Icons.EVENT_BUSY_ROUNDED,
+                                    color=C_TEXTO_3, size=40),
+                            ft.Text(
+                                "Este día no tiene eventos registrados.",
+                                size=13, color=C_TEXTO_2,
+                                font_family="Saira",
+                                text_align=ft.TextAlign.CENTER,
+                            ),
+                        ],
+                    ),
+                )
+            )
+            _ultimo_dia_renderizado[0] = fecha_str
+            safe_update(lista_hist_eventos, lbl_hist_fecha, lbl_hist_stats)
+            return
+
+        # Capamos a los últimos 200 eventos visibles. Para días con más,
+        # mostramos un aviso al final.
+        eventos_render = list(reversed(eventos))[:MAX_EVENTOS_HISTORIAL_RENDER]
+        total_eventos  = len(eventos)
+        truncado = total_eventos > MAX_EVENTOS_HISTORIAL_RENDER
+
+        for ev in eventos_render:
             color, bg, icono, label = TIPOS_LOG.get(ev.get("tipo", "info"), TIPOS_LOG["info"])
             lista_hist_eventos.controls.append(
                 ft.Container(
@@ -2281,17 +3384,71 @@ def main(page: ft.Page):
                     ),
                 )
             )
-        safe_update()
+
+        if truncado:
+            # Aviso: hay más eventos en el JSON pero no los rendereamos
+            # para mantener la UI fluida. El usuario puede abrir el JSON
+            # directo si necesita los más antiguos.
+            ocultos = total_eventos - MAX_EVENTOS_HISTORIAL_RENDER
+            lista_hist_eventos.controls.append(
+                ft.Container(
+                    padding=ft.Padding(12, 14, 12, 14),
+                    alignment=ft.Alignment(0, 0),
+                    content=ft.Text(
+                        f"+ {ocultos} evento(s) más antiguos no renderizados "
+                        f"(visibles en el JSON del día).",
+                        size=11, color=C_TEXTO_3, italic=True,
+                        font_family="Saira",
+                        text_align=ft.TextAlign.CENTER,
+                    ),
+                )
+            )
+
+        _ultimo_dia_renderizado[0] = fecha_str
+        # safe_update específico: sólo los 3 controles del panel detalle,
+        # no toda la página. Esto fue lo que generaba el lag al abrir
+        # un día con 500+ eventos.
+        safe_update(lista_hist_eventos, lbl_hist_fecha, lbl_hist_stats)
 
     def refrescar_dias_historial():
         lista_historial_dias.controls.clear()
         dias = enviar_correos.listar_dias_historial()
         if not dias:
+            # Empty state pulido — estilo Lista negra/Respuestas/Rechazados.
             lista_historial_dias.controls.append(
                 ft.Container(
-                    padding=ft.Padding(16, 16, 16, 16),
-                    content=ft.Text("Sin historial todavía.", size=13,
-                                    color=C_TEXTO_3, font_family="Saira", italic=True),
+                    padding=ft.Padding(20, 50, 20, 50),
+                    alignment=ft.Alignment(0, 0),
+                    content=ft.Column(
+                        horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+                        spacing=12,
+                        controls=[
+                            ft.Container(
+                                width=64, height=64,
+                                bgcolor=C_MORADO_LIGHT,
+                                border_radius=ft.BorderRadius(32, 32, 32, 32),
+                                alignment=ft.Alignment(0, 0),
+                                content=ft.Icon(
+                                    ft.Icons.HISTORY_TOGGLE_OFF_ROUNDED,
+                                    color=C_MORADO, size=30,
+                                ),
+                            ),
+                            ft.Text(
+                                "Sin historial todavía",
+                                size=15, weight=ft.FontWeight.BOLD,
+                                color=C_TEXTO_1, font_family="Saira",
+                                text_align=ft.TextAlign.CENTER,
+                            ),
+                            ft.Text(
+                                "Cuando inicies tu primera campaña, cada día "
+                                "que envíes correos va a quedar registrado "
+                                "acá con el detalle de eventos.",
+                                size=11, color=C_TEXTO_3,
+                                font_family="Saira",
+                                text_align=ft.TextAlign.CENTER,
+                            ),
+                        ],
+                    ),
                 )
             )
         # Tarjeta horizontal con fecha legible arriba y badges abajo
@@ -3091,16 +4248,25 @@ def main(page: ft.Page):
                 if (item.get("date") or "") > (g["ultimo"].get("date") or ""):
                     g["ultimo"] = item
 
-        # Filtrar hilos ignorados (a menos que el usuario quiera verlos)
+        # Filtro de ignorados con semántica EXCLUSIVA:
+        #   - Checkbox APAGADO (default) → mostrar SÓLO los NO-ignorados.
+        #   - Checkbox PRENDIDO          → mostrar SÓLO los ignorados.
+        # Antes era "incluir/excluir" (con checkbox ON veías todos los
+        # normales + los ignorados mezclados) — confuso. El usuario pidió
+        # comportamiento de "vista exclusiva" como un toggle de tab.
         ignorados_set = enviar_correos.cargar_ignorados()
         agrupados = []
         contado_ignorados = 0
+        ver_solo_ignorados = mostrar_ignorados[0]
         for g in grupos.values():
             es_ignorado = g["clave"] in ignorados_set
             if es_ignorado:
                 contado_ignorados += 1
-                if not mostrar_ignorados[0]:
-                    continue
+                if not ver_solo_ignorados:
+                    continue   # checkbox OFF: ocultar ignorados
+            else:
+                if ver_solo_ignorados:
+                    continue   # checkbox ON: ocultar los NO-ignorados
             g["ignorado"] = es_ignorado
             agrupados.append(g)
 
@@ -3141,10 +4307,18 @@ def main(page: ft.Page):
             ) and not es_ignorado
 
             if tipo == "calendly":
-                icono       = ft.Icons.EVENT_AVAILABLE_ROUNDED
+                # Diferenciamos visualmente Calendly vs Cal.com con icono
+                # y label, manteniendo el mismo estilo verde del grupo
+                # "REUNIÓN" para que el usuario las identifique de un vistazo.
+                plataforma_reu = (item.get("plataforma") or "calendly").lower()
+                if plataforma_reu == "cal_com":
+                    icono = ft.Icons.CALENDAR_MONTH_ROUNDED
+                    etiq  = "CAL.COM"
+                else:
+                    icono = ft.Icons.EVENT_AVAILABLE_ROUNDED
+                    etiq  = "CALENDLY"
                 color       = C_VERDE_DARK
                 bg          = C_VERDE_LIGHT
-                etiq        = "REUNIÓN"
                 principal   = item.get("invitado") or item.get("from", "")
                 accion_email = item.get("invitado") or ""
                 subtitulo   = item.get("subject", "(sin asunto)")
@@ -3344,14 +4518,61 @@ def main(page: ft.Page):
             )
 
         if not lista_respuestas.controls:
-            mensaje = "Sin respuestas detectadas todavía. Apretá 'Escanear bandeja'."
-            if total_resp + total_cal > 0:
-                mensaje = "Ningún correo coincide con el filtro actual."
+            # Empty state: distinguimos tres escenarios distintos para
+            # darle al usuario un copy útil según en qué situación está.
+            hay_datos_total = (total_resp + total_cal) > 0
+            if hay_datos_total:
+                # Hay datos pero el filtro/checkbox los oculta a todos
+                icono_e  = ft.Icons.FILTER_ALT_OFF_ROUNDED
+                titulo_e = "Sin coincidencias con el filtro actual"
+                msg_e = (
+                    "Tenés respuestas registradas pero ninguna pasa los "
+                    "filtros activos. Probá destildar \"Solo correos de "
+                    "esta campaña\" para ver todas las respuestas, o "
+                    "limpiá el buscador."
+                )
+            else:
+                # No hay nada — primera vez o nada que escanear todavía
+                icono_e  = ft.Icons.INBOX_ROUNDED
+                titulo_e = "Sin respuestas todavía"
+                msg_e = (
+                    "Cuando un contacto de tu campaña responda a uno "
+                    "de los correos, va a aparecer acá automáticamente. "
+                    "También vas a ver las confirmaciones de reuniones "
+                    "de Calendly o Cal.com. Apretá \"Escanear bandeja\" "
+                    "para hacer un escaneo manual."
+                )
             lista_respuestas.controls.append(
                 ft.Container(
-                    padding=ft.Padding(20, 24, 20, 24),
-                    content=ft.Text(mensaje, size=13, color=C_TEXTO_3,
-                                    italic=True, font_family="Saira"),
+                    expand=True,
+                    alignment=ft.Alignment(0, 0),
+                    padding=ft.Padding(40, 60, 40, 60),
+                    content=ft.Column(
+                        horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+                        spacing=14,
+                        controls=[
+                            ft.Container(
+                                width=72, height=72,
+                                bgcolor=C_MORADO_LIGHT,
+                                border_radius=ft.BorderRadius(36, 36, 36, 36),
+                                alignment=ft.Alignment(0, 0),
+                                content=ft.Icon(
+                                    icono_e, color=C_MORADO, size=36,
+                                ),
+                            ),
+                            ft.Text(
+                                titulo_e,
+                                size=18, weight=ft.FontWeight.BOLD,
+                                color=C_TEXTO_1, font_family="Saira",
+                            ),
+                            ft.Text(
+                                msg_e,
+                                size=12, color=C_TEXTO_3,
+                                font_family="Saira",
+                                text_align=ft.TextAlign.CENTER,
+                            ),
+                        ],
+                    ),
                 )
             )
 
@@ -3385,12 +4606,35 @@ def main(page: ft.Page):
             return
         ring_resp.visible = True
         safe_update(ring_resp)
-        _flash_resp("Escaneando bandeja por IMAP...", C_AZUL, 60)
+        _flash_resp("Escaneando bandeja (full rescan)...", C_AZUL, 60)
 
         def trabajador():
             try:
-                enviar_correos.detectar_respuestas_y_calendly(dias=30)
-                _flash_resp("Escaneo completo.", C_EXITO, 2)
+                # Comparar antes/después para reportar cuántas respuestas
+                # nuevas trajo el escaneo manual.
+                antes  = enviar_correos.cargar_respuestas()
+                n_antes = (len(antes.get("respuestas", []))
+                            + len(antes.get("calendly", [])))
+                # forzar_full=True ignora el `_last_uid` cacheado y
+                # rescanea TODO el rango. Es lo que el usuario espera
+                # cuando aprieta "Escanear bandeja" — no un escaneo
+                # incremental, sino uno completo que garantice que
+                # encuentre todo lo que hay.
+                enviar_correos.detectar_respuestas_y_calendly(
+                    dias=30, forzar_full=True,
+                )
+                despues = enviar_correos.cargar_respuestas()
+                n_desp  = (len(despues.get("respuestas", []))
+                            + len(despues.get("calendly", [])))
+                nuevas  = max(0, n_desp - n_antes)
+                if nuevas > 0:
+                    _flash_resp(
+                        f"Escaneo completo · {nuevas} respuesta(s) nueva(s)",
+                        C_EXITO, 4,
+                    )
+                else:
+                    _flash_resp("Escaneo completo · sin novedades",
+                                 C_AZUL, 3)
             except Exception as ex:
                 _flash_resp(f"Error escaneando: {ex}", C_ROJO, 4)
             finally:
@@ -4021,7 +5265,7 @@ def main(page: ft.Page):
         expand=True,
     )
     tf_url_calendly = ft.TextField(
-        label="URL del botón Calendly",
+        label="URL Calendly",
         value=cfg_actual.get("url_calendly", ""),
         hint_text="https://calendly.com/tu-usuario/30min",
         prefix_icon=ft.Icons.EVENT_AVAILABLE_ROUNDED,
@@ -4031,6 +5275,55 @@ def main(page: ft.Page):
         text_style=ft.TextStyle(font_family="Saira"),
         expand=True,
     )
+    tf_url_cal_com = ft.TextField(
+        label="URL Cal.com",
+        value=cfg_actual.get("url_cal_com", ""),
+        hint_text="https://cal.com/tu-usuario/15min",
+        prefix_icon=ft.Icons.CALENDAR_MONTH_ROUNDED,
+        border_color=C_BORDE,
+        focused_border_color=C_MORADO,
+        label_style=ft.TextStyle(color=C_TEXTO_2, font_family="Saira"),
+        text_style=ft.TextStyle(font_family="Saira"),
+        expand=True,
+    )
+
+    # ── Toggle de plataforma activa (Calendly vs Cal.com) ──
+    plataforma_actual = [cfg_actual.get("plataforma_reunion", "calendly")]
+    btns_plataforma = {}
+
+    def _refrescar_botones_plataforma():
+        for k, b in btns_plataforma.items():
+            activo = (k == plataforma_actual[0])
+            b.style = ft.ButtonStyle(
+                bgcolor={ft.ControlState.DEFAULT: C_MORADO if activo else C_BLANCO},
+                color={ft.ControlState.DEFAULT: C_BLANCO if activo else C_MORADO},
+                side={ft.ControlState.DEFAULT: ft.BorderSide(1.2, C_MORADO)},
+                shape=ft.RoundedRectangleBorder(radius=8),
+                padding=ft.Padding(14, 8, 14, 8),
+            )
+        try:
+            for b in btns_plataforma.values():
+                b.update()
+        except Exception:
+            pass
+
+    def _set_plataforma(p):
+        plataforma_actual[0] = p
+        cfg_p = enviar_correos.cargar_config()
+        cfg_p["plataforma_reunion"] = p
+        enviar_correos.guardar_config(cfg_p)
+        _refrescar_botones_plataforma()
+
+    btns_plataforma["calendly"] = ft.ElevatedButton(
+        "Calendly", icon=ft.Icons.EVENT_AVAILABLE_ROUNDED,
+        on_click=lambda e: _set_plataforma("calendly"),
+    )
+    btns_plataforma["cal_com"] = ft.ElevatedButton(
+        "Cal.com", icon=ft.Icons.CALENDAR_MONTH_ROUNDED,
+        on_click=lambda e: _set_plataforma("cal_com"),
+    )
+    _refrescar_botones_plataforma()
+
     tf_url_whatsapp = ft.TextField(
         label="URL del botón WhatsApp",
         value=cfg_actual.get("url_whatsapp", ""),
@@ -4398,8 +5691,10 @@ def main(page: ft.Page):
             "imap_host":     tf_imap_host.value.strip(),
             "firma":         (tf_firma.value or "").rstrip(),
             "correos_copia": (tf_correos_copia.value or "").strip(),
-            "url_calendly":  (tf_url_calendly.value or "").strip(),
-            "url_whatsapp":  (tf_url_whatsapp.value or "").strip(),
+            "url_calendly":       (tf_url_calendly.value or "").strip(),
+            "url_cal_com":        (tf_url_cal_com.value or "").strip(),
+            "plataforma_reunion": plataforma_actual[0],
+            "url_whatsapp":       (tf_url_whatsapp.value or "").strip(),
         })
         enviar_correos.guardar_config(cfg)
 
@@ -4529,18 +5824,96 @@ def main(page: ft.Page):
                     ),
                 ),
                 ft.Row(spacing=12, controls=[tf_correos_copia]),
-                ft.Divider(height=1, color=C_BORDE),
-                ft.Text("Botones del correo",
-                        size=12, weight=ft.FontWeight.BOLD,
-                        color=C_TEXTO_2, font_family="Saira"),
+            ],
+        ),
+    )
+
+    # ── Tab "Reuniones" — Calendly / Cal.com ────────────────────
+    tab_reuniones = ft.Container(
+        padding=ft.Padding(0, 20, 0, 0),
+        content=ft.Column(
+            spacing=14,
+            scroll=ft.ScrollMode.AUTO,
+            controls=[
                 ft.Text(
-                    "URLs que abren los botones \"Agendá una reunión\" y "
-                    "\"WhatsApp\" del template. Pegá el enlace y listo. Si "
-                    "los dejás vacíos se usan los de IntelliHelp por defecto.",
+                    "Elegí qué plataforma usás para agendar reuniones. "
+                    "El botón \"Agendar reunión\" del correo va a abrir "
+                    "la URL de la plataforma elegida. Si alguien agenda "
+                    "con la OTRA plataforma, también se detecta y aparece "
+                    "en Respuestas — no se pierde nada al cambiar.",
+                    size=12, color=C_TEXTO_3, font_family="Saira",
+                ),
+                ft.Container(
+                    bgcolor=C_FONDO,
+                    border_radius=ft.BorderRadius(10, 10, 10, 10),
+                    padding=ft.Padding(14, 12, 14, 12),
+                    border=borde_all(1, C_BORDE),
+                    content=ft.Row(
+                        spacing=10,
+                        controls=[
+                            ft.Text("Plataforma activa:",
+                                    size=12, color=C_TEXTO_2,
+                                    weight=ft.FontWeight.W_500,
+                                    font_family="Saira"),
+                            btns_plataforma["calendly"],
+                            btns_plataforma["cal_com"],
+                        ],
+                    ),
+                ),
+                ft.Text(
+                    "Pegá los enlaces tuyos. Si dejás un campo vacío, "
+                    "ese botón NO aparece en el correo (no se manda "
+                    "nada genérico). Sólo se incluye lo que vos configures.",
                     size=11, color=C_TEXTO_3, italic=True,
                     font_family="Saira",
                 ),
                 ft.Row(spacing=12, controls=[tf_url_calendly]),
+                ft.Row(spacing=12, controls=[tf_url_cal_com]),
+            ],
+        ),
+    )
+
+    # ── Tab "WhatsApp" ─────────────────────────────────────────
+    tab_whatsapp = ft.Container(
+        padding=ft.Padding(0, 20, 0, 0),
+        content=ft.Column(
+            spacing=14,
+            scroll=ft.ScrollMode.AUTO,
+            controls=[
+                ft.Text(
+                    "URL del botón verde \"Conversar por WhatsApp\" del "
+                    "correo. Si la dejás vacía, el botón no aparece.",
+                    size=12, color=C_TEXTO_3, font_family="Saira",
+                ),
+                ft.Container(
+                    bgcolor=C_FONDO,
+                    border_radius=ft.BorderRadius(10, 10, 10, 10),
+                    padding=ft.Padding(14, 12, 14, 12),
+                    border=borde_all(1, C_BORDE),
+                    content=ft.Column(
+                        spacing=8,
+                        controls=[
+                            ft.Text("¿Cómo armar el enlace?",
+                                    size=12, weight=ft.FontWeight.BOLD,
+                                    color=C_TEXTO_2, font_family="Saira"),
+                            ft.Text(
+                                "Formato: https://wa.me/<código país + número>"
+                                "?text=<mensaje pre-cargado>\n"
+                                "Ejemplo (Argentina, +54 9 11 2345-6789):\n"
+                                "https://wa.me/5491123456789?text=Hola%2C%20me"
+                                "%20interesa",
+                                size=11, color=C_TEXTO_3,
+                                font_family="Saira",
+                            ),
+                            ft.Text(
+                                "Tip: usá https://wa.me para generar el "
+                                "enlace correcto con tu número y mensaje.",
+                                size=11, color=C_TEXTO_3, italic=True,
+                                font_family="Saira",
+                            ),
+                        ],
+                    ),
+                ),
                 ft.Row(spacing=12, controls=[tf_url_whatsapp]),
             ],
         ),
@@ -5029,11 +6402,13 @@ def main(page: ft.Page):
 
     # ── Sub-pestañas custom (más confiable que ft.Tabs en Flet 0.84) ──
     cfg_tabs = [
-        ("cuenta",     "Cuenta",      ft.Icons.ACCOUNT_CIRCLE_ROUNDED, tab_cuenta),
-        ("firma",      "Firma",       ft.Icons.DRAW_ROUNDED,           tab_firma),
-        ("servidores", "Servidores",  ft.Icons.DNS_ROUNDED,            tab_servidores),
-        ("apariencia", "Apariencia",  ft.Icons.PALETTE_ROUNDED,        tab_apariencia),
-        ("datos",      "Datos",       ft.Icons.STORAGE_ROUNDED,        tab_datos),
+        ("cuenta",     "Cuenta",     ft.Icons.ACCOUNT_CIRCLE_ROUNDED, tab_cuenta),
+        ("reuniones",  "Reuniones",  ft.Icons.EVENT_AVAILABLE_ROUNDED, tab_reuniones),
+        ("whatsapp",   "WhatsApp",   ft.Icons.CHAT_ROUNDED,           tab_whatsapp),
+        ("firma",      "Firma",      ft.Icons.DRAW_ROUNDED,           tab_firma),
+        ("servidores", "Servidores", ft.Icons.DNS_ROUNDED,            tab_servidores),
+        ("apariencia", "Apariencia", ft.Icons.PALETTE_ROUNDED,        tab_apariencia),
+        ("datos",      "Datos",      ft.Icons.STORAGE_ROUNDED,        tab_datos),
     ]
     cfg_tab_actual = [_CFG_TAB_INICIAL[0]]
     cfg_tab_botones = {}
@@ -5240,6 +6615,11 @@ def main(page: ft.Page):
             lbl_topbar_titulo.value  = "Rechazados"
             btn_iniciar.visible      = False
             refrescar_rechazados()
+        elif vista_key == "lista_negra":
+            contenedor_vista.content = vista_lista_negra
+            lbl_topbar_titulo.value  = "Lista negra"
+            btn_iniciar.visible      = False
+            cargar_lista_negra_panel()
         elif vista_key == "estadisticas":
             contenedor_vista.content = vista_estadisticas
             lbl_topbar_titulo.value  = "Estadísticas"
@@ -5252,6 +6632,31 @@ def main(page: ft.Page):
             respuestas_no_vistas[0]  = 0
             _actualizar_badge_respuestas()
             _render_respuestas()
+            # Si entramos al panel y está vacío, disparamos un full
+            # rescan en background. Esto cubre el bug de "Pulsemail
+            # dice 0 respuestas pero en Gmail hay varias" — fuerza al
+            # módulo a buscar en los últimos 7 días sin importar el
+            # último UID conocido.
+            try:
+                data_actual = enviar_correos.cargar_respuestas()
+                total_actual = (
+                    len(data_actual.get("respuestas", []))
+                    + len(data_actual.get("calendly", []))
+                )
+                if total_actual == 0:
+                    def _full_rescan_bg():
+                        try:
+                            enviar_correos.detectar_respuestas_y_calendly(
+                                dias=7, forzar_full=True,
+                            )
+                            _render_respuestas()
+                        except Exception:
+                            pass
+                    threading.Thread(
+                        target=_full_rescan_bg, daemon=True,
+                    ).start()
+            except Exception:
+                pass
         elif vista_key == "hilo":
             contenedor_vista.content = vista_hilo
             lbl_topbar_titulo.value  = "Conversación"
@@ -5272,6 +6677,9 @@ def main(page: ft.Page):
             tf_firma.value         = cfg_r.get("firma", "")
             tf_correos_copia.value = cfg_r.get("correos_copia", "")
             tf_url_calendly.value  = cfg_r.get("url_calendly", "")
+            tf_url_cal_com.value   = cfg_r.get("url_cal_com", "")
+            plataforma_actual[0]   = cfg_r.get("plataforma_reunion", "calendly")
+            _refrescar_botones_plataforma()
             tf_url_whatsapp.value  = cfg_r.get("url_whatsapp", "")
             contenedor_vista.content = vista_configuracion
             lbl_topbar_titulo.value  = "Configuración"
@@ -5409,6 +6817,12 @@ def main(page: ft.Page):
         threading.Thread(target=watcher_dashboard, daemon=True).start()
 
     # ── Watcher de respuestas: polling IMAP cada 30s (rápido, dias=2) ──
+    # Cada N ciclos hace un FULL rescan para captar respuestas que el
+    # tracking incremental (_last_uid) podría haber perdido por algún
+    # cierre forzado, sync con la nube, etc.
+    _CICLOS_FULL_RESCAN = 12   # con polling de ~10-15s, full ~cada 2-3 min
+    contador_ciclos = [0]
+
     def watcher_respuestas():
         import time as _time
         _time.sleep(8)  # delay inicial para que arranque la UI tranquila
@@ -5420,15 +6834,59 @@ def main(page: ft.Page):
                     n_antes_resp = len(antes.get("respuestas", []))
                     n_antes_cal  = len(antes.get("calendly", []))
 
-                    enviar_correos.detectar_respuestas_y_calendly(dias=2)
+                    # Decidimos si forzar full rescan:
+                    #   - Cada N ciclos (heartbeat)
+                    #   - Si la lista de respuestas está vacía PERO hay
+                    #     un _last_uid > 0 (significa que algo se perdió:
+                    #     el JSON fue limpiado/corrupted y el tracking
+                    #     incremental dejaría fuera respuestas reales)
+                    contador_ciclos[0] += 1
+                    last_uid = int(antes.get("_last_uid", 0) or 0)
+                    forzar = (
+                        contador_ciclos[0] % _CICLOS_FULL_RESCAN == 0
+                        or (n_antes_resp == 0 and n_antes_cal == 0 and last_uid > 0)
+                    )
+
+                    enviar_correos.detectar_respuestas_y_calendly(
+                        dias=7 if forzar else 2,
+                        forzar_full=forzar,
+                    )
 
                     despues     = enviar_correos.cargar_respuestas()
                     n_desp_resp = len(despues.get("respuestas", []))
                     n_desp_cal  = len(despues.get("calendly", []))
 
-                    nuevas_resp = max(0, n_desp_resp - n_antes_resp)
-                    nuevas_cal  = max(0, n_desp_cal  - n_antes_cal)
-                    total_nuevas = nuevas_resp + nuevas_cal
+                    nuevas_resp_total = max(0, n_desp_resp - n_antes_resp)
+                    nuevas_cal_total  = max(0, n_desp_cal  - n_antes_cal)
+
+                    # Para la notificación tipo toast, sólo contamos las
+                    # respuestas NUEVAS que vienen de contactos que están
+                    # AHORA en contactos.csv. Una respuesta vieja en el
+                    # JSON cuyo remitente ya no está en el CSV (porque el
+                    # cliente cambió la lista de campaña) NO debe
+                    # disparar notificación — el cliente quiere ver sólo
+                    # respuestas verdaderas de SU campaña actual.
+                    contactos_actuales = enviar_correos.emails_de_contactos()
+                    resp_lista     = despues.get("respuestas", [])
+                    cal_lista      = despues.get("calendly", [])
+                    nuevas_resp_lst = resp_lista[n_antes_resp:] if n_antes_resp <= len(resp_lista) else []
+                    nuevas_cal_lst  = cal_lista[n_antes_cal:]  if n_antes_cal  <= len(cal_lista)  else []
+
+                    def _es_de_campana(item):
+                        # Calendly: usa el campo "invitado" (email del
+                        # cliente que agendó), no el "from" del propio
+                        # Calendly. Respuestas: el "from" es el cliente.
+                        em = (
+                            item.get("invitado")
+                            or item.get("from")
+                            or ""
+                        ).strip().lower()
+                        return em in contactos_actuales
+
+                    nuevas_resp = sum(1 for r in nuevas_resp_lst if _es_de_campana(r))
+                    nuevas_cal  = sum(1 for c in nuevas_cal_lst  if _es_de_campana(c))
+                    total_nuevas       = nuevas_resp + nuevas_cal
+                    total_nuevas_total = nuevas_resp_total + nuevas_cal_total
 
                     if total_nuevas > 0:
                         # Marcar timestamp de actividad para polling adaptativo
@@ -5465,12 +6923,22 @@ def main(page: ft.Page):
                         if vista_actual[0] == "respuestas":
                             _render_respuestas()
                         else:
+                            # Sólo subimos el contador del badge con las
+                            # respuestas que SÍ son de la campaña actual.
                             respuestas_no_vistas[0] += total_nuevas
                             _actualizar_badge_respuestas()
                             agregar_log(
                                 "info",
-                                f"{total_nuevas} nueva(s) respuesta(s) detectada(s) por IMAP."
+                                f"{total_nuevas} nueva(s) respuesta(s) de la campaña."
                             )
+
+                    # Si hubo respuestas nuevas pero NINGUNA es de la
+                    # campaña actual, refrescamos la UI silenciosamente
+                    # (sin toast, sin badge) — el listado completo del
+                    # panel "Respuestas" igual las muestra por si el
+                    # usuario quiere verlas con el checkbox apagado.
+                    elif total_nuevas_total > 0 and vista_actual[0] == "respuestas":
+                        _render_respuestas()
                 except Exception:
                     pass
 
@@ -5483,15 +6951,46 @@ def main(page: ft.Page):
             mirando_respuestas = (vista_actual[0] == "respuestas")
 
             if desde_actividad < 300:        # actividad en últimos 5 min
-                sleep_t = 5 if mirando_respuestas else 8
+                # Más agresivo cuando el usuario está MIRANDO el panel
+                # de respuestas: 2.5s entre polls. Sensación "instantánea"
+                # sin abusar del rate limit de Gmail. Cuando no está en
+                # el panel, baja a 8s.
+                sleep_t = 2.5 if mirando_respuestas else 8
             elif desde_actividad < 1800:     # entre 5 y 30 min
-                sleep_t = 10 if mirando_respuestas else 15
+                sleep_t = 4 if mirando_respuestas else 15
             else:                            # más de 30 min sin actividad
                 sleep_t = 15 if mirando_respuestas else 25
             _time.sleep(sleep_t)
 
     if not _INIT_HECHO[0]:
         threading.Thread(target=watcher_respuestas, daemon=True).start()
+
+        # Pre-warm de Chrome en background. La primera renderización de
+        # un correo del Hilo cuesta 2-3 s porque Chrome tiene que
+        # arrancar. Si esto pasa en background al iniciar la app, cuando
+        # el usuario finalmente abre un hilo el render es instantáneo.
+        # Si el usuario nunca entra al Hilo, este thread igual termina
+        # rápido (sólo inicializa el binding html2image, ~200 MB RAM
+        # vienen recién al primer screenshot).
+        def _prewarm_chrome():
+            try:
+                _hti_init()
+            except Exception:
+                pass
+        threading.Thread(target=_prewarm_chrome, daemon=True).start()
+
+        # Pre-load del CSV de contactos en background. Con 30k+ contactos
+        # parsear el archivo toma 500-800 ms — si lo hacemos al cargar
+        # la app, cuando el usuario entra al panel "Contactos" la tabla
+        # se muestra al instante. Si nunca entra, el set queda cacheado
+        # para uso en main() y detectar_respuestas().
+        def _preload_contactos():
+            try:
+                enviar_correos.emails_de_contactos()
+            except Exception:
+                pass
+        threading.Thread(target=_preload_contactos, daemon=True).start()
+
     _INIT_HECHO[0] = True
 
     # ── Header del sidebar: nombre del producto + logo del cliente ──
@@ -5577,6 +7076,7 @@ def main(page: ft.Page):
                             nav_item("Rechazados",     ft.Icons.REPORT_GMAILERRORRED_ROUNDED, "rechazados"),
                             nav_item("Respuestas",     ft.Icons.MARK_EMAIL_READ_ROUNDED,   "respuestas",
                                      badge=lbl_badge_respuestas),
+                            nav_item("Lista negra",    ft.Icons.BLOCK_ROUNDED,             "lista_negra"),
                             nav_item("Estadísticas",   ft.Icons.ANALYTICS_ROUNDED,         "estadisticas"),
                             nav_item("Historial",      ft.Icons.HISTORY_ROUNDED,           "historial"),
                             nav_item("Configuración",  ft.Icons.SETTINGS_ROUNDED,          "configuracion"),

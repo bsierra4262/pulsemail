@@ -48,6 +48,8 @@ ARCHIVO_RESPUESTAS = os.path.join(CARPETA_ACTUAL, "registro_respuestas.json")
 ARCHIVO_VISTOS    = os.path.join(CARPETA_ACTUAL, "registro_vistos.json")
 ARCHIVO_IGNORADOS = os.path.join(CARPETA_ACTUAL, "registro_ignorados.json")
 ARCHIVO_PENDIENTE = os.path.join(CARPETA_ACTUAL, "registro_pendiente.json")
+ARCHIVO_LISTA_NEGRA = os.path.join(CARPETA_ACTUAL, "lista_negra.json")
+ARCHIVO_MSG_IDS    = os.path.join(CARPETA_ACTUAL, "registro_msg_ids.json")
 
 # ── Control de campaña: stop manual + reintentos red ───────────
 # Reintentos máximos por correo cuando se cae internet:
@@ -113,25 +115,455 @@ def borrar_pendiente():
             os.remove(ARCHIVO_PENDIENTE)
     except Exception:
         pass
+
+
+# ==========================================
+# TRACKING DE MESSAGE-IDs ENVIADOS
+# ==========================================
+# Guardamos los Message-ID que generamos al mandar cada correo. Cuando
+# alguien responde, su email trae In-Reply-To / References apuntando a
+# esos IDs. Esto nos permite detectar la respuesta CON CERTEZA aunque:
+#   - El remitente no esté tal cual en contactos.csv (otro email del
+#     mismo cliente, alias corporativo, etc).
+#   - Le hayan cambiado el asunto (ej: "Baja", "Fuera de oficina Re:...").
+#   - El servidor anti-spam haya re-empaquetado el mensaje.
+# Es la forma 100% confiable de no perder respuestas.
+
+_MAX_MSG_IDS_GUARDADOS = 10000  # ~ 6-7 campañas de 1500 envíos cada una
+_msg_ids_cache = [None]         # cache en memoria del set; invalidado al guardar
+
+def _cargar_msg_ids_archivo():
+    if not os.path.exists(ARCHIVO_MSG_IDS):
+        return []
+    try:
+        with open(ARCHIVO_MSG_IDS, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict) and isinstance(data.get("ids"), list):
+            return data["ids"]
+    except Exception:
+        pass
+    return []
+
+def cargar_message_ids_enviados():
+    """Set de Message-IDs que mandamos (los que esperamos ver en
+    In-Reply-To de las respuestas). Cacheado en memoria."""
+    if _msg_ids_cache[0] is None:
+        _msg_ids_cache[0] = set(_cargar_msg_ids_archivo())
+    return _msg_ids_cache[0]
+
+def registrar_message_id_enviado(message_id):
+    """Agrega un Message-ID al registro. Idempotente. Rota cuando supera
+    `_MAX_MSG_IDS_GUARDADOS` (descarta los más viejos)."""
+    if not message_id:
+        return
+    mid = message_id.strip()
+    if not mid:
+        return
+    # Normalización mínima: aseguramos que tenga <...> envolventes para
+    # match consistente con headers IMAP.
+    if not mid.startswith("<"):
+        mid = "<" + mid
+    if not mid.endswith(">"):
+        mid = mid + ">"
+    try:
+        ids = _cargar_msg_ids_archivo()
+        if mid in ids:
+            return  # ya estaba
+        ids.append(mid)
+        if len(ids) > _MAX_MSG_IDS_GUARDADOS:
+            ids = ids[-_MAX_MSG_IDS_GUARDADOS:]
+        with open(ARCHIVO_MSG_IDS, "w", encoding="utf-8") as f:
+            json.dump({"ids": ids}, f, ensure_ascii=False)
+        # Invalidar cache para que el próximo `cargar_message_ids_enviados`
+        # vea el nuevo.
+        _msg_ids_cache[0] = None
+    except Exception:
+        pass
+
+
+# ==========================================
+# LISTA NEGRA — opt-outs (responden "BAJA" o piden no recibir más)
+# ==========================================
+# `lista_negra.json` estructura:
+#   {"emails": [{"email": "x@y.com", "fecha": "2026-05-08 14:30",
+#                "motivo": "Respondió BAJA", "auto": true}]}
+# Acceso O(1) vía set cacheado en `cargar_lista_negra_set()`.
+
+def cargar_lista_negra():
+    """Devuelve el dict crudo con metadata. Para lookup rápido por email,
+    usar `cargar_lista_negra_set()`."""
+    def _loader():
+        if not os.path.exists(ARCHIVO_LISTA_NEGRA):
+            return {"emails": []}
+        try:
+            with open(ARCHIVO_LISTA_NEGRA, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if not isinstance(data, dict):
+                return {"emails": []}
+            data.setdefault("emails", [])
+            return data
+        except Exception:
+            return {"emails": []}
+    return _cached_read("lista_negra", ARCHIVO_LISTA_NEGRA, _loader)
+
+
+def cargar_lista_negra_set():
+    """Set de emails (en minúsculas) para chequeo O(1) en el loop de envío."""
+    data = cargar_lista_negra()
+    return {
+        (e.get("email") or "").strip().lower()
+        for e in data.get("emails", [])
+        if e.get("email")
+    }
+
+
+def _guardar_lista_negra(data):
+    with open(ARCHIVO_LISTA_NEGRA, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+    _cache_invalidate("lista_negra")
+
+
+def agregar_a_lista_negra(email_addr, motivo="Agregado manualmente", auto=False):
+    """Agrega un email a la lista negra. Idempotente: si ya está,
+    actualiza la fecha/motivo pero no duplica.
+    Retorna True si quedó agregado, False si el email es inválido."""
+    if not email_addr or "@" not in email_addr:
+        return False
+    email_norm = email_addr.strip().lower()
+    data = cargar_lista_negra()
+    # Si ya existe, actualizamos motivo+fecha (el más reciente gana)
+    for entry in data["emails"]:
+        if (entry.get("email") or "").strip().lower() == email_norm:
+            entry["motivo"] = motivo
+            entry["fecha"]  = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            entry["auto"]   = auto or entry.get("auto", False)
+            _guardar_lista_negra(data)
+            return True
+    data["emails"].append({
+        "email":  email_norm,
+        "fecha":  datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "motivo": motivo,
+        "auto":   bool(auto),
+    })
+    _guardar_lista_negra(data)
+    return True
+
+
+def quitar_de_lista_negra(email_addr):
+    """Quita un email. Retorna True si existía y fue removido."""
+    if not email_addr:
+        return False
+    email_norm = email_addr.strip().lower()
+    data = cargar_lista_negra()
+    nuevos = [
+        e for e in data["emails"]
+        if (e.get("email") or "").strip().lower() != email_norm
+    ]
+    if len(nuevos) == len(data["emails"]):
+        return False
+    data["emails"] = nuevos
+    _guardar_lista_negra(data)
+    return True
+
+
+def escanear_bajas_retroactivo(dias=180):
+    """Escanea respuestas registradas en `registro_respuestas.json` y
+    analiza con `es_pedido_de_baja()` las que no fueron evaluadas todavía.
+    Las que matchean se agregan a la lista negra automáticamente.
+
+    **Optimización**: en vez de hacer SEARCH+FETCH por cada respuesta
+    individual (2 round-trips IMAP × N respuestas = lentísimo), hace:
+      1. UN SEARCH del INBOX en los últimos `dias` días.
+      2. UN BATCH FETCH de headers para construir un dict
+         {Message-ID → UID} en memoria.
+      3. UN BATCH FETCH de RFC822 de los UIDs que matchean.
+      4. Procesamiento local de los cuerpos.
+    De 1000+ round-trips IMAP a ~3 → de 10 minutos a < 30 segundos.
+
+    Retorna dict {analizados, ya_evaluados, nuevas_bajas, errores}.
+    """
+    resumen = {
+        "analizados":     0,
+        "ya_evaluados":   0,
+        "nuevas_bajas":   0,
+        "errores":        0,
+    }
+
+    cfg = cargar_config()
+    imap_host = (cfg.get("imap_host") or "imap.gmail.com").strip()
+    if not MI_CORREO() or not MI_PASSWORD():
+        return resumen
+
+    data = _cargar_respuestas_archivo()
+    respuestas = data.get("respuestas", [])
+    if not respuestas:
+        return resumen
+
+    blacklist_set = cargar_lista_negra_set()
+
+    # Paso 1 — filtrar localmente las respuestas que necesitan análisis.
+    # Las ya evaluadas (es_baja=False explícito), las que ya están en
+    # blacklist, o las que tienen es_baja=True (re-aplicar idempotente)
+    # se procesan sin tocar IMAP.
+    a_evaluar = []      # [{resp, msg_id_normalizado}]
+    for resp in respuestas:
+        remitente = (resp.get("from") or "").strip().lower()
+        if not remitente:
+            continue
+        if remitente in blacklist_set:
+            resumen["ya_evaluados"] += 1
+            continue
+        if resp.get("es_baja") is False:
+            resumen["ya_evaluados"] += 1
+            continue
+        if resp.get("es_baja"):
+            # Idempotente: re-agregamos a la blacklist
+            agregar_a_lista_negra(
+                remitente,
+                motivo="Re-aplicación de auto-baja histórica",
+                auto=True,
+            )
+            blacklist_set.add(remitente)
+            resumen["nuevas_bajas"] += 1
+            continue
+        msg_id = (resp.get("uid") or "").strip()
+        if msg_id:
+            a_evaluar.append((resp, msg_id))
+
+    if not a_evaluar:
+        # No hay nada que bajar de IMAP, terminamos rápido
+        _guardar_respuestas_archivo(data)
+        return resumen
+
+    # Set de Message-IDs para lookup O(1) cuando procesamos los headers
+    msg_ids_buscados = {mid for _, mid in a_evaluar}
+
+    try:
+        with imaplib.IMAP4_SSL(imap_host) as mail:
+            mail.login(MI_CORREO(), MI_PASSWORD())
+            mail.select("inbox", readonly=True)
+
+            # Paso 2 — UN solo SEARCH para acotar el universo de UIDs.
+            try:
+                desde = datetime.now() - timedelta(days=int(dias))
+            except Exception:
+                desde = datetime.now() - timedelta(days=180)
+            fecha_imap = desde.strftime("%d-%b-%Y")
+            try:
+                estado, ids = mail.uid(
+                    "SEARCH", None, f'(SINCE "{fecha_imap}")'
+                )
+                if estado != "OK" or not ids or not ids[0]:
+                    _guardar_respuestas_archivo(data)
+                    return resumen
+                todos_uids = ids[0].split()
+            except Exception as e:
+                logging.error(f"SEARCH en scan retro falló: {e}")
+                resumen["errores"] += 1
+                _guardar_respuestas_archivo(data)
+                return resumen
+
+            # Paso 3 — UN BATCH FETCH de headers de todo el rango.
+            # Construye dict {Message-ID → UID}.
+            msgid_to_uid = {}
+            if todos_uids:
+                # Si hay muchos UIDs los fetcheamos en chunks de 500 para
+                # no superar el límite de comando IMAP (~8KB).
+                CHUNK = 500
+                for i in range(0, len(todos_uids), CHUNK):
+                    chunk = todos_uids[i:i + CHUNK]
+                    try:
+                        _, fetched = mail.uid(
+                            "FETCH", b",".join(chunk),
+                            "(BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)])",
+                        )
+                    except Exception:
+                        continue
+                    # Parsear el response: viene como secuencia alternada
+                    # de tuplas (uid_header_bytes, header_body) y bytes
+                    # cierre. Extraemos UID y Message-ID de cada tupla.
+                    uid_actual = None
+                    for item in fetched:
+                        if isinstance(item, tuple) and len(item) >= 2:
+                            raw_meta = item[0]
+                            raw_body = item[1]
+                            # raw_meta tiene formato: b'123 (UID 456 BODY[...]'
+                            m_uid = re.search(rb"UID (\d+)", raw_meta)
+                            uid_actual = m_uid.group(1) if m_uid else None
+                            if uid_actual:
+                                m_mid = re.search(
+                                    rb"Message-ID:\s*(<[^>]+>)",
+                                    raw_body, re.IGNORECASE,
+                                )
+                                if m_mid:
+                                    mid_str = m_mid.group(1).decode(
+                                        "utf-8", "ignore"
+                                    )
+                                    if mid_str in msg_ids_buscados:
+                                        msgid_to_uid[mid_str] = uid_actual
+
+            # Paso 4 — BATCH FETCH de RFC822 sólo para los UIDs que
+            # necesitamos (los que tienen Message-ID que matchea).
+            uids_finales = list(msgid_to_uid.values())
+            uid_to_cuerpo = {}
+            if uids_finales:
+                CHUNK = 100  # cuerpos enteros pesan más
+                for i in range(0, len(uids_finales), CHUNK):
+                    chunk = uids_finales[i:i + CHUNK]
+                    try:
+                        _, fetched = mail.uid(
+                            "FETCH", b",".join(chunk), "(RFC822)"
+                        )
+                    except Exception:
+                        continue
+                    uid_actual = None
+                    for item in fetched:
+                        if isinstance(item, tuple) and len(item) >= 2:
+                            m_uid = re.search(rb"UID (\d+)", item[0])
+                            uid_actual = m_uid.group(1) if m_uid else None
+                            if uid_actual:
+                                try:
+                                    msg_full = email.message_from_bytes(
+                                        item[1]
+                                    )
+                                    uid_to_cuerpo[uid_actual] = (
+                                        _texto_correo(msg_full) or ""
+                                    )
+                                except Exception:
+                                    uid_to_cuerpo[uid_actual] = ""
+
+            # Paso 5 — Evaluar localmente cada respuesta con su cuerpo
+            for resp, msg_id in a_evaluar:
+                uid_imap = msgid_to_uid.get(msg_id)
+                cuerpo_resp = uid_to_cuerpo.get(uid_imap, "") if uid_imap else ""
+
+                resumen["analizados"] += 1
+                asunto = resp.get("subject", "")
+                es_baja, razon = es_pedido_de_baja(asunto, cuerpo_resp)
+                resp["es_baja"] = bool(es_baja)
+
+                if es_baja:
+                    remitente = (resp.get("from") or "").strip().lower()
+                    agregar_a_lista_negra(
+                        remitente,
+                        motivo=f"Auto-baja retroactiva: {razon}",
+                        auto=True,
+                    )
+                    blacklist_set.add(remitente)
+                    resumen["nuevas_bajas"] += 1
+
+            _guardar_respuestas_archivo(data)
+    except Exception as e:
+        logging.error(f"Scan retroactivo BAJA falló: {e}")
+        resumen["errores"] += 1
+
+    return resumen
+
+
+# ── Frases típicas de opt-out (case-insensitive, regex) ──
+# Cubre español, inglés y formas comunes. Las frases tienen que ser
+# claras y explícitas — NO matchean "necesito una app para bajar costos"
+# u otros contextos donde "baja" aparece como sustantivo o verbo común.
+# TODOS los regex de detección están PRECOMPILADOS a nivel módulo — así
+# `es_pedido_de_baja()` no paga el costo de compilación en cada llamada.
+# Para un polling de respuestas con 50 emails/día esto evita ~750 compi-
+# laciones de regex al día (15 patrones × 50 evaluaciones).
+_RE_BAJA_ASUNTO = re.compile(
+    r"\b(baja|unsubscribe|opt[- ]?out)\b", re.IGNORECASE,
+)
+_RE_BAJA_CUERPO_CORTO = re.compile(r"\bbaja\b", re.IGNORECASE)
+_RE_FIRMA_GUION  = re.compile(r"\n[> ]*-{2,}.*", re.DOTALL)
+_RE_LINEAS_QUOTE = re.compile(r"^>.*$", re.MULTILINE)
+_RE_WHITESPACE   = re.compile(r"\s+")
+# Combinamos todos los patrones explícitos en UN solo regex con alternancia.
+# Es más rápido que iterar 14 regex separados.
+_RE_BAJA_EXPLICITO = re.compile(
+    "|".join([
+        r"\bdarme de baja\b",
+        r"\bdate de baja\b",
+        r"\bdar(?:me)? de baja\b",
+        r"\bno (?:quiero|deseo) (?:recibir|seguir recibiendo)\b",
+        r"\bno me (?:env[íi]en|env[íi]es|manden|mandes)\b",
+        r"\bdejen? de (?:enviar|mandar)\b",
+        r"\bdesuscrib(?:ir|irme|ame|anme)\b",
+        r"\bcancelar (?:la )?(?:suscripci[óo]n|inscripci[óo]n)\b",
+        r"\bquitar(?:me)? de (?:la )?lista\b",
+        r"\bno (?:contactar(?:me)?|me contacten)\b",
+        r"\bme bajo de (?:la|esta) (?:lista|campa[ñn]a)\b",
+        r"\bunsubscribe\b",
+        r"\bremove me\b",
+        r"\bstop sending\b",
+        r"\bopt[- ]?out\b",
+    ]),
+    re.IGNORECASE,
+)
+
+
+def es_pedido_de_baja(asunto, cuerpo):
+    """Heurística: decide si una respuesta es un pedido de no recibir más
+    correos.
+
+    Devuelve (es_baja: bool, razon: str).
+
+    Reglas (en orden):
+      1. Si el ASUNTO contiene "baja", "unsubscribe" u "opt-out" como
+         palabra aislada → SÍ, es baja (señal muy fuerte).
+      2. Si el CUERPO contiene "BAJA" aislada Y es corto (< 300 chars de
+         texto significativo) → SÍ. Las respuestas legítimas de baja son
+         típicamente "BAJA" sola o frases muy cortas.
+      3. Si el CUERPO contiene frases de opt-out explícitas (regardless
+         de la longitud), como "no quiero recibir más", "unsubscribe",
+         "darme de baja" → SÍ.
+      4. Si "baja" aparece sólo dentro de un mensaje largo SIN frases de
+         opt-out claras → NO. Ejemplo: "necesito una app para procesar
+         bajas de personal" no debe matchear.
+    """
+    asunto = (asunto or "").strip()
+    cuerpo = (cuerpo or "").strip()
+
+    # Regla 1: asunto explícito
+    if _RE_BAJA_ASUNTO.search(asunto):
+        return True, f"Asunto contiene pedido de baja: {asunto[:80]!r}"
+
+    # Limpiamos firmas/quotes/footers del cuerpo para no contar contenido
+    # que es de NUESTRO correo original embebido como quote en la respuesta.
+    cuerpo_limpio = _RE_FIRMA_GUION.sub("", cuerpo)
+    cuerpo_limpio = _RE_LINEAS_QUOTE.sub("", cuerpo_limpio)
+    cuerpo_limpio = _RE_WHITESPACE.sub(" ", cuerpo_limpio).strip()
+
+    # Regla 2: cuerpo corto con "BAJA" aislada
+    if len(cuerpo_limpio) < 300 and _RE_BAJA_CUERPO_CORTO.search(cuerpo_limpio):
+        return True, "Respuesta corta con 'BAJA'"
+
+    # Regla 3: frases de opt-out explícitas en cualquier longitud.
+    # Un solo regex con alternancia es mucho más rápido que iterar
+    # 15 patrones separados.
+    m = _RE_BAJA_EXPLICITO.search(cuerpo_limpio)
+    if m:
+        return True, f"Frase de opt-out detectada: {m.group(0)!r}"
+
+    return False, ""
 CARPETA_HISTORIAL = os.path.join(CARPETA_ACTUAL, "historial")
 
 # Configuración de los correos a enviar
 ASUNTO       = "TECNOLOGÍA PARA EMPRESAS: MEJORAR LA PRODUCTIVIDAD Y BAJAR COSTOS"
 CORREO_COPIA = ""
-URL_WHATSAPP = "https://wa.me/5491150274827?text=Hola,%20me%20interesa%20conocer%20m%C3%A1s%20sobre%20sus%20soluciones."
-URL_CALENDLY = "https://calendly.com/rnasif-intellihelp/30min"
+URL_WHATSAPP = ""
+URL_CALENDLY = ""
 
 TIEMPO_MINIMO, TIEMPO_MAXIMO = 25, 45
 FUENTE_BASE = "font-family: 'Saira', Arial, sans-serif;"
 
 ACTIVOS_MULTIMEDIA = [
-    ("ITH-logo.png",       "logo_intellihelp"),
-    ("icon-process.svg",   "icon_process"),
-    ("icon-cost.svg",      "icon_cost"),
-    ("icon-prod.svg",      "icon_prod"),
-    ("icon-solution.svg",  "icon_solution"),
-    ("icon-calendar.svg",  "icon_calendar"),
-    ("icon-whatsapp.svg",  "icon_whatsapp"),
+    # (nombre_base, content_id) — se busca el archivo en este orden:
+    #   1. CARPETA_ACTUAL/<nombre_base>.png
+    #   2. CARPETA_ACTUAL/<nombre_base>.jpg
+    #   3. CARPETA_ASSETS/<nombre_base>.png
+    #   4. CARPETA_ASSETS/<nombre_base>.jpg
+    # Así el usuario puede usar PNG (mejor calidad, transparencia) o JPG
+    # indistintamente, y reemplazar la imagen sin tocar código.
+    ("Flyer", "flyer_campana"),
+    ("firma", "firma_intellihelp"),
 ]
 
 
@@ -151,15 +583,35 @@ _CONFIG_DEFAULTS = {
     "firma_imagen":  "",          # ruta absoluta a la imagen de firma
     "correos_copia": "",          # CC: lista separada por coma o vacío
     "logo_personalizado": "",     # path absoluto al logo del cliente
-    "url_calendly":      "",      # URL botón "Agendá una reunión"
+    "url_calendly":      "",      # URL botón cuando plataforma_reunion="calendly"
+    "url_cal_com":       "",      # URL botón cuando plataforma_reunion="cal_com"
+    "plataforma_reunion": "calendly",  # 'calendly' | 'cal_com'
     "url_whatsapp":      "",      # URL botón "WhatsApp"
 }
 
 
 def URL_CALENDLY_CFG():
-    """Devuelve la URL configurada por el usuario o la por defecto."""
+    """Devuelve la URL Calendly del usuario o la por defecto del módulo."""
     v = (get_config_value("url_calendly") or "").strip()
     return v or URL_CALENDLY
+
+
+def URL_CAL_COM_CFG():
+    """Devuelve la URL Cal.com del usuario (o vacío si no configuró)."""
+    return (get_config_value("url_cal_com") or "").strip()
+
+
+def URL_REUNION_CFG():
+    """URL que va en el botón "Agendar reunión" del correo. Selecciona
+    entre Calendly o Cal.com según `plataforma_reunion`. Si la elegida
+    no tiene URL configurada, hace fallback a la otra (no romper el
+    botón por un campo vacío)."""
+    plataforma = (get_config_value("plataforma_reunion") or "calendly").lower()
+    url_cd = URL_CALENDLY_CFG()
+    url_cc = URL_CAL_COM_CFG()
+    if plataforma == "cal_com":
+        return url_cc or url_cd
+    return url_cd or url_cc
 
 
 def URL_WHATSAPP_CFG():
@@ -369,86 +821,205 @@ def preparar_correo(nombre, destino):
     # CC: leemos del config (configurable desde la UI). Si está vacío,
     # no agregamos cabecera Cc (Gmail no la incluye en el correo).
     cc_lista = _parsear_cc(get_config_value("correos_copia"))
-    msg["Subject"] = f"{ASUNTO} | {nombre}"
+    # Asunto con nombre+apellido al final separado por "|" — facilita
+    # identificar el envío en la bandeja del remitente sin abrir el correo.
+    msg["Subject"] = f"{ASUNTO} | {nombre}" if nombre else ASUNTO
     msg["From"]    = correo_remitente
     msg["To"]      = destino
     if cc_lista:
         msg["Cc"]  = ", ".join(cc_lista)
 
-    # URLs configurables por el usuario (si no, defaults del módulo)
-    url_cal = URL_CALENDLY_CFG()
+    # URLs configurables por el usuario. Pueden estar vacías — en ese
+    # caso simplemente NO renderizamos ese botón (ni en HTML ni en
+    # texto plano). El sistema NO trae URLs hardcodeadas: cada cliente
+    # configura las suyas.
+    url_cal = URL_REUNION_CFG()
     url_wsp = URL_WHATSAPP_CFG()
 
-    msg.set_content(
-        f"Estimado/a {nombre}:\n\nAutomatizá tu empresa. Producí más, gastá menos.\n"
-        f"Agendá una reunión: {url_cal}\nWhatsApp: {url_wsp}"
+    # Nombre de pila (primera palabra) cuando hay nombre+apellido. Sirve
+    # como saludo personal "Hola Juan,". Fallback al nombre completo si
+    # no se puede extraer.
+    nombre_pila = (nombre or "").strip().split()[0] if (nombre or "").strip() else ""
+    saludo = nombre_pila if nombre_pila else (nombre or "Cliente")
+
+    # Texto plano: armamos el bloque de "CTA" sólo con las líneas que
+    # tengan URL. Si no hay ninguna, queda sin bloque de CTA (el correo
+    # sigue siendo válido como propuesta escrita).
+    cta_lineas = []
+    if url_cal:
+        cta_lineas.append(f"Agendá una reunión: {url_cal}")
+    if url_wsp:
+        cta_lineas.append(f"WhatsApp: {url_wsp}")
+    bloque_cta_texto = ("\n".join(cta_lineas) + "\n\n") if cta_lineas else ""
+
+    cuerpo_texto = (
+        f"Hola {saludo},\n\n"
+        "En INTELLIHELP, ayudamos a empresas como la tuya a transformar sus procesos "
+        "internos para lograr más resultados con menor esfuerzo y optimizando el "
+        "presupuesto.\n\n"
+        "Podemos impulsar tu crecimiento corporativo a través de:\n\n"
+        "- TRANSFORMACIÓN DIGITAL: Modernizamos tu infraestructura tecnológica para "
+        "que operes con mayor agilidad.\n"
+        "- Automatización con Inteligencia Artificial: Eliminamos tareas manuales "
+        "repetitivas para que tu equipo se enfoque en lo que realmente importa.\n"
+        "- Desarrollo de Software Llave en Mano: Implementamos herramientas a medida "
+        "que multiplican tu productividad.\n"
+        "- Consultoría Técnica Estratégica: Identificamos cuellos de botella y "
+        "establecemos mejoras concretas.\n"
+        "- Sistemas Integrados de Seguridad: Control de acceso y videovigilancia "
+        "conectados directamente a tu software de liquidaciones.\n"
+        "- TALENT ACQUISITION IT: Encontramos los recursos técnicos clave que tu "
+        "equipo necesita, ya sea en tu nómina o en la nuestra.\n\n"
+        "Sabemos que cada negocio tiene desafíos únicos. Por eso, te propongo una "
+        "breve llamada exploratoria de 15 minutos, sin compromisos, para entender "
+        "tu escenario actual y contarte cómo podemos aportar valor.\n\n"
+        f"{bloque_cta_texto}"
+        "¿Tienes disponibilidad esta semana para conversar?\n\n"
+        "Quedo a tu entera disposición.\nSaludos cordiales."
     )
+    msg.set_content(cuerpo_texto)
+
+    # ── Firma como imagen ──
+    # Si el usuario configuró firma_imagen lo usamos; sino, se usa el
+    # firma.jpg que está en CARPETA_ACTUAL o en el bundle de assets.
+    firma_html = """
+    <div style="margin-top: 8px;">
+        <img src="cid:firma_intellihelp" alt="Firma" style="max-width: 400px; height: auto; border: none; display: block;">
+    </div>
+    """
+
+    # ── Bloque de botones (CTA) — condicional ──
+    # Cada botón se renderiza sólo si su URL está configurada.
+    # Si no hay NINGUNA URL configurada, no aparece el bloque entero
+    # (sólo el texto introductorio). Así nada queda hardcodeado del
+    # lado del template para distintos clientes.
+    botones_html_partes = []
+    if url_wsp:
+        botones_html_partes.append(f'''
+                                            <td align="center" style="border-radius: 6px;" bgcolor="#25D366">
+                                                <a href="{url_wsp}" target="_blank" style="font-size: 14px; font-family: Arial, sans-serif; color: #ffffff; text-decoration: none; border-radius: 6px; padding: 12px 22px; border: 1px solid #25D366; display: inline-block; font-weight: bold;">
+                                                    Conversar por WhatsApp
+                                                </a>
+                                            </td>''')
+    if url_wsp and url_cal:
+        botones_html_partes.append('                                            <td width="15"></td>')
+    if url_cal:
+        botones_html_partes.append(f'''
+                                            <td align="center" style="border-radius: 6px;" bgcolor="#0052cc">
+                                                <a href="{url_cal}" target="_blank" style="font-size: 14px; font-family: Arial, sans-serif; color: #ffffff; text-decoration: none; border-radius: 6px; padding: 12px 22px; border: 1px solid #0052cc; display: inline-block; font-weight: bold;">
+                                                    Agendar Reunión (15 min)
+                                                </a>
+                                            </td>''')
+
+    if botones_html_partes:
+        bloque_botones = (
+            '<table cellspacing="0" cellpadding="0" style="margin: 0 auto;">'
+            '<tr>' + "\n".join(botones_html_partes) + '</tr></table>'
+        )
+    else:
+        bloque_botones = ""
 
     html = f"""
-    <!doctype html><html lang="es"><head><meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <style>
-        @import url('https://fonts.googleapis.com/css2?family=Saira:wght@400;500;600;700&display=swap');
-        body, p, h1, h2, h3, a, span, div {{ {FUENTE_BASE} }}
-        @media only screen and (max-width: 480px) {{
-            .m-stack {{ display: block !important; width: 100% !important; margin-bottom: 12px !important; }}
-            .m-p-20 {{ padding: 20px !important; }}
-            .m-txt-24 {{ font-size: 24px !important; }}
-        }}
-    </style></head>
-    <body style="margin: 0; padding: 24px 16px; background-color: #eeeaf2; -webkit-font-smoothing: antialiased; {FUENTE_BASE}">
-      <table width="100%" cellpadding="0" cellspacing="0" style="margin: 0 auto; max-width: 560px; background-color: #ffffff; border-radius: 20px; overflow: hidden; box-shadow: 0 4px 10px rgba(0,0,0,0.04);">
-        <tr><td style="padding: 22px 28px; border-bottom: 1px solid #eeeeee;">
-            <table width="100%" cellpadding="0" cellspacing="0"><tr>
-                <td align="left"><img src="cid:logo_intellihelp" width="130" style="display: block; border: none;" /></td>
-                <td align="right"><div style="font-size: 10px; letter-spacing: 0.14em; text-transform: uppercase; color: #663399; font-weight: 600; background-color: #f3eefa; padding: 6px 10px; border-radius: 999px; display: inline-block;">Automatización empresarial</div></td>
-            </tr></table>
-        </td></tr>
-        <tr><td class="m-p-20" style="padding: 32px 28px 28px;">
-            <p style="font-size: 15px; color: #5a5d68; margin: 0 0 15px 0;">Estimado/a <strong>{nombre}</strong>,</p>
-            <h1 class="m-txt-24" style="font-size: 32px; font-weight: 600; color: #161922; margin: 0 0 12px 0;">Automatizá tu empresa.<br/><span style="color: #663399;">Producí más, gastá menos.</span></h1>
-            <p style="font-size: 14px; color: #5a5d68; line-height: 1.5; margin: 0 0 24px 0;">Soluciones a medida que reducen costos operativos y liberan a tu equipo.</p>
-            <table width="100%" cellpadding="0" cellspacing="0" style="margin-bottom: 24px;"><tr>
-                <td width="50%" valign="top" class="m-stack">
-                  <table width="100%" style="margin-bottom: 14px;"><tr><td width="38"><table width="28" height="28" style="background-color: #f3eefa; border-radius: 8px;"><tr><td align="center"><img src="cid:icon_process" width="14" height="14" style="display:block;"/></td></tr></table></td><td style="font-size: 13px; font-weight: 500; color: #161922;">Automatización de procesos</td></tr></table>
-                  <table width="100%"><tr><td width="38"><table width="28" height="28" style="background-color: #f3eefa; border-radius: 8px;"><tr><td align="center"><img src="cid:icon_prod" width="14" height="14" style="display:block;"/></td></tr></table></td><td style="font-size: 13px; font-weight: 500; color: #161922;">Mayor productividad</td></tr></table>
-                </td>
-                <td width="50%" valign="top" class="m-stack">
-                  <table width="100%" style="margin-bottom: 14px;"><tr><td width="38"><table width="28" height="28" style="background-color: #f3eefa; border-radius: 8px;"><tr><td align="center"><img src="cid:icon_cost" width="14" height="14" style="display:block;"/></td></tr></table></td><td style="font-size: 13px; font-weight: 500; color: #161922;">Reducción de costos</td></tr></table>
-                  <table width="100%"><tr><td width="38"><table width="28" height="28" style="background-color: #f3eefa; border-radius: 8px;"><tr><td align="center"><img src="cid:icon_solution" width="14" height="14" style="display:block;"/></td></tr></table></td><td style="font-size: 13px; font-weight: 500; color: #161922;">Soluciones a medida</td></tr></table>
-                </td>
-            </tr></table>
-            <table width="100%" cellpadding="0" cellspacing="0"><tr><td align="left">
-                <table cellpadding="0" cellspacing="0" align="left" class="m-stack" style="margin-right: 10px;"><tr><td><a href="{url_cal}" target="_blank" style="display: block; background-color: #663399; color: #ffffff; font-weight: 600; font-size: 14px; padding: 13px 20px; border-radius: 12px; text-decoration: none;"><img src="cid:icon_calendar" width="14" height="14" style="vertical-align: middle; margin-right: 6px;" /><span style="vertical-align: middle;">Agendá una reunión</span></a></td></tr></table>
-                <table cellpadding="0" cellspacing="0" align="left" class="m-stack"><tr><td><a href="{url_wsp}" target="_blank" style="display: block; background-color: #25D366; color: #ffffff; font-weight: 600; font-size: 14px; padding: 13px 20px; border-radius: 12px; text-decoration: none;"><img src="cid:icon_whatsapp" width="14" height="14" style="vertical-align: middle; margin-right: 6px;" /><span style="vertical-align: middle;">WhatsApp</span></a></td></tr></table>
-            </td></tr></table>
-        </td></tr>
-        <tr><td style="background-color: #161922; padding: 14px 28px;">
-            <table width="100%" cellpadding="0" cellspacing="0"><tr>
-                <td align="left" class="m-stack" style="font-size: 12px; color: #ffffff;"><a href="mailto:ventas@intellihelp.tech" style="color: #ffffff; text-decoration: none;">ventas@intellihelp.tech</a><span style="opacity: 0.25; margin: 0 8px;">•</span><a href="https://intellihelp.tech" target="_blank" style="color: #ffffff; text-decoration: none;">intellihelp.tech</a></td>
-                <td align="right" class="m-stack" style="font-size: 12px; color: #ffffff; opacity: 0.6;">© 2026 IntelliHelp</td>
-            </tr></table>
-        </td></tr>
-      </table>
-    </body></html>
+    <html>
+        <body style="margin: 0; padding: 0; background-color: #f4f7f6; font-family: 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; color: #333333;">
+            <table width="100%" cellpadding="0" cellspacing="0" style="background-color: #f4f7f6; padding: 40px 15px;">
+                <tr>
+                    <td align="center">
+                        <table width="100%" cellpadding="0" cellspacing="0" style="max-width: 600px; background-color: #ffffff; border-radius: 12px; overflow: hidden; box-shadow: 0 8px 20px rgba(0,0,0,0.06);">
+
+                            <tr>
+                                <td style="padding: 45px 45px 25px 45px; text-align: left;">
+                                    <p style="margin: 0 0 15px 0; font-size: 18px; color: #1a1a1a; font-weight: 600;">Hola {saludo},</p>
+                                    <p style="margin: 0 0 15px 0; font-size: 15px; line-height: 1.6; color: #4a4a4a;">
+                                        En <strong style="color: #663399;">INTELLIHELP</strong>, ayudamos a empresas a transformar sus procesos internos para <strong style="color: #663399;">lograr más resultados con menor esfuerzo</strong> y optimizando el presupuesto mediante innovación tecnológica.
+                                    </p>
+                                    <p style="margin: 0 0 10px 0; font-size: 15px; line-height: 1.6; color: #1a1a1a; font-weight: 600;">
+                                        Podemos impulsar tu crecimiento corporativo a través de:
+                                    </p>
+                                    <ul style="margin: 0 0 15px 0; padding-left: 20px; font-size: 14px; line-height: 1.6; color: #4a4a4a;">
+                                        <li style="margin-bottom: 8px;"><b style="color: #663399;">TRANSFORMACIÓN DIGITAL:</b> Modernizamos tu infraestructura tecnológica para que operes con mayor agilidad.</li>
+                                        <li style="margin-bottom: 8px;"><b style="color: #663399;">AUTOMATIZACIÓN CON I.A.:</b> Eliminamos tareas manuales repetitivas para que tu equipo se enfoque en lo estratégico.</li>
+                                        <li style="margin-bottom: 8px;"><b style="color: #663399;">SOFTWARE LLAVE EN MANO:</b> Implementamos herramientas a medida que multiplican directamente tu productividad.</li>
+                                        <li style="margin-bottom: 8px;"><b style="color: #663399;">CONSULTORÍA TÉCNICA:</b> Identificamos cuellos de botella y establecemos un plan de mejoras concretas.</li>
+                                        <li style="margin-bottom: 8px;"><b style="color: #663399;">SISTEMAS INTEGRADOS DE SEGURIDAD:</b> Control de acceso y videovigilancia conectados a tu software de liquidaciones.</li>
+                                        <li style="margin-bottom: 8px;"><b style="color: #663399;">TALENT ACQUISITION IT:</b> Encontramos los recursos técnicos clave que tu proyecto necesita para escalar.</li>
+                                    </ul>
+                                </td>
+                            </tr>
+
+                            <tr>
+                                <td align="center" style="padding: 0;">
+                                    <img src="cid:flyer_campana" alt="Propuesta Intellihelp" style="width: 100%; max-width: 600px; height: auto; display: block; border: none; margin: 0; padding: 0;">
+                                </td>
+                            </tr>
+
+                            <tr>
+                                <td style="padding: 25px 45px 15px 45px; text-align: center;">
+                                    <p style="margin: 0 0 20px 0; font-size: 15px; line-height: 1.6; color: #4a4a4a; text-align: left;">
+                                        Sabemos que cada negocio tiene desafíos únicos. Por eso, te propongo una <strong style="color: #663399;">breve llamada exploratoria de 15 minutos</strong>, sin compromisos, simplemente para escuchar tu escenario actual y contarte cómo podemos aportar valor.
+                                    </p>
+                                    {bloque_botones}
+                                </td>
+                            </tr>
+
+                            <tr>
+                                <td style="padding: 15px 45px 45px 45px; text-align: left;">
+                                    <p style="margin: 0 0 10px 0; font-size: 15px; color: #1a1a1a; font-weight: 500;">¿Tienes disponibilidad esta semana?</p>
+                                    <p style="margin: 0; font-size: 15px; color: #4a4a4a;">Quedo a tu entera disposición,<br>Saludos cordiales.</p>
+                                    {firma_html}
+                                </td>
+                            </tr>
+                        </table>
+
+                        <table width="100%" cellpadding="0" cellspacing="0" style="max-width: 600px;">
+                            <tr>
+                                <td align="center" style="padding: 25px 20px; font-size: 12px; color: #999999; line-height: 1.5;">
+                                    Este mensaje es una comunicación corporativa de Intellihelp.<br>
+                                    Si no deseas recibir más información sobre nuestros servicios, responde este correo con la palabra "BAJA".
+                                </td>
+                            </tr>
+                        </table>
+                    </td>
+                </tr>
+            </table>
+        </body>
+    </html>
     """
     msg.add_alternative(html, subtype="html")
 
-    # Logo personalizado del usuario (si lo configuró). Sustituye al
-    # ITH-logo.png en el cid:logo_intellihelp del HTML del correo.
-    logo_user = (get_config_value("logo_personalizado") or "").strip()
-    activos = []
-    for archivo, id_imagen in ACTIVOS_MULTIMEDIA:
-        if id_imagen == "logo_intellihelp" and logo_user and os.path.exists(logo_user):
-            activos.append((logo_user, id_imagen, True))
-        else:
-            activos.append((os.path.join(CARPETA_ASSETS, archivo), id_imagen, False))
+    # ── Resolución de rutas para Flyer y firma ──
+    # Prioridad para cada activo:
+    #   1) firma personalizada del config (sólo para firma_intellihelp)
+    #   2) Archivo en CARPETA_ACTUAL — al lado del .exe, lo puede
+    #      reemplazar el usuario sin recompilar. Prueba .png primero
+    #      (mejor calidad), luego .jpg.
+    #   3) Archivo en CARPETA_ASSETS (default del bundle).
+    firma_user = (get_config_value("firma_imagen") or "").strip()
 
-    for ruta, id_imagen, es_absoluto in activos:
-        if not os.path.exists(ruta):
+    def _resolver_activo(nombre_base):
+        for carpeta in (CARPETA_ACTUAL, CARPETA_ASSETS):
+            for ext in (".png", ".jpg", ".jpeg"):
+                ruta = os.path.join(carpeta, nombre_base + ext)
+                if os.path.exists(ruta):
+                    return ruta
+        return None
+
+    activos = []
+    for nombre_base, id_imagen in ACTIVOS_MULTIMEDIA:
+        ruta_final = None
+        if id_imagen == "firma_intellihelp" and firma_user and os.path.exists(firma_user):
+            ruta_final = firma_user
+        else:
+            ruta_final = _resolver_activo(nombre_base)
+        if ruta_final:
+            activos.append((ruta_final, id_imagen))
+
+    for ruta, id_imagen in activos:
+        try:
+            with open(ruta, "rb") as img:
+                datos = img.read()
+        except Exception:
             continue
-        with open(ruta, "rb") as img:
-            datos = img.read()
         ext = os.path.splitext(ruta)[1].lower()
         tipo = (
             "image/svg+xml"
@@ -496,10 +1067,32 @@ def enviar_correo(msg, destino, intentos_previos=0, nombre=""):
 
         intento += 1
         try:
+            # Si el correo no tiene Message-ID (no se lo seteamos a mano),
+            # Python lo va a generar al serializar. Para poder trackear-
+            # lo después al detectar respuestas, lo seteamos NOSOTROS
+            # acá y lo registramos antes de enviar.
+            if not msg.get("Message-ID"):
+                try:
+                    from email.utils import make_msgid
+                    msg["Message-ID"] = make_msgid()
+                except Exception:
+                    pass
+
             with smtplib.SMTP(host, port, timeout=30) as server:
                 server.starttls()
                 server.login(MI_CORREO(), MI_PASSWORD())
                 server.send_message(msg)
+
+            # Persistir Message-ID al registro de IDs enviados — es la
+            # forma confiable de detectar respuestas aunque cambien el
+            # asunto (la respuesta viene con In-Reply-To: <ese-id>).
+            try:
+                mid = msg.get("Message-ID") or ""
+                if mid:
+                    registrar_message_id_enviado(mid)
+            except Exception:
+                pass
+
             if aviso_red:
                 _emit_red("recuperado", intento, MAX_REINTENTOS_RED, destino)
                 print(f" Conexión recuperada. Enviado a {destino} "
@@ -711,6 +1304,19 @@ def main():
         p_destino  = pendiente["destino"]
         p_nombre   = pendiente.get("nombre") or "Cliente"
         p_intentos = int(pendiente.get("intentos") or 0)
+
+        # Si entre que se guardó el pendiente y ahora se agregó este
+        # destinatario a la lista negra, no le mandamos. Borramos el
+        # pendiente y seguimos con el CSV.
+        if p_destino.lower() in cargar_lista_negra_set():
+            msg = (f"Correo pendiente {p_destino} está en lista negra. "
+                   "Descartado.")
+            print(msg)
+            guardar_evento_historial(hoy, "info", msg)
+            borrar_pendiente()
+            pendiente = None
+
+    if pendiente and pendiente.get("destino"):
         msg_p = (f"Retomando correo pendiente: {p_destino} "
                  f"(intentos previos: {p_intentos}/{MAX_REINTENTOS_RED}).")
         print(msg_p)
@@ -757,6 +1363,14 @@ def main():
     if saltar_hasta_ultimo:
         print("Avanzando automáticamente hasta encontrar dónde nos quedamos la última vez...")
 
+    # Lista negra cargada UNA vez al inicio del loop para no leer disco
+    # por cada iteración. Si el usuario agrega manualmente alguien mid-
+    # campaña, se aplicará en la próxima corrida (igualmente la mayoría
+    # de adds son automáticos al recibir un BAJA, que se aplica en la
+    # siguiente campaña).
+    blacklist = cargar_lista_negra_set()
+    skipped_blacklist = 0
+
     for fila in lista_clientes:
         if campana_detenida():
             msg = "Campaña detenida por el usuario."
@@ -784,6 +1398,17 @@ def main():
         if saltar_hasta_ultimo:
             if destino == ultimo_correo:
                 saltar_hasta_ultimo = False
+            continue
+
+        # ── Lista negra: skip silencioso para opt-outs ──
+        if destino.lower() in blacklist:
+            skipped_blacklist += 1
+            if skipped_blacklist <= 5:   # primeros 5 al historial; el resto, batch
+                guardar_evento_historial(
+                    hoy, "info",
+                    f"Saltado por lista negra (opt-out): {destino}",
+                )
+            print(f" Saltado por lista negra: {destino}")
             continue
 
         nombre = (
@@ -842,6 +1467,12 @@ def main():
         msg = f"Lista finalizada por el momento. Total enviados hoy: {enviados}"
         print(f"\n{msg}")
         guardar_evento_historial(hoy, "info", msg, enviados=enviados)
+
+    if skipped_blacklist > 0:
+        msg_bl = (f"Se saltaron {skipped_blacklist} contacto(s) por estar en "
+                   "lista negra (opt-out).")
+        print(msg_bl)
+        guardar_evento_historial(hoy, "info", msg_bl)
 
     revisar_rebotes(hoy, enviados)
 
@@ -1740,7 +2371,27 @@ def contar_contactos():
 # ==========================================
 # 12. RESPUESTAS DE CLIENTES + CALENDLY (IMAP)
 # ==========================================
-_DOMINIOS_CALENDLY = ("calendly.com",)
+# Dominios desde los que llegan emails de confirmación de reunión.
+# Detectamos AMBAS plataformas siempre (independiente de cuál usa el
+# usuario en el botón) — así si cambia de Calendly a Cal.com o viceversa
+# no pierde el histórico de bookings de la otra.
+_DOMINIOS_REUNION = {
+    "calendly": ("calendly.com",),
+    "cal_com":  ("cal.com", "no-reply@cal.com", "notifications@cal.com"),
+}
+# Mantenido por compatibilidad con código viejo
+_DOMINIOS_CALENDLY = _DOMINIOS_REUNION["calendly"]
+
+
+def _identificar_plataforma_reunion(remitente):
+    """Devuelve 'calendly', 'cal_com' o None según el dominio del FROM."""
+    if not remitente:
+        return None
+    r = remitente.lower()
+    for plataforma, dominios in _DOMINIOS_REUNION.items():
+        if any(d in r for d in dominios):
+            return plataforma
+    return None
 
 
 def _cargar_respuestas_archivo():
@@ -2361,12 +3012,18 @@ def _html_a_markdown(html_str):
     return s.strip()
 
 
-def detectar_respuestas_y_calendly(dias=30):
+def detectar_respuestas_y_calendly(dias=30, forzar_full=False):
     """
     Busca por IMAP en los últimos `dias`:
       - Respuestas: correos cuyo From coincide con un contacto del CSV.
       - Calendly: correos de Calendly cuya confirmación menciona un contacto del CSV.
+      - Auto-baja: respuestas que piden no recibir más → agregadas a lista negra.
+
     Persiste en registro_respuestas.json y devuelve el dict.
+
+    `forzar_full=True` ignora el `_last_uid` cacheado y rescanea TODO el
+    rango `SINCE dias`. Útil cuando se sospecha que se perdieron respuestas
+    (UI muestra lista vacía pero el server tiene respuestas).
     """
     cfg = cargar_config()
     imap_host = cfg.get("imap_host", "imap.gmail.com")
@@ -2381,6 +3038,14 @@ def detectar_respuestas_y_calendly(dias=30):
     vistos_resp = {(r.get("uid"), r.get("from")) for r in data["respuestas"]}
     vistos_cal  = {c.get("uid") for c in data["calendly"]}
 
+    # IDs que mandamos NOSOTROS. Si una respuesta tiene In-Reply-To o
+    # References apuntando a uno de estos IDs, ES una respuesta a un
+    # correo nuestro — sin importar quién la mande ni qué asunto tenga.
+    # Esto cubre los casos: cambio de asunto ("Baja", "Fuera de oficina"),
+    # respuesta desde un alias o personal, anti-spam que re-empaqueta el
+    # mensaje, etc.
+    ids_propios = cargar_message_ids_enviados()
+
     try:
         desde = datetime.now() - timedelta(days=int(dias))
     except Exception:
@@ -2391,7 +3056,8 @@ def detectar_respuestas_y_calendly(dias=30):
     # 30 días cada vez (lento, 100s de fetches), sólo buscamos UIDs
     # mayores al último procesado. Primer escaneo: usa SINCE; los
     # siguientes son casi instantáneos porque sólo bajan correos nuevos.
-    last_uid = int(data.get("_last_uid", 0) or 0)
+    # `forzar_full` resetea ese tracking para un re-escaneo completo.
+    last_uid = 0 if forzar_full else int(data.get("_last_uid", 0) or 0)
 
     try:
         with imaplib.IMAP4_SSL(imap_host) as mail:
@@ -2413,6 +3079,8 @@ def detectar_respuestas_y_calendly(dias=30):
             uids = msgs[0].split()
             max_uid_visto = last_uid
 
+            # Filtrar IN-MEMORY los UIDs nuevos (los <= last_uid ya se vieron).
+            uids_nuevos = []
             for uid_b in uids:
                 try:
                     uid_i = int(uid_b)
@@ -2422,80 +3090,173 @@ def detectar_respuestas_y_calendly(dias=30):
                     continue
                 if uid_i > max_uid_visto:
                     max_uid_visto = uid_i
+                uids_nuevos.append(uid_b)
 
-                # Paso 1: sólo headers — ~10x más rápido que RFC822 completo.
+            if not uids_nuevos:
+                data["_last_uid"] = max_uid_visto
+                _guardar_respuestas_archivo(data)
+                return data
+
+            # ──────────────────────────────────────────────────────────
+            # PASO 1: BATCH FETCH de headers de TODOS los UIDs nuevos
+            # ──────────────────────────────────────────────────────────
+            # Antes hacíamos un FETCH individual por cada UID → 5000+
+            # round-trips en una bandeja de 30 días con tráfico normal.
+            # Ahora un fetch por chunk de 500 (10 round-trips para 5000).
+            # Esto es lo que hizo el "Escanear bandeja" demorar mucho
+            # con forzar_full=True.
+            CHUNK_HEADERS = 500
+            # Almacenamos por UID lo que necesitamos para decidir qué
+            # hacer (sin volver a tocar IMAP).
+            info_por_uid = {}   # uid_bytes -> {remitente, asunto, fecha, msg_id, in_reply_to, references}
+
+            for i in range(0, len(uids_nuevos), CHUNK_HEADERS):
+                chunk = uids_nuevos[i:i + CHUNK_HEADERS]
                 try:
                     _, fetched = mail.uid(
-                        "FETCH", uid_b, "(BODY.PEEK[HEADER])"
+                        "FETCH", b",".join(chunk), "(BODY.PEEK[HEADER])"
                     )
                 except Exception:
                     continue
-
-                msg = None
-                for respuesta in fetched:
-                    if isinstance(respuesta, tuple):
+                # Parsear respuesta: tuplas (meta_bytes, header_body)
+                uid_actual = None
+                for item in fetched:
+                    if isinstance(item, tuple) and len(item) >= 2:
+                        m_uid = re.search(rb"UID (\d+)", item[0])
+                        uid_actual = m_uid.group(1) if m_uid else None
+                        if not uid_actual:
+                            continue
                         try:
-                            msg = email.message_from_bytes(respuesta[1])
+                            msg = email.message_from_bytes(item[1])
                         except Exception:
-                            msg = None
-                        break
-                if msg is None:
+                            continue
+                        rem_raw = _decodificar_cabecera(msg.get("From", ""))
+                        info_por_uid[uid_actual] = {
+                            "remitente":   _extraer_email(rem_raw),
+                            "asunto":      _decodificar_cabecera(msg.get("Subject", "")),
+                            "fecha":       _decodificar_cabecera(msg.get("Date", "")),
+                            "msg_id":      msg.get("Message-ID", "") or uid_actual.decode("utf-8", "ignore"),
+                            "in_reply_to": msg.get("In-Reply-To", "") or "",
+                            "references":  msg.get("References", "") or "",
+                        }
+
+            # ──────────────────────────────────────────────────────────
+            # PASO 2: Decisión local — qué UIDs necesitan cuerpo (RFC822)
+            # ──────────────────────────────────────────────────────────
+            mi_correo = (MI_CORREO() or "").lower()
+            uids_necesita_cuerpo = []   # [(uid_b, "calendly"|"respuesta", info)]
+            for uid_b, info in info_por_uid.items():
+                rem = info["remitente"]
+                if not rem or "daemon" in rem:
+                    continue
+                if rem == mi_correo:
                     continue
 
-                remitente_raw = _decodificar_cabecera(msg.get("From", ""))
-                remitente     = _extraer_email(remitente_raw)
-                asunto        = _decodificar_cabecera(msg.get("Subject", ""))
-                fecha_msg     = _decodificar_cabecera(msg.get("Date", ""))
-                uid_key       = msg.get("Message-ID", "") or uid_b.decode("utf-8", "ignore")
-
-                if not remitente or "daemon" in remitente:
-                    continue
-                if remitente == (MI_CORREO() or "").lower():
-                    continue
-
-                es_calendly = any(d in remitente for d in _DOMINIOS_CALENDLY)
-
-                if es_calendly:
-                    if uid_key in vistos_cal:
-                        continue
-                    # Calendly necesita el cuerpo para sacar el invitado.
-                    invitado = ""
-                    try:
-                        _, fetched_full = mail.uid("FETCH", uid_b, "(RFC822)")
-                        for r in fetched_full:
-                            if isinstance(r, tuple):
-                                msg_full = email.message_from_bytes(r[1])
-                                cuerpo = _texto_correo(msg_full)
-                                for c in re.findall(
-                                    r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+",
-                                    cuerpo
-                                ):
-                                    cl = c.lower()
-                                    if cl in contactos:
-                                        invitado = cl
-                                        break
+                # ¿Responde a un correo nuestro? (match por Message-ID)
+                respuesta_hilo = False
+                if ids_propios:
+                    headers_thread = f"{info['in_reply_to']} {info['references']}"
+                    if headers_thread.strip():
+                        for mid_ref in re.findall(r"<[^>]+>", headers_thread):
+                            if mid_ref in ids_propios:
+                                respuesta_hilo = True
                                 break
-                    except Exception:
-                        pass
-                    data["calendly"].append({
-                        "uid":      uid_key,
-                        "from":     remitente,
-                        "subject":  asunto,
-                        "date":     fecha_msg,
-                        "invitado": invitado,
-                    })
-                    vistos_cal.add(uid_key)
-                elif remitente in contactos:
-                    clave = (uid_key, remitente)
+                info["via_hilo"] = respuesta_hilo
+
+                plataforma = _identificar_plataforma_reunion(rem)
+                if plataforma:
+                    if info["msg_id"] in vistos_cal:
+                        continue
+                    info["plataforma"] = plataforma
+                    uids_necesita_cuerpo.append((uid_b, "calendly", info))
+                elif rem in contactos or respuesta_hilo:
+                    clave = (info["msg_id"], rem)
                     if clave in vistos_resp:
                         continue
-                    data["respuestas"].append({
-                        "uid":     uid_key,
-                        "from":    remitente,
-                        "subject": asunto,
-                        "date":    fecha_msg,
+                    info["clave"] = clave
+                    uids_necesita_cuerpo.append((uid_b, "respuesta", info))
+
+            # ──────────────────────────────────────────────────────────
+            # PASO 3: BATCH FETCH de RFC822 sólo para los necesarios
+            # ──────────────────────────────────────────────────────────
+            cuerpos_por_uid = {}   # uid_bytes -> texto plano
+            if uids_necesita_cuerpo:
+                CHUNK_CUERPOS = 100
+                uids_a_fetch = [u for u, _, _ in uids_necesita_cuerpo]
+                for i in range(0, len(uids_a_fetch), CHUNK_CUERPOS):
+                    chunk = uids_a_fetch[i:i + CHUNK_CUERPOS]
+                    try:
+                        _, fetched = mail.uid(
+                            "FETCH", b",".join(chunk), "(RFC822)"
+                        )
+                    except Exception:
+                        continue
+                    for item in fetched:
+                        if isinstance(item, tuple) and len(item) >= 2:
+                            m_uid = re.search(rb"UID (\d+)", item[0])
+                            uid_actual = m_uid.group(1) if m_uid else None
+                            if uid_actual:
+                                try:
+                                    msg_full = email.message_from_bytes(item[1])
+                                    cuerpos_por_uid[uid_actual] = (
+                                        _texto_correo(msg_full) or ""
+                                    )
+                                except Exception:
+                                    cuerpos_por_uid[uid_actual] = ""
+
+            # ──────────────────────────────────────────────────────────
+            # PASO 4: Procesamiento local (sin más IMAP)
+            # ──────────────────────────────────────────────────────────
+            for uid_b, tipo, info in uids_necesita_cuerpo:
+                cuerpo = cuerpos_por_uid.get(uid_b, "")
+                rem = info["remitente"]
+                msg_id = info["msg_id"]
+                asunto = info["asunto"]
+                fecha_msg = info["fecha"]
+
+                if tipo == "calendly":
+                    invitado = ""
+                    for c in re.findall(
+                        r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+",
+                        cuerpo,
+                    ):
+                        cl = c.lower()
+                        if cl in contactos:
+                            invitado = cl
+                            break
+                    data["calendly"].append({
+                        "uid":        msg_id,
+                        "from":       rem,
+                        "subject":    asunto,
+                        "plataforma": info["plataforma"],
+                        "date":       fecha_msg,
+                        "invitado":   invitado,
                     })
-                    vistos_resp.add(clave)
+                    vistos_cal.add(msg_id)
+                else:  # respuesta
+                    es_baja = False
+                    razon_baja = ""
+                    if cuerpo or asunto:
+                        es_baja, razon_baja = es_pedido_de_baja(asunto, cuerpo)
+                    if es_baja:
+                        agregar_a_lista_negra(
+                            rem,
+                            motivo=f"Auto-baja: {razon_baja}",
+                            auto=True,
+                        )
+                        logging.info(
+                            f"Lista negra: {rem} agregado "
+                            f"automáticamente ({razon_baja})"
+                        )
+                    data["respuestas"].append({
+                        "uid":      msg_id,
+                        "from":     rem,
+                        "subject":  asunto,
+                        "date":     fecha_msg,
+                        "es_baja":  es_baja,
+                        "via_hilo": info["via_hilo"],
+                    })
+                    vistos_resp.add(info["clave"])
 
             data["_last_uid"] = max_uid_visto
     except Exception as e:

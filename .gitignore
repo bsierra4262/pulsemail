@@ -1,0 +1,65 @@
+# ============================================================
+#  Pulsemail — .gitignore
+# ============================================================
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.venv/
+venv/
+env/
+
+# --- Artefactos de compilación (PyInstaller / flet pack) ---
+build/
+dist/
+*.spec
+
+# --- Output del instalador (binarios generados, no se versionan) ---
+installer_output/
+
+# --- Datos del usuario en runtime (PRIVADOS, no van al repo) ---
+# Estos archivos los genera la app al usarla. Contienen credenciales,
+# contactos, historial de envíos y otros datos sensibles del cliente.
+config.json
+contactos.csv
+contactos.csv.bak
+ultimo_enviado.txt
+registro_envios.json
+registro_rechazados.json
+registro_depurados.json
+registro_respuestas.json
+registro_vistos.json
+registro_ignorados.json
+registro_pendiente.json
+registro_msg_ids.json
+lista_negra.json
+historial/
+sistema_errores.log
+sistema_errores.log.*
+
+# --- Cache de renderizado HTML (Chrome headless) ---
+ith_mail_render_cache/
+*.png.tmp
+
+# --- Configuración local de editores / IDEs ---
+.vscode/
+.idea/
+*.code-workspace
+.claude/
+
+# --- Sistema operativo ---
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+.DS_Store
+*~
+
+# --- Backups manuales y archivos temporales ---
+*.bak
+*.tmp
+*.swp
+*.orig

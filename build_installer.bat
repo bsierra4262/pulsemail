@@ -1,25 +1,36 @@
 @echo off
 REM ============================================================
-REM  Pulsemail — Compilar a .exe + generar instalador
+REM  Pulsemail - Compilar a .exe + generar instalador
 REM ============================================================
 REM  Pre-requisitos (instalar UNA sola vez):
-REM    1. Python 3.11+ con: pip install flet html2image plyer pillow
+REM    1. Python 3.11+ con: pip install flet html2image plyer pillow pyinstaller
 REM    2. Inno Setup 6 (gratis): https://jrsoftware.org/isdl.php
-REM       (Asegurate de que iscc.exe esté en C:\Program Files (x86)\Inno Setup 6\)
 REM
-REM  Uso:
-REM    Doble click en este .bat (o ejecutar desde cmd)
+REM  Uso: doble click en este .bat
 REM
-REM  Resultado:
-REM    installer_output\PulsemailSetup_v1.0.0.exe
+REM  Versionado: la version vive en el archivo VERSION (raiz).
+REM    python bump_version.py patch
 REM ============================================================
 
-setlocal enabledelayedexpansion
 cd /d "%~dp0"
+
+REM === 0) Leer version desde el archivo VERSION ===
+if not exist "VERSION" (
+    echo  ERROR: No se encontro el archivo VERSION en la raiz del proyecto.
+    echo  Ejecuta: python bump_version.py set 1.0.0
+    goto :error
+)
+set "APP_VERSION="
+set /p APP_VERSION=<VERSION
+if "%APP_VERSION%"=="" (
+    echo  ERROR: El archivo VERSION esta vacio.
+    goto :error
+)
+set "APP_FILE_VERSION=%APP_VERSION%.0"
 
 echo.
 echo ============================================================
-echo  PULSEMAIL - Build del instalador
+echo  PULSEMAIL v%APP_VERSION% - Build del instalador
 echo ============================================================
 echo.
 
@@ -30,8 +41,7 @@ if not exist "logo-app.ico" (
     if errorlevel 1 (
         echo  ERROR: no se pudo generar logo-app.ico
         echo  Asegurate de tener Pillow instalado: pip install Pillow
-        pause
-        exit /b 1
+        goto :error
     )
 ) else (
     echo [1/4] logo-app.ico ya existe, saltando.
@@ -45,41 +55,23 @@ if not exist "installer_output" mkdir "installer_output"
 
 REM === 3) Compilar a .exe con flet pack ===
 echo.
-echo [3/4] Compilando con flet pack (esto tarda 1-3 minutos)...
+echo [3/4] Compilando con flet pack (tarda 1-3 minutos)...
 echo.
 
-flet pack interfaz.py ^
-    --name "Pulsemail" ^
-    --product-name "Pulsemail" ^
-    --product-version "1.0.0" ^
-    --file-version "1.0.0.0" ^
-    --company-name "Pulsemail" ^
-    --copyright "Pulsemail (c) 2026" ^
-    --icon "logo-app.ico" ^
-    --add-data "logo-app.png;." ^
-    --add-data "logo-app.ico;." ^
-    --add-data "ITH-logo.png;." ^
-    --add-data "icon-process.svg;." ^
-    --add-data "icon-cost.svg;." ^
-    --add-data "icon-prod.svg;." ^
-    --add-data "icon-solution.svg;." ^
-    --add-data "icon-calendar.svg;." ^
-    --add-data "icon-whatsapp.svg;." ^
-    --add-data "enviar_correos.py;." ^
-    --hidden-import "plyer.platforms.win.notification" ^
-    --hidden-import "plyer.platforms.win" ^
-    --hidden-import "plyer.platforms" ^
-    --hidden-import "plyer"
-
+REM Usamos _build_helper.py en vez de invocar flet directamente porque:
+REM   - python -m flet NO funciona en flet 0.84
+REM   - flet.exe no siempre esta en PATH (Windows Store Python)
+REM   - El helper importa flet_cli.cli.main y lo invoca con sys.argv,
+REM     lo cual es portable a cualquier instalacion de Python
+python _build_helper.py "%APP_VERSION%"
 if errorlevel 1 (
     echo.
-    echo  ERROR: flet pack falló. Revisá los mensajes arriba.
-    pause
-    exit /b 1
+    echo  ERROR: flet pack fallo. Revisa los mensajes arriba.
+    goto :error
 )
 
 REM flet pack genera "dist\Pulsemail.exe" (onefile). Inno Setup espera
-REM una carpeta "dist\Pulsemail\" — la armamos.
+REM una carpeta "dist\Pulsemail\" - la armamos.
 if not exist "dist\Pulsemail" mkdir "dist\Pulsemail"
 if exist "dist\Pulsemail.exe" move /y "dist\Pulsemail.exe" "dist\Pulsemail\Pulsemail.exe" >nul
 
@@ -92,22 +84,16 @@ set "ISCC=C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
 if not exist "%ISCC%" set "ISCC=C:\Program Files\Inno Setup 6\ISCC.exe"
 
 if not exist "%ISCC%" (
-    echo  ERROR: No se encontró Inno Setup en:
-    echo    C:\Program Files ^(x86^)\Inno Setup 6\
-    echo    C:\Program Files\Inno Setup 6\
-    echo.
+    echo  ERROR: No se encontro Inno Setup.
     echo  Descargalo gratis de: https://jrsoftware.org/isdl.php
-    pause
-    exit /b 1
+    goto :error
 )
 
 "%ISCC%" "installer\pulsemail.iss"
-
 if errorlevel 1 (
     echo.
-    echo  ERROR: Inno Setup falló. Revisá los mensajes arriba.
-    pause
-    exit /b 1
+    echo  ERROR: Inno Setup fallo. Revisa los mensajes arriba.
+    goto :error
 )
 
 echo.
@@ -116,11 +102,17 @@ echo  LISTO!
 echo ============================================================
 echo.
 echo  Instalador generado en:
-echo    %~dp0installer_output\PulsemailSetup_v1.0.0.exe
+echo    %~dp0installer_output\PulsemailSetup_v%APP_VERSION%.exe
 echo.
-echo  Para distribuir, mandale ese .exe a tus usuarios.
-echo  Al ejecutarlo:
-echo    - Si es la primera vez: instala Pulsemail en %%LOCALAPPDATA%%\Pulsemail
-echo    - Si ya estaba instalado: ofrece actualizar y recomienda backup
+echo  Para distribuir, mandaselo a tus usuarios.
 echo.
 pause
+exit /b 0
+
+:error
+echo.
+echo ============================================================
+echo  Build cancelada por error.
+echo ============================================================
+pause
+exit /b 1
