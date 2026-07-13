@@ -76,7 +76,148 @@ def _cleanup_html_temps():
 atexit.register(_cleanup_html_temps)
 
 
+# ==========================================
+# DIÁLOGO DE ARCHIVOS NATIVO (Win32)
+# ==========================================
+# En Flet 0.84 desktop `ft.FilePicker` no está soportado, y el patrón
+# anterior (crear `tk.Tk()` dentro de un thread daemon por cada diálogo)
+# es frágil en el .exe compilado:
+#   - PyInstaller / `flet pack` no siempre empaqueta el runtime tcl/tk,
+#     con lo cual `tk.Tk()` lanza `TclError: Can't find init.tcl` y el
+#     diálogo NUNCA abre → el usuario ve "no importa ni exporta nada".
+#   - Crear varias raíces Tk desde distintos hilos rompe la afinidad de
+#     hilo del intérprete Tcl (el primero funciona, los siguientes cuelgan).
+#
+# Solución: usar el diálogo NATIVO de Windows vía comdlg32
+# (GetOpenFileNameW / GetSaveFileNameW). No depende de tcl/tk, funciona
+# desde cualquier hilo y va en línea con el uso de Win32 que ya hace la
+# app (portapapeles). Si comdlg32 no está disponible (otro SO, dev),
+# cae a tkinter como último recurso.
+try:
+    import ctypes as _ct_dlg
+    from ctypes import wintypes as _wt_dlg
+
+    class _OPENFILENAMEW(_ct_dlg.Structure):
+        _fields_ = [
+            ("lStructSize",       _wt_dlg.DWORD),
+            ("hwndOwner",         _wt_dlg.HWND),
+            ("hInstance",         _wt_dlg.HINSTANCE),
+            ("lpstrFilter",       _wt_dlg.LPCWSTR),
+            ("lpstrCustomFilter", _wt_dlg.LPWSTR),
+            ("nMaxCustFilter",    _wt_dlg.DWORD),
+            ("nFilterIndex",      _wt_dlg.DWORD),
+            ("lpstrFile",         _wt_dlg.LPWSTR),
+            ("nMaxFile",          _wt_dlg.DWORD),
+            ("lpstrFileTitle",    _wt_dlg.LPWSTR),
+            ("nMaxFileTitle",     _wt_dlg.DWORD),
+            ("lpstrInitialDir",   _wt_dlg.LPCWSTR),
+            ("lpstrTitle",        _wt_dlg.LPCWSTR),
+            ("Flags",             _wt_dlg.DWORD),
+            ("nFileOffset",       _wt_dlg.WORD),
+            ("nFileExtension",    _wt_dlg.WORD),
+            ("lpstrDefExt",       _wt_dlg.LPCWSTR),
+            ("lCustData",         _wt_dlg.LPARAM),
+            ("lpfnHook",          _wt_dlg.LPVOID),
+            ("lpTemplateName",    _wt_dlg.LPCWSTR),
+            ("pvReserved",        _wt_dlg.LPVOID),
+            ("dwReserved",        _wt_dlg.DWORD),
+            ("FlagsEx",           _wt_dlg.DWORD),
+        ]
+
+    _comdlg32 = _ct_dlg.windll.comdlg32
+    _WIN32_DLG_OK = True
+except Exception:
+    _WIN32_DLG_OK = False
+
+# Flags de OPENFILENAMEW
+_OFN_OVERWRITEPROMPT = 0x00000002
+_OFN_HIDEREADONLY    = 0x00000004
+_OFN_NOCHANGEDIR     = 0x00000008
+_OFN_PATHMUSTEXIST   = 0x00000800
+_OFN_FILEMUSTEXIST   = 0x00001000
+_OFN_EXPLORER        = 0x00080000
+
+
+def _win32_build_filter(filtros):
+    """Convierte [(etiqueta, "*.png *.jpg"), ...] al formato de comdlg32:
+    pares etiqueta\\0patron\\0 ... \\0\\0. Win32 separa múltiples patrones
+    con ';' (no con espacios como tkinter), así que normalizamos."""
+    partes = []
+    for etiqueta, patron in filtros:
+        partes.append(str(etiqueta))
+        partes.append(str(patron).replace(" ", ";"))
+    return "\0".join(partes) + "\0\0"
+
+
+def _dialogo_archivo_nativo(save, title, filtros, default_name="",
+                            default_ext=""):
+    """Diálogo nativo de Windows para abrir/guardar un archivo.
+
+    `save`: True = guardar (GetSaveFileNameW), False = abrir.
+    `filtros`: lista [(etiqueta, patron)] en formato tkinter
+        ej [("Backup ZIP", "*.zip"), ("Todos los archivos", "*.*")].
+    Devuelve la ruta absoluta elegida, o "" si el usuario canceló.
+
+    Si comdlg32 no está disponible cae a tkinter (último recurso).
+    """
+    if _WIN32_DLG_OK:
+        try:
+            buf = _ct_dlg.create_unicode_buffer(default_name or "", 65536)
+            ofn = _OPENFILENAMEW()
+            ofn.lStructSize = _ct_dlg.sizeof(_OPENFILENAMEW)
+            ofn.hwndOwner   = None
+            ofn.lpstrFilter = _win32_build_filter(filtros)
+            ofn.nFilterIndex = 1
+            ofn.lpstrFile   = _ct_dlg.cast(buf, _wt_dlg.LPWSTR)
+            ofn.nMaxFile    = 65536
+            ext = (default_ext or "").lstrip("*").lstrip(".")
+            ofn.lpstrDefExt = ext or None
+            ofn.lpstrTitle  = title
+            if save:
+                ofn.Flags = (_OFN_EXPLORER | _OFN_OVERWRITEPROMPT
+                             | _OFN_HIDEREADONLY | _OFN_NOCHANGEDIR)
+                ok = _comdlg32.GetSaveFileNameW(_ct_dlg.byref(ofn))
+            else:
+                ofn.Flags = (_OFN_EXPLORER | _OFN_FILEMUSTEXIST
+                             | _OFN_PATHMUSTEXIST | _OFN_HIDEREADONLY
+                             | _OFN_NOCHANGEDIR)
+                ok = _comdlg32.GetOpenFileNameW(_ct_dlg.byref(ofn))
+            if not ok:
+                return ""   # usuario canceló (o error → probamos fallback)
+            return buf.value or ""
+        except Exception:
+            pass  # cae al fallback tkinter
+
+    # ── Fallback tkinter (sólo si comdlg32 no está / falló) ──
+    try:
+        import tkinter as _tk
+        from tkinter import filedialog as _fd
+        root = _tk.Tk()
+        root.withdraw()
+        root.attributes("-topmost", True)
+        try:
+            if save:
+                ext = (default_ext or "").lstrip("*")
+                if ext and not ext.startswith("."):
+                    ext = "." + ext
+                ruta = _fd.asksaveasfilename(
+                    parent=root, title=title, filetypes=filtros,
+                    defaultextension=ext or None,
+                    initialfile=default_name or None,
+                )
+            else:
+                ruta = _fd.askopenfilename(
+                    parent=root, title=title, filetypes=filtros,
+                )
+        finally:
+            root.destroy()
+        return ruta or ""
+    except Exception:
+        return ""
+
+
 # ── Notificación del sistema operativo ──
+# Intenta primero `plyer.notification` (toast nativo Windows 10/11),
 # Intenta primero `plyer.notification` (toast nativo Windows 10/11),
 # si no está disponible cae a un beep + flash de la ventana. La
 # notificación lleva el logo de Pulsemail (Windows requiere .ico).
@@ -1542,17 +1683,11 @@ def main(page: ft.Page):
         como contactos.csv (sobrescribe haciendo .bak previo)."""
         def _picker():
             try:
-                import tkinter as _tk
-                from tkinter import filedialog as _fd
-                root = _tk.Tk()
-                root.withdraw()
-                root.attributes("-topmost", True)
-                path = _fd.askopenfilename(
-                    parent=root,
+                path = _dialogo_archivo_nativo(
+                    save=False,
                     title="Seleccioná tu contactos.csv",
-                    filetypes=[("CSV", "*.csv"), ("Todos los archivos", "*.*")],
+                    filtros=[("CSV", "*.csv"), ("Todos los archivos", "*.*")],
                 )
-                root.destroy()
                 if not path:
                     return
                 ok, msg = enviar_correos.importar_archivo_local(
@@ -2463,19 +2598,13 @@ def main(page: ft.Page):
     def _exportar_negra_csv(e=None):
         def _picker():
             try:
-                import tkinter as _tk
-                from tkinter import filedialog as _fd
-                root = _tk.Tk()
-                root.withdraw()
-                root.attributes("-topmost", True)
-                path = _fd.asksaveasfilename(
-                    parent=root,
+                path = _dialogo_archivo_nativo(
+                    save=True,
                     title="Guardar lista negra como CSV",
-                    defaultextension=".csv",
-                    initialfile="lista_negra.csv",
-                    filetypes=[("CSV", "*.csv"), ("Todos", "*.*")],
+                    filtros=[("CSV", "*.csv"), ("Todos", "*.*")],
+                    default_name="lista_negra.csv",
+                    default_ext="csv",
                 )
-                root.destroy()
                 if not path:
                     return
                 import csv as _csv
@@ -2498,17 +2627,11 @@ def main(page: ft.Page):
     def _importar_negra_csv(e=None):
         def _picker():
             try:
-                import tkinter as _tk
-                from tkinter import filedialog as _fd
-                root = _tk.Tk()
-                root.withdraw()
-                root.attributes("-topmost", True)
-                path = _fd.askopenfilename(
-                    parent=root,
+                path = _dialogo_archivo_nativo(
+                    save=False,
                     title="Importar emails a lista negra",
-                    filetypes=[("CSV / TXT", "*.csv *.txt"), ("Todos", "*.*")],
+                    filtros=[("CSV / TXT", "*.csv *.txt"), ("Todos", "*.*")],
                 )
-                root.destroy()
                 if not path:
                     return
                 agregados = 0
@@ -5335,6 +5458,63 @@ def main(page: ft.Page):
         text_style=ft.TextStyle(font_family="Saira"),
         expand=True,
     )
+    # ── Datos de la empresa (se muestran en el correo de campaña) ──
+    tf_empresa_nombre = ft.TextField(
+        label="Nombre de la empresa",
+        value=cfg_actual.get("empresa_nombre", ""),
+        hint_text="Intellihelp",
+        prefix_icon=ft.Icons.BUSINESS_ROUNDED,
+        border_color=C_BORDE,
+        focused_border_color=C_MORADO,
+        label_style=ft.TextStyle(color=C_TEXTO_2, font_family="Saira"),
+        text_style=ft.TextStyle(font_family="Saira"),
+        expand=True,
+    )
+    tf_empresa_web = ft.TextField(
+        label="Sitio web",
+        value=cfg_actual.get("empresa_web", ""),
+        hint_text="intellihelp.tech",
+        prefix_icon=ft.Icons.LANGUAGE_ROUNDED,
+        border_color=C_BORDE,
+        focused_border_color=C_MORADO,
+        label_style=ft.TextStyle(color=C_TEXTO_2, font_family="Saira"),
+        text_style=ft.TextStyle(font_family="Saira"),
+        expand=True,
+    )
+    tf_empresa_telefono = ft.TextField(
+        label="Teléfono fijo",
+        value=cfg_actual.get("empresa_telefono", ""),
+        hint_text="+54 11 7700-6868",
+        prefix_icon=ft.Icons.CALL_ROUNDED,
+        border_color=C_BORDE,
+        focused_border_color=C_MORADO,
+        label_style=ft.TextStyle(color=C_TEXTO_2, font_family="Saira"),
+        text_style=ft.TextStyle(font_family="Saira"),
+        expand=True,
+    )
+    tf_empresa_email = ft.TextField(
+        label="Email de contacto",
+        value=cfg_actual.get("empresa_email", ""),
+        hint_text="info@intellihelp.tech",
+        prefix_icon=ft.Icons.ALTERNATE_EMAIL_ROUNDED,
+        border_color=C_BORDE,
+        focused_border_color=C_MORADO,
+        label_style=ft.TextStyle(color=C_TEXTO_2, font_family="Saira"),
+        text_style=ft.TextStyle(font_family="Saira"),
+        expand=True,
+    )
+    tf_empresa_whatsapp = ft.TextField(
+        label="WhatsApp (número visible)",
+        value=cfg_actual.get("empresa_whatsapp", ""),
+        hint_text="+54 9 11 5027-4827",
+        prefix_icon=ft.Icons.CHAT_ROUNDED,
+        border_color=C_BORDE,
+        focused_border_color=C_MORADO,
+        label_style=ft.TextStyle(color=C_TEXTO_2, font_family="Saira"),
+        text_style=ft.TextStyle(font_family="Saira"),
+        expand=True,
+    )
+
     tf_smtp_host = ft.TextField(
         label="Servidor SMTP",
         value=cfg_actual.get("smtp_host", "smtp.gmail.com"),
@@ -5444,20 +5624,14 @@ def main(page: ft.Page):
         En Flet 0.84 desktop ft.FilePicker no está soportado todavía."""
         def _picker():
             try:
-                import tkinter as _tk
-                from tkinter import filedialog as _fd
-                root = _tk.Tk()
-                root.withdraw()
-                root.attributes("-topmost", True)
-                path = _fd.askopenfilename(
-                    parent=root,
+                path = _dialogo_archivo_nativo(
+                    save=False,
                     title="Seleccioná tu firma",
-                    filetypes=[
+                    filtros=[
                         ("Imágenes", "*.png *.jpg *.jpeg *.gif *.webp *.bmp"),
                         ("Todos los archivos", "*.*"),
                     ],
                 )
-                root.destroy()
                 if path:
                     _on_firma_imagen_path(path)
             except Exception as ex:
@@ -5570,20 +5744,14 @@ def main(page: ft.Page):
     def _abrir_dialogo_logo(e=None):
         def _picker():
             try:
-                import tkinter as _tk
-                from tkinter import filedialog as _fd
-                root = _tk.Tk()
-                root.withdraw()
-                root.attributes("-topmost", True)
-                path = _fd.askopenfilename(
-                    parent=root,
+                path = _dialogo_archivo_nativo(
+                    save=False,
                     title="Seleccioná tu logo",
-                    filetypes=[
+                    filtros=[
                         ("Imágenes", "*.png *.jpg *.jpeg *.gif *.webp *.bmp"),
                         ("Todos los archivos", "*.*"),
                     ],
                 )
-                root.destroy()
                 if path:
                     _on_logo_path(path)
             except Exception as ex:
@@ -5695,6 +5863,11 @@ def main(page: ft.Page):
             "url_cal_com":        (tf_url_cal_com.value or "").strip(),
             "plataforma_reunion": plataforma_actual[0],
             "url_whatsapp":       (tf_url_whatsapp.value or "").strip(),
+            "empresa_nombre":     (tf_empresa_nombre.value or "").strip(),
+            "empresa_web":        (tf_empresa_web.value or "").strip(),
+            "empresa_telefono":   (tf_empresa_telefono.value or "").strip(),
+            "empresa_email":      (tf_empresa_email.value or "").strip(),
+            "empresa_whatsapp":   (tf_empresa_whatsapp.value or "").strip(),
         })
         enviar_correos.guardar_config(cfg)
 
@@ -5919,6 +6092,37 @@ def main(page: ft.Page):
         ),
     )
 
+    # ── Tab "Empresa" — datos que se muestran en el correo de campaña ──
+    tab_empresa = ft.Container(
+        padding=ft.Padding(0, 20, 0, 0),
+        content=ft.Column(
+            spacing=14,
+            scroll=ft.ScrollMode.AUTO,
+            controls=[
+                ft.Text(
+                    "Estos datos se muestran en el correo de campaña "
+                    "(encabezado, bloque de contacto y pie). Si dejás un "
+                    "campo vacío, esa línea no aparece. Nada está fijo en el "
+                    "código: todo sale de acá.",
+                    size=12, color=C_TEXTO_3, font_family="Saira",
+                ),
+                ft.Row(spacing=12, controls=[tf_empresa_nombre]),
+                ft.Row(spacing=12, controls=[tf_empresa_web]),
+                ft.Row(spacing=12, controls=[tf_empresa_telefono]),
+                ft.Row(spacing=12, controls=[tf_empresa_email]),
+                ft.Row(spacing=12, controls=[tf_empresa_whatsapp]),
+                ft.Text(
+                    "El número de WhatsApp de acá es sólo el texto visible en "
+                    "el bloque de contacto. El botón verde \"Contáctanos por "
+                    "WhatsApp\" usa el enlace de la pestaña WhatsApp, y el "
+                    "botón \"Agendar reunión\" usa el de la pestaña Reuniones. "
+                    "Cada botón aparece sólo si su enlace está configurado.",
+                    size=11, color=C_TEXTO_3, italic=True, font_family="Saira",
+                ),
+            ],
+        ),
+    )
+
     # ── Tab "Firma" ──────────────────────────────────────────────
     tab_firma = ft.Container(
         padding=ft.Padding(0, 20, 0, 0),
@@ -5927,9 +6131,10 @@ def main(page: ft.Page):
             scroll=ft.ScrollMode.AUTO,
             controls=[
                 ft.Text(
-                    "Esta firma se agrega automáticamente al final de las "
-                    "respuestas que envíes desde el hilo. Gmail no expone su "
-                    "firma vía SMTP, así que la configurás acá.",
+                    "Esta firma se agrega automáticamente al cierre del correo "
+                    "de campaña y de las respuestas que envíes desde el hilo. "
+                    "Si la dejás vacía, el correo cierra con el nombre de la "
+                    "empresa. Podés usar texto o una imagen.",
                     size=12, color=C_TEXTO_3, font_family="Saira",
                 ),
                 ft.Row(
@@ -6053,28 +6258,25 @@ def main(page: ft.Page):
         threading.Thread(target=_limpiar, daemon=True).start()
 
     def _abrir_dialogo(titulo, modo, filetypes, default_name=""):
-        """Abre tkinter filedialog y devuelve la ruta elegida (o '').
-        modo = 'open' | 'save'."""
-        import tkinter as _tk
-        from tkinter import filedialog as _fd
-        root = _tk.Tk()
-        root.withdraw()
-        root.attributes("-topmost", True)
+        """Abre el diálogo NATIVO de Windows y devuelve la ruta elegida
+        (o '' si el usuario canceló). modo = 'open' | 'save'.
+        `filetypes` en formato tkinter: [(etiqueta, "*.ext"), ...].
+
+        Antes usaba `tk.Tk()` en un thread daemon, lo cual fallaba en el
+        .exe compilado (tcl/tk no siempre se empaqueta) → los backups no
+        se podían importar ni exportar. Ahora delega en el diálogo nativo
+        Win32 (ver `_dialogo_archivo_nativo`), robusto y sin dependencias."""
         try:
-            if modo == "save":
-                ruta = _fd.asksaveasfilename(
-                    parent=root, title=titulo,
-                    filetypes=filetypes,
-                    defaultextension=filetypes[0][1].split()[0].lstrip("*"),
-                    initialfile=default_name,
-                )
-            else:
-                ruta = _fd.askopenfilename(
-                    parent=root, title=titulo, filetypes=filetypes,
-                )
-        finally:
-            root.destroy()
-        return ruta or ""
+            default_ext = filetypes[0][1].split()[0].lstrip("*").lstrip(".")
+        except Exception:
+            default_ext = ""
+        return _dialogo_archivo_nativo(
+            save=(modo == "save"),
+            title=titulo,
+            filtros=filetypes,
+            default_name=default_name,
+            default_ext=default_ext,
+        )
 
     def _importar_archivo_dialog(nombre_local, descripcion, exts):
         def _picker():
@@ -6405,6 +6607,7 @@ def main(page: ft.Page):
         ("cuenta",     "Cuenta",     ft.Icons.ACCOUNT_CIRCLE_ROUNDED, tab_cuenta),
         ("reuniones",  "Reuniones",  ft.Icons.EVENT_AVAILABLE_ROUNDED, tab_reuniones),
         ("whatsapp",   "WhatsApp",   ft.Icons.CHAT_ROUNDED,           tab_whatsapp),
+        ("empresa",    "Empresa",    ft.Icons.BUSINESS_ROUNDED,       tab_empresa),
         ("firma",      "Firma",      ft.Icons.DRAW_ROUNDED,           tab_firma),
         ("servidores", "Servidores", ft.Icons.DNS_ROUNDED,            tab_servidores),
         ("apariencia", "Apariencia", ft.Icons.PALETTE_ROUNDED,        tab_apariencia),
@@ -6681,6 +6884,11 @@ def main(page: ft.Page):
             plataforma_actual[0]   = cfg_r.get("plataforma_reunion", "calendly")
             _refrescar_botones_plataforma()
             tf_url_whatsapp.value  = cfg_r.get("url_whatsapp", "")
+            tf_empresa_nombre.value   = cfg_r.get("empresa_nombre", "")
+            tf_empresa_web.value      = cfg_r.get("empresa_web", "")
+            tf_empresa_telefono.value = cfg_r.get("empresa_telefono", "")
+            tf_empresa_email.value    = cfg_r.get("empresa_email", "")
+            tf_empresa_whatsapp.value = cfg_r.get("empresa_whatsapp", "")
             contenedor_vista.content = vista_configuracion
             lbl_topbar_titulo.value  = "Configuración"
             btn_iniciar.visible      = False

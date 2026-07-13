@@ -546,25 +546,15 @@ def es_pedido_de_baja(asunto, cuerpo):
 CARPETA_HISTORIAL = os.path.join(CARPETA_ACTUAL, "historial")
 
 # Configuración de los correos a enviar
-ASUNTO       = "TECNOLOGÍA PARA EMPRESAS: MEJORAR LA PRODUCTIVIDAD Y BAJAR COSTOS"
+# El ASUNTO es lo único fijo del template; TODO el resto (botones, datos de
+# contacto, firma, logo, CC) se arma desde la config del usuario — nada
+# hardcodeado. Ver `preparar_correo` y los defaults `empresa_*` de config.
+ASUNTO       = "TE AYUDAMOS A BUSCAR LOS MEJORES RECURSOS PARA TU EMPRESA"
 CORREO_COPIA = ""
 URL_WHATSAPP = ""
 URL_CALENDLY = ""
 
 TIEMPO_MINIMO, TIEMPO_MAXIMO = 25, 45
-FUENTE_BASE = "font-family: 'Saira', Arial, sans-serif;"
-
-ACTIVOS_MULTIMEDIA = [
-    # (nombre_base, content_id) — se busca el archivo en este orden:
-    #   1. CARPETA_ACTUAL/<nombre_base>.png
-    #   2. CARPETA_ACTUAL/<nombre_base>.jpg
-    #   3. CARPETA_ASSETS/<nombre_base>.png
-    #   4. CARPETA_ASSETS/<nombre_base>.jpg
-    # Así el usuario puede usar PNG (mejor calidad, transparencia) o JPG
-    # indistintamente, y reemplazar la imagen sin tocar código.
-    ("Flyer", "flyer_campana"),
-    ("firma", "firma_intellihelp"),
-]
 
 
 # ==========================================
@@ -585,8 +575,16 @@ _CONFIG_DEFAULTS = {
     "logo_personalizado": "",     # path absoluto al logo del cliente
     "url_calendly":      "",      # URL botón cuando plataforma_reunion="calendly"
     "url_cal_com":       "",      # URL botón cuando plataforma_reunion="cal_com"
-    "plataforma_reunion": "calendly",  # 'calendly' | 'cal_com'
+    "plataforma_reunion": "cal_com",   # 'calendly' | 'cal_com'
     "url_whatsapp":      "",      # URL botón "WhatsApp"
+    # ── Datos de la empresa (se muestran en el correo de campaña) ──
+    # Configurables desde Configuración → Empresa. Vacío = no se muestra
+    # esa línea. Nada de esto está hardcodeado en el template.
+    "empresa_nombre":    "Intellihelp",
+    "empresa_web":       "intellihelp.tech",
+    "empresa_telefono":  "+54 11 7700-6868",
+    "empresa_email":     "info@intellihelp.tech",
+    "empresa_whatsapp":  "+54 9 11 5027-4827",
 }
 
 
@@ -815,221 +813,434 @@ def listar_dias_historial() -> list:
 # ==========================================
 # 6. ARMADO Y ENVÍO DEL CORREO
 # ==========================================
+_FF_CORREO = "'Saira',Arial,Helvetica,sans-serif"
+
+
+def _pilar_html(titulo, desc):
+    """HTML de un 'pilar de valor': chip verde con check + título + desc."""
+    _ff = _FF_CORREO
+    return (
+        '<table role="presentation" width="100%" border="0" cellpadding="0" '
+        'cellspacing="0" style="margin:0 0 14px 0;"><tr>'
+        '<td width="38" valign="top" style="padding-top:1px;">'
+        '<table role="presentation" border="0" cellpadding="0" cellspacing="0">'
+        '<tr><td width="26" height="26" align="center" valign="middle" '
+        'bgcolor="#8bc53f" style="width:26px;height:26px;border-radius:13px;'
+        'color:#ffffff;font-family:Arial,Helvetica,sans-serif;font-size:14px;'
+        'font-weight:bold;line-height:26px;">&#10003;</td></tr></table></td>'
+        '<td valign="top" style="padding-left:12px;">'
+        f'<div style="font-family:{_ff};font-size:15px;'
+        f'font-weight:bold;color:#241a33;line-height:1.45;">{titulo}</div>'
+        f'<div style="font-family:{_ff};font-size:14px;'
+        f'color:#6b6b76;line-height:1.5;">{desc}</div>'
+        '</td></tr></table>'
+    )
+
+
+def _boton_html(label, url, fill, stroke):
+    """Botón 'bulletproof' con VML para Outlook. `url`, `fill` (relleno) y
+    `stroke` (borde). Se renderiza igual en Gmail, Outlook, Apple Mail."""
+    _ff = _FF_CORREO
+    return (
+        '<!--[if mso]>'
+        '<v:roundrect xmlns:v="urn:schemas-microsoft-com:vml" '
+        'xmlns:w="urn:schemas-microsoft-com:office:word" '
+        f'href="{url}" style="height:50px;v-text-anchor:middle;width:300px;" '
+        f'arcsize="14%" strokecolor="{stroke}" fillcolor="{fill}">'
+        '<w:anchorlock/>'
+        f'<center style="color:#ffffff;font-family:Arial,sans-serif;'
+        f'font-size:16px;font-weight:bold;">{label}</center>'
+        '</v:roundrect>'
+        '<![endif]-->'
+        '<!--[if !mso]><!-- -->'
+        f'<a class="btn" href="{url}" target="_blank" '
+        f'style="background-color:{fill}; border:1px solid {stroke}; '
+        f'border-radius:8px; color:#ffffff; display:inline-block; '
+        f'font-family:{_ff}; font-size:16px; font-weight:bold; '
+        f'line-height:50px; text-align:center; text-decoration:none; '
+        f'width:300px; -webkit-text-size-adjust:none;">{label}</a>'
+        '<!--<![endif]-->'
+    )
+
+
+def _fila_contacto_html(label, value_html):
+    """Una fila del bloque de contacto: etiqueta (morado) + valor (negro)."""
+    _ff = _FF_CORREO
+    return (
+        '<tr>'
+        f'<td style="font-family:{_ff}; font-size:13px; color:#5b2d91; '
+        'font-weight:bold; text-transform:uppercase; letter-spacing:0.5px; '
+        f'padding:5px 0; width:110px; vertical-align:top;">{label}</td>'
+        f'<td style="font-family:{_ff}; font-size:14px; padding:5px 0; '
+        f'color:#241a33;">{value_html}</td>'
+        '</tr>'
+    )
+
+
 def preparar_correo(nombre, destino):
+    from html import escape as _esc
     correo_remitente = MI_CORREO()
+    _ff = _FF_CORREO
+
     msg = EmailMessage()
-    # CC: leemos del config (configurable desde la UI). Si está vacío,
-    # no agregamos cabecera Cc (Gmail no la incluye en el correo).
     cc_lista = _parsear_cc(get_config_value("correos_copia"))
-    # Asunto con nombre+apellido al final separado por "|" — facilita
-    # identificar el envío en la bandeja del remitente sin abrir el correo.
     msg["Subject"] = f"{ASUNTO} | {nombre}" if nombre else ASUNTO
     msg["From"]    = correo_remitente
     msg["To"]      = destino
     if cc_lista:
         msg["Cc"]  = ", ".join(cc_lista)
 
-    # URLs configurables por el usuario. Pueden estar vacías — en ese
-    # caso simplemente NO renderizamos ese botón (ni en HTML ni en
-    # texto plano). El sistema NO trae URLs hardcodeadas: cada cliente
-    # configura las suyas.
-    url_cal = URL_REUNION_CFG()
-    url_wsp = URL_WHATSAPP_CFG()
+    # List-Unsubscribe (anti-spam): atado al sistema de "responde BAJA".
+    if correo_remitente:
+        msg["List-Unsubscribe"] = f"<mailto:{correo_remitente}?subject=BAJA>"
 
-    # Nombre de pila (primera palabra) cuando hay nombre+apellido. Sirve
-    # como saludo personal "Hola Juan,". Fallback al nombre completo si
-    # no se puede extraer.
+    # ── TODO desde config del usuario (nada hardcodeado) ──
+    url_wsp     = (URL_WHATSAPP_CFG() or "").strip()       # botón WhatsApp
+    url_reunion = (URL_REUNION_CFG() or "").strip()        # botón Agendar reunión
+    emp_nombre  = (get_config_value("empresa_nombre")   or "").strip()
+    emp_web     = (get_config_value("empresa_web")      or "").strip()
+    emp_tel     = (get_config_value("empresa_telefono") or "").strip()
+    emp_email   = (get_config_value("empresa_email")    or "").strip()
+    emp_wsp     = (get_config_value("empresa_whatsapp") or "").strip()
+    marca = emp_nombre or "nuestra empresa"
+
+    # Firma configurada (texto o imagen) — se muestra al cierre si existe.
+    firma_tipo   = (get_config_value("firma_tipo") or "texto").lower()
+    firma_texto  = (get_config_value("firma") or "").strip()
+    firma_imagen = (get_config_value("firma_imagen") or "").strip()
+
+    # Nombre de pila para el saludo personal "Hola Juan,".
     nombre_pila = (nombre or "").strip().split()[0] if (nombre or "").strip() else ""
     saludo = nombre_pila if nombre_pila else (nombre or "Cliente")
 
-    # Texto plano: armamos el bloque de "CTA" sólo con las líneas que
-    # tengan URL. Si no hay ninguna, queda sin bloque de CTA (el correo
-    # sigue siendo válido como propuesta escrita).
-    cta_lineas = []
-    if url_cal:
-        cta_lineas.append(f"Agendá una reunión: {url_cal}")
+    # ── Logo: personalizado del config, o ITH-logo.png del bundle ──
+    logo_cfg = (get_config_value("logo_personalizado") or "").strip()
+    logo_path = None
+    if logo_cfg and os.path.exists(logo_cfg):
+        logo_path = logo_cfg
+    else:
+        for _carpeta in (CARPETA_ACTUAL, CARPETA_ASSETS):
+            for _nb in ("ITH-logo.png", "logo-app.png"):
+                _p = os.path.join(_carpeta, _nb)
+                if os.path.exists(_p):
+                    logo_path = _p
+                    break
+            if logo_path:
+                break
+
+    # ── Botones condicionales según config ──
+    #   ambos configurados → 2 botones · sólo uno → 1 botón · ninguno → 0
+    botones = []
     if url_wsp:
-        cta_lineas.append(f"WhatsApp: {url_wsp}")
-    bloque_cta_texto = ("\n".join(cta_lineas) + "\n\n") if cta_lineas else ""
+        botones.append(_boton_html("Contáctanos por WhatsApp", url_wsp,
+                                    "#25D366", "#1EBE57"))
+    if url_reunion:
+        botones.append(_boton_html("Agendar reunión", url_reunion,
+                                    "#5b2d91", "#4a2277"))
+    _sep_btn = '<div style="font-size:0; line-height:12px;">&nbsp;</div>'
+    botones_html = _sep_btn.join(botones)
+
+    # ── Bloque de contacto (sólo las líneas que estén configuradas) ──
+    filas = []
+    if emp_web:
+        web_url = emp_web if emp_web.lower().startswith("http") else "https://" + emp_web
+        filas.append(_fila_contacto_html(
+            "Web",
+            f'<a href="{web_url}" target="_blank" style="color:#241a33; '
+            f'font-weight:bold; text-decoration:none;">{_esc(emp_web)}</a>'))
+    if emp_wsp:
+        filas.append(_fila_contacto_html(
+            "WhatsApp",
+            f'<span style="font-weight:bold;">{_esc(emp_wsp)}</span>'))
+    if emp_tel:
+        filas.append(_fila_contacto_html(
+            "Teléfono",
+            f'<span style="font-weight:bold;">{_esc(emp_tel)}</span>'))
+    if emp_email:
+        filas.append(_fila_contacto_html(
+            "Email",
+            f'<a href="mailto:{_esc(emp_email)}" style="color:#241a33; '
+            f'font-weight:bold; text-decoration:none;">{_esc(emp_email)}</a>'))
+
+    contacto_html = ""
+    if filas:
+        contacto_html = (
+            '<tr><td class="px" style="padding:22px 44px 8px 44px;">'
+            '<table role="presentation" width="100%" border="0" cellpadding="0" '
+            'cellspacing="0" style="border:1px solid #ececf2; border-radius:10px;">'
+            '<tr><td style="padding:20px 26px;">'
+            '<table role="presentation" width="100%" border="0" cellpadding="0" '
+            'cellspacing="0">' + "".join(filas) + '</table>'
+            '</td></tr></table></td></tr>'
+        )
+
+    # ── Firma configurada (imagen o texto) ──
+    firma_img_path = None
+    if firma_tipo == "imagen" and firma_imagen and os.path.exists(firma_imagen):
+        firma_bloque = ('<img src="cid:firma_usuario" alt="Firma" '
+                        'style="max-width:100%; height:auto; display:block; '
+                        'border:0; margin-top:10px;" />')
+        firma_img_path = firma_imagen
+    elif firma_tipo == "texto" and firma_texto:
+        firma_bloque = (
+            f'<div style="margin-top:8px; font-family:{_ff}; font-size:14px; '
+            f'line-height:1.5; color:#4a4a55;">'
+            + _esc(firma_texto).replace("\n", "<br />") + '</div>')
+    elif emp_nombre:
+        firma_bloque = (f'<p style="margin:6px 0 0 0; font-family:{_ff}; '
+                        f'font-size:16px; font-weight:bold; color:#5b2d91;">'
+                        f'{_esc(emp_nombre)}</p>')
+    else:
+        firma_bloque = ""
+
+    firma_area_html = (
+        '<tr><td class="px" style="padding:22px 44px 34px 44px;">'
+        f'<p style="margin:0; font-family:{_ff}; font-size:15px; '
+        f'color:#4a4a55;">Saludos cordiales,</p>'
+        + firma_bloque +
+        '</td></tr>'
+    )
+
+    # ── Versión texto plano (fallback para clientes sin HTML) ──
+    cta_lineas_txt = []
+    if url_wsp:
+        cta_lineas_txt.append(f"  Contáctanos por WhatsApp:  {url_wsp}")
+    if url_reunion:
+        cta_lineas_txt.append(f"  Agendar reunión:           {url_reunion}")
+    bloque_cta_txt = ("\n".join(cta_lineas_txt) + "\n\n") if cta_lineas_txt else ""
+
+    contacto_txt_lineas = []
+    if emp_web:
+        contacto_txt_lineas.append(f"  Web:       {emp_web}")
+    if emp_wsp:
+        contacto_txt_lineas.append(f"  WhatsApp:  {emp_wsp}")
+    if emp_tel:
+        contacto_txt_lineas.append(f"  Teléfono:  {emp_tel}")
+    if emp_email:
+        contacto_txt_lineas.append(f"  Email:     {emp_email}")
+    bloque_contacto_txt = ""
+    if contacto_txt_lineas:
+        bloque_contacto_txt = (
+            "------------------------------------------------------------\n"
+            + "\n".join(contacto_txt_lineas) + "\n"
+            "------------------------------------------------------------\n\n")
+
+    firma_txt = ""
+    if firma_tipo == "texto" and firma_texto:
+        firma_txt = firma_texto + "\n"
+    elif emp_nombre:
+        firma_txt = emp_nombre + "\n"
 
     cuerpo_texto = (
         f"Hola {saludo},\n\n"
-        "En INTELLIHELP, ayudamos a empresas como la tuya a transformar sus procesos "
-        "internos para lograr más resultados con menor esfuerzo y optimizando el "
-        "presupuesto.\n\n"
-        "Podemos impulsar tu crecimiento corporativo a través de:\n\n"
-        "- TRANSFORMACIÓN DIGITAL: Modernizamos tu infraestructura tecnológica para "
-        "que operes con mayor agilidad.\n"
-        "- Automatización con Inteligencia Artificial: Eliminamos tareas manuales "
-        "repetitivas para que tu equipo se enfoque en lo que realmente importa.\n"
-        "- Desarrollo de Software Llave en Mano: Implementamos herramientas a medida "
-        "que multiplican tu productividad.\n"
-        "- Consultoría Técnica Estratégica: Identificamos cuellos de botella y "
-        "establecemos mejoras concretas.\n"
-        "- Sistemas Integrados de Seguridad: Control de acceso y videovigilancia "
-        "conectados directamente a tu software de liquidaciones.\n"
-        "- TALENT ACQUISITION IT: Encontramos los recursos técnicos clave que tu "
-        "equipo necesita, ya sea en tu nómina o en la nuestra.\n\n"
-        "Sabemos que cada negocio tiene desafíos únicos. Por eso, te propongo una "
-        "breve llamada exploratoria de 15 minutos, sin compromisos, para entender "
-        "tu escenario actual y contarte cómo podemos aportar valor.\n\n"
-        f"{bloque_cta_texto}"
-        "¿Tienes disponibilidad esta semana para conversar?\n\n"
-        "Quedo a tu entera disposición.\nSaludos cordiales."
+        "LOS MEJORES RECURSOS PARA TU EMPRESA\n"
+        "Outsourcing y selección de personal\n\n"
+        f"En {marca} contamos con más de 15 años ayudando a las empresas a "
+        "completar sus equipos de trabajo. Nos ocupamos del outsourcing, la "
+        "búsqueda y la selección de personal: vos definís el perfil y "
+        "nosotros te presentamos a los candidatos indicados.\n\n"
+        "  + Outsourcing de personal: tercerizá la búsqueda, selección y "
+        "administración de tu equipo.\n"
+        "  + Selección a medida: encontramos los recursos que encajan con "
+        "tu operación.\n"
+        "  + Más de 15 años de experiencia respaldando cada proceso.\n\n"
+        "Contáctanos, te asesoramos sin cargo.\n\n"
+        f"{bloque_cta_txt}"
+        f"{bloque_contacto_txt}"
+        "Saludos cordiales,\n"
+        f"{firma_txt}\n"
+        "Si no deseas recibir más información, responde este correo con la "
+        'palabra "BAJA".'
     )
     msg.set_content(cuerpo_texto)
 
-    # ── Firma como imagen ──
-    # Si el usuario configuró firma_imagen lo usamos; sino, se usa el
-    # firma.jpg que está en CARPETA_ACTUAL o en el bundle de assets.
-    firma_html = """
-    <div style="margin-top: 8px;">
-        <img src="cid:firma_intellihelp" alt="Firma" style="max-width: 400px; height: auto; border: none; display: block;">
-    </div>
-    """
-
-    # ── Bloque de botones (CTA) — condicional ──
-    # Cada botón se renderiza sólo si su URL está configurada.
-    # Si no hay NINGUNA URL configurada, no aparece el bloque entero
-    # (sólo el texto introductorio). Así nada queda hardcodeado del
-    # lado del template para distintos clientes.
-    botones_html_partes = []
-    if url_wsp:
-        botones_html_partes.append(f'''
-                                            <td align="center" style="border-radius: 6px;" bgcolor="#25D366">
-                                                <a href="{url_wsp}" target="_blank" style="font-size: 14px; font-family: Arial, sans-serif; color: #ffffff; text-decoration: none; border-radius: 6px; padding: 12px 22px; border: 1px solid #25D366; display: inline-block; font-weight: bold;">
-                                                    Conversar por WhatsApp
-                                                </a>
-                                            </td>''')
-    if url_wsp and url_cal:
-        botones_html_partes.append('                                            <td width="15"></td>')
-    if url_cal:
-        botones_html_partes.append(f'''
-                                            <td align="center" style="border-radius: 6px;" bgcolor="#0052cc">
-                                                <a href="{url_cal}" target="_blank" style="font-size: 14px; font-family: Arial, sans-serif; color: #ffffff; text-decoration: none; border-radius: 6px; padding: 12px 22px; border: 1px solid #0052cc; display: inline-block; font-weight: bold;">
-                                                    Agendar Reunión (15 min)
-                                                </a>
-                                            </td>''')
-
-    if botones_html_partes:
-        bloque_botones = (
-            '<table cellspacing="0" cellpadding="0" style="margin: 0 auto;">'
-            '<tr>' + "\n".join(botones_html_partes) + '</tr></table>'
+    # ── Logo (imagen CID) con fallback a wordmark si se bloquea ──
+    if logo_path:
+        logo_html = (
+            '<img src="cid:logo_empresa" alt="' + _esc(marca) + '" height="42" '
+            'style="height:42px;width:auto;display:block;border:0;outline:none;'
+            'text-decoration:none;" />'
         )
     else:
-        bloque_botones = ""
+        logo_html = (f"<span style=\"font-family:{_ff};font-size:22px;"
+                     "font-weight:bold;color:#5b2d91;letter-spacing:0.5px;\">"
+                     f"{_esc((emp_nombre or 'INTELLIHELP').upper())}</span>")
 
-    html = f"""
-    <html>
-        <body style="margin: 0; padding: 0; background-color: #f4f7f6; font-family: 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; color: #333333;">
-            <table width="100%" cellpadding="0" cellspacing="0" style="background-color: #f4f7f6; padding: 40px 15px;">
-                <tr>
-                    <td align="center">
-                        <table width="100%" cellpadding="0" cellspacing="0" style="max-width: 600px; background-color: #ffffff; border-radius: 12px; overflow: hidden; box-shadow: 0 8px 20px rgba(0,0,0,0.06);">
+    preheader = ("Más de 15 años en outsourcing y selección de personal. "
+                 "Asesoría sin cargo.")
 
-                            <tr>
-                                <td style="padding: 45px 45px 25px 45px; text-align: left;">
-                                    <p style="margin: 0 0 15px 0; font-size: 18px; color: #1a1a1a; font-weight: 600;">Hola {saludo},</p>
-                                    <p style="margin: 0 0 15px 0; font-size: 15px; line-height: 1.6; color: #4a4a4a;">
-                                        En <strong style="color: #663399;">INTELLIHELP</strong>, ayudamos a empresas a transformar sus procesos internos para <strong style="color: #663399;">lograr más resultados con menor esfuerzo</strong> y optimizando el presupuesto mediante innovación tecnológica.
-                                    </p>
-                                    <p style="margin: 0 0 10px 0; font-size: 15px; line-height: 1.6; color: #1a1a1a; font-weight: 600;">
-                                        Podemos impulsar tu crecimiento corporativo a través de:
-                                    </p>
-                                    <ul style="margin: 0 0 15px 0; padding-left: 20px; font-size: 14px; line-height: 1.6; color: #4a4a4a;">
-                                        <li style="margin-bottom: 8px;"><b style="color: #663399;">TRANSFORMACIÓN DIGITAL:</b> Modernizamos tu infraestructura tecnológica para que operes con mayor agilidad.</li>
-                                        <li style="margin-bottom: 8px;"><b style="color: #663399;">AUTOMATIZACIÓN CON I.A.:</b> Eliminamos tareas manuales repetitivas para que tu equipo se enfoque en lo estratégico.</li>
-                                        <li style="margin-bottom: 8px;"><b style="color: #663399;">SOFTWARE LLAVE EN MANO:</b> Implementamos herramientas a medida que multiplican directamente tu productividad.</li>
-                                        <li style="margin-bottom: 8px;"><b style="color: #663399;">CONSULTORÍA TÉCNICA:</b> Identificamos cuellos de botella y establecemos un plan de mejoras concretas.</li>
-                                        <li style="margin-bottom: 8px;"><b style="color: #663399;">SISTEMAS INTEGRADOS DE SEGURIDAD:</b> Control de acceso y videovigilancia conectados a tu software de liquidaciones.</li>
-                                        <li style="margin-bottom: 8px;"><b style="color: #663399;">TALENT ACQUISITION IT:</b> Encontramos los recursos técnicos clave que tu proyecto necesita para escalar.</li>
-                                    </ul>
-                                </td>
-                            </tr>
+    # Saira (Google Fonts) para clientes que soportan fuentes web; el resto
+    # cae a Arial. El @import va primero dentro del <style>.
+    estilos = (
+        "<style type=\"text/css\">"
+        "@import url('https://fonts.googleapis.com/css2?"
+        "family=Saira:wght@400;500;600;700&display=swap');"
+        "@media only screen and (max-width:620px){"
+        ".cont{width:100%!important;}"
+        ".px{padding-left:26px!important;padding-right:26px!important;}"
+        ".hero-px{padding-left:26px!important;padding-right:26px!important;}"
+        ".h1{font-size:25px!important;line-height:1.25!important;}"
+        ".btn{width:100%!important;}"
+        "}"
+        "</style>"
+    )
 
-                            <tr>
-                                <td align="center" style="padding: 0;">
-                                    <img src="cid:flyer_campana" alt="Propuesta Intellihelp" style="width: 100%; max-width: 600px; height: auto; display: block; border: none; margin: 0; padding: 0;">
-                                </td>
-                            </tr>
+    # Bloque CTA (headline + subtítulo + botones si hay).
+    cta_html = (
+        '<tr><td class="px" style="padding:14px 44px 8px 44px;">'
+        '<table role="presentation" width="100%" border="0" cellpadding="0" '
+        'cellspacing="0" style="background-color:#f5f3fa; border-radius:12px;">'
+        '<tr><td align="center" style="padding:28px 26px 30px 26px;">'
+        f'<p style="margin:0 0 4px 0; font-family:{_ff}; font-size:21px; '
+        f'font-weight:bold; color:#5b2d91;">Contáctanos, te asesoramos sin cargo.</p>'
+        f'<p style="margin:0 0 {"22px" if botones_html else "0"} 0; '
+        f'font-family:{_ff}; font-size:15px; color:#6b6b76;">'
+        'Conversemos hoy mismo cómo podemos sumar a tu equipo.</p>'
+        + botones_html +
+        '</td></tr></table></td></tr>'
+    )
 
-                            <tr>
-                                <td style="padding: 25px 45px 15px 45px; text-align: center;">
-                                    <p style="margin: 0 0 20px 0; font-size: 15px; line-height: 1.6; color: #4a4a4a; text-align: left;">
-                                        Sabemos que cada negocio tiene desafíos únicos. Por eso, te propongo una <strong style="color: #663399;">breve llamada exploratoria de 15 minutos</strong>, sin compromisos, simplemente para escuchar tu escenario actual y contarte cómo podemos aportar valor.
-                                    </p>
-                                    {bloque_botones}
-                                </td>
-                            </tr>
+    html = f"""<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd">
+<html xmlns="http://www.w3.org/1999/xhtml" xmlns:v="urn:schemas-microsoft-com:vml" xmlns:o="urn:schemas-microsoft-com:office:office" lang="es">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge" />
+    <meta name="x-apple-disable-message-reformatting" />
+    <title>{_esc(marca)}</title>
+    <!--[if !mso]><!-->
+    <link href="https://fonts.googleapis.com/css2?family=Saira:wght@400;500;600;700&display=swap" rel="stylesheet" />
+    <!--<![endif]-->
+    <!--[if mso]>
+    <style type="text/css">table{{border-collapse:collapse;}} body,table,td{{font-family:Arial,Helvetica,sans-serif !important;}}</style>
+    <![endif]-->
+    {estilos}
+</head>
+<body style="margin:0; padding:0; background-color:#eef0f4; -webkit-text-size-adjust:100%; -ms-text-size-adjust:100%;">
+    <div style="display:none; max-height:0; overflow:hidden; mso-hide:all; font-size:1px; line-height:1px; color:#eef0f4; opacity:0;">
+        {preheader}&#847;&zwnj;&nbsp;&#847;&zwnj;&nbsp;&#847;&zwnj;&nbsp;&#847;&zwnj;&nbsp;&#847;&zwnj;&nbsp;
+    </div>
 
-                            <tr>
-                                <td style="padding: 15px 45px 45px 45px; text-align: left;">
-                                    <p style="margin: 0 0 10px 0; font-size: 15px; color: #1a1a1a; font-weight: 500;">¿Tienes disponibilidad esta semana?</p>
-                                    <p style="margin: 0; font-size: 15px; color: #4a4a4a;">Quedo a tu entera disposición,<br>Saludos cordiales.</p>
-                                    {firma_html}
-                                </td>
-                            </tr>
-                        </table>
+    <table role="presentation" width="100%" border="0" cellpadding="0" cellspacing="0" style="background-color:#eef0f4;">
+        <tr>
+            <td align="center" style="padding:34px 12px;">
 
-                        <table width="100%" cellpadding="0" cellspacing="0" style="max-width: 600px;">
-                            <tr>
-                                <td align="center" style="padding: 25px 20px; font-size: 12px; color: #999999; line-height: 1.5;">
-                                    Este mensaje es una comunicación corporativa de Intellihelp.<br>
-                                    Si no deseas recibir más información sobre nuestros servicios, responde este correo con la palabra "BAJA".
-                                </td>
-                            </tr>
-                        </table>
-                    </td>
-                </tr>
-            </table>
-        </body>
-    </html>
-    """
+                <table role="presentation" class="cont" width="600" border="0" cellpadding="0" cellspacing="0" style="width:600px; max-width:600px; background-color:#ffffff; border-radius:14px; overflow:hidden; box-shadow:0 6px 24px rgba(36,26,51,0.10);">
+
+                    <!-- Barra bicolor superior -->
+                    <tr>
+                        <td style="padding:0; font-size:0; line-height:0;">
+                            <table role="presentation" width="100%" border="0" cellpadding="0" cellspacing="0">
+                                <tr>
+                                    <td width="66%" style="height:6px; background-color:#5b2d91; font-size:0; line-height:0;">&nbsp;</td>
+                                    <td width="34%" style="height:6px; background-color:#8bc53f; font-size:0; line-height:0;">&nbsp;</td>
+                                </tr>
+                            </table>
+                        </td>
+                    </tr>
+
+                    <!-- Header: logo + web -->
+                    <tr>
+                        <td class="px" style="padding:26px 40px 22px 40px;">
+                            <table role="presentation" width="100%" border="0" cellpadding="0" cellspacing="0">
+                                <tr>
+                                    <td align="left" valign="middle">{logo_html}</td>
+                                    <td align="right" valign="middle" style="font-family:{_ff}; font-size:13px; color:#9a9aa6; letter-spacing:0.3px;">{_esc(emp_web)}</td>
+                                </tr>
+                            </table>
+                        </td>
+                    </tr>
+
+                    <!-- Hero -->
+                    <tr>
+                        <td class="hero-px" bgcolor="#5b2d91" style="background-color:#5b2d91; padding:36px 44px 38px 44px;">
+                            <p style="margin:0 0 12px 0; font-family:{_ff}; font-size:12px; font-weight:bold; letter-spacing:2px; text-transform:uppercase; color:#a8e05f;">
+                                Outsourcing y selección de personal
+                            </p>
+                            <h1 class="h1" style="margin:0 0 14px 0; font-family:{_ff}; font-size:30px; line-height:1.22; font-weight:bold; color:#ffffff;">
+                                El personal indicado para tu empresa, cuando lo necesitás.
+                            </h1>
+                            <p style="margin:0; font-family:{_ff}; font-size:16px; line-height:1.6; color:#e3d8f2;">
+                                Más de <strong style="color:#ffffff;">15 años</strong> en outsourcing y selección de personal para empresas como la tuya.
+                            </p>
+                        </td>
+                    </tr>
+
+                    <!-- Cuerpo -->
+                    <tr>
+                        <td class="px" style="padding:34px 44px 6px 44px;">
+                            <p style="margin:0 0 16px 0; font-family:{_ff}; font-size:16px; line-height:1.65; color:#4a4a55;">
+                                Hola <strong style="color:#241a33;">{saludo}</strong>,
+                            </p>
+                            <p style="margin:0 0 26px 0; font-family:{_ff}; font-size:16px; line-height:1.7; color:#4a4a55;">
+                                En <strong style="color:#5b2d91;">{_esc(marca)}</strong> contamos con <strong>más de 15 años</strong> ayudando a las empresas a <strong>completar sus equipos de trabajo</strong>. Nos ocupamos del outsourcing, la búsqueda y la selección de personal: <em>vos definís el perfil y nosotros te presentamos a los candidatos indicados.</em>
+                            </p>
+                        </td>
+                    </tr>
+
+                    <!-- Pilares -->
+                    <tr>
+                        <td class="px" style="padding:0 44px 6px 44px;">
+                            {_pilar_html("Outsourcing de personal", "Tercerizá la búsqueda, selección y administración de tu equipo.")}
+                            {_pilar_html("Selección a medida", "Encontramos los recursos que encajan con tu operación.")}
+                            {_pilar_html("Más de 15 años de experiencia", "Una trayectoria que respalda cada proceso.")}
+                        </td>
+                    </tr>
+
+                    {cta_html}
+
+                    {contacto_html}
+
+                    {firma_area_html}
+                </table>
+
+                <!-- Footer -->
+                <table role="presentation" class="cont" width="600" border="0" cellpadding="0" cellspacing="0" style="width:600px; max-width:600px;">
+                    <tr>
+                        <td style="padding:22px 40px 6px 40px; text-align:center; font-family:{_ff}; font-size:12px; line-height:1.6; color:#9a9aa6;">
+                            <strong style="color:#6b6b76;">{_esc(marca)}</strong> &nbsp;·&nbsp; Outsourcing y selección de personal<br />
+                            Esta es una comunicación corporativa de {_esc(marca)}.
+                        </td>
+                    </tr>
+                    <tr>
+                        <td style="padding:2px 40px 26px 40px; text-align:center; font-family:{_ff}; font-size:12px; line-height:1.6; color:#9a9aa6;">
+                            Si no deseas recibir más información, responde este correo con la palabra <strong style="color:#6b6b76;">"BAJA"</strong>.
+                        </td>
+                    </tr>
+                </table>
+
+            </td>
+        </tr>
+    </table>
+</body>
+</html>"""
     msg.add_alternative(html, subtype="html")
+    _html_part = msg.get_payload()[1]
 
-    # ── Resolución de rutas para Flyer y firma ──
-    # Prioridad para cada activo:
-    #   1) firma personalizada del config (sólo para firma_intellihelp)
-    #   2) Archivo en CARPETA_ACTUAL — al lado del .exe, lo puede
-    #      reemplazar el usuario sin recompilar. Prueba .png primero
-    #      (mejor calidad), luego .jpg.
-    #   3) Archivo en CARPETA_ASSETS (default del bundle).
-    firma_user = (get_config_value("firma_imagen") or "").strip()
-
-    def _resolver_activo(nombre_base):
-        for carpeta in (CARPETA_ACTUAL, CARPETA_ASSETS):
-            for ext in (".png", ".jpg", ".jpeg"):
-                ruta = os.path.join(carpeta, nombre_base + ext)
-                if os.path.exists(ruta):
-                    return ruta
-        return None
-
-    activos = []
-    for nombre_base, id_imagen in ACTIVOS_MULTIMEDIA:
-        ruta_final = None
-        if id_imagen == "firma_intellihelp" and firma_user and os.path.exists(firma_user):
-            ruta_final = firma_user
-        else:
-            ruta_final = _resolver_activo(nombre_base)
-        if ruta_final:
-            activos.append((ruta_final, id_imagen))
-
-    for ruta, id_imagen in activos:
+    # ── Adjuntar logo y firma-imagen como inline (CID) del HTML ──
+    if logo_path:
         try:
-            with open(ruta, "rb") as img:
-                datos = img.read()
+            with open(logo_path, "rb") as _f:
+                _datos = _f.read()
+            _ext = os.path.splitext(logo_path)[1].lower().lstrip(".") or "png"
+            if _ext == "jpg":
+                _ext = "jpeg"
+            _html_part.add_related(_datos, maintype="image", subtype=_ext,
+                                   cid="<logo_empresa>")
         except Exception:
-            continue
-        ext = os.path.splitext(ruta)[1].lower()
-        tipo = (
-            "image/svg+xml"
-            if ext == ".svg"
-            else mimetypes.guess_type(ruta)[0] or "application/octet-stream"
-        )
-        t, st = tipo.split("/")
-        msg.get_payload()[1].add_related(
-            datos, maintype=t, subtype=st, cid=f"<{id_imagen}>"
-        )
+            pass
+
+    if firma_img_path:
+        try:
+            with open(firma_img_path, "rb") as _f:
+                _fdatos = _f.read()
+            _fext = os.path.splitext(firma_img_path)[1].lower().lstrip(".") or "png"
+            if _fext == "jpg":
+                _fext = "jpeg"
+            _html_part.add_related(_fdatos, maintype="image", subtype=_fext,
+                                   cid="<firma_usuario>")
+        except Exception:
+            pass
 
     return msg
 

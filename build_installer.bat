@@ -80,14 +80,25 @@ echo.
 echo [4/4] Empaquetando instalador con Inno Setup...
 echo.
 
-set "ISCC=C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
-if not exist "%ISCC%" set "ISCC=C:\Program Files\Inno Setup 6\ISCC.exe"
+REM Buscar ISCC.exe en las ubicaciones habituales (v7 y v6, sistema y
+REM per-usuario de winget en %LOCALAPPDATA%\Programs). Toma el primero.
+set "ISCC="
+for %%P in (
+    "%LOCALAPPDATA%\Programs\Inno Setup 7\ISCC.exe"
+    "%LOCALAPPDATA%\Programs\Inno Setup 6\ISCC.exe"
+    "C:\Program Files (x86)\Inno Setup 7\ISCC.exe"
+    "C:\Program Files\Inno Setup 7\ISCC.exe"
+    "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+    "C:\Program Files\Inno Setup 6\ISCC.exe"
+) do if not defined ISCC if exist "%%~P" set "ISCC=%%~P"
 
-if not exist "%ISCC%" (
-    echo  ERROR: No se encontro Inno Setup.
-    echo  Descargalo gratis de: https://jrsoftware.org/isdl.php
+if not defined ISCC (
+    echo  ERROR: No se encontro Inno Setup (ISCC.exe).
+    echo  Instalalo con:  winget install JRSoftware.InnoSetup.7
+    echo  o descargalo de: https://jrsoftware.org/isdl.php
     goto :error
 )
+echo  Inno Setup: "%ISCC%"
 
 "%ISCC%" "installer\pulsemail.iss"
 if errorlevel 1 (

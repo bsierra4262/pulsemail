@@ -2,6 +2,10 @@
 
 Formato basado en [Keep a Changelog](https://keepachangelog.com/) y [SemVer](https://semver.org/).
 
+## [1.2.0] — 2026-07-13  _minor_
+
+Fix critico backups: reemplazo dialogos tkinter (fallaban en el .exe por tcl/tk no empaquetado) por dialogo nativo Win32 comdlg32 -> importar/exportar funciona. Nueva campana de correo con diseno profesional (hero, pilares, Saira, botones VML anti-Outlook) y 100% config-driven: botones WhatsApp + Agendar reunion condicionales segun config, firma configurada sale en la campana, datos de empresa en nueva pestana Configuracion -> Empresa. Anti-spam: header List-Unsubscribe atado a BAJA. Nada hardcodeado salvo el asunto.
+
 ## [1.1.4] — 2026-05-21  _patch_
 
 **Fix crítico**: la app crasheaba al construir el Dropdown 'Items por página' de Lista Negra con `Dropdown.__init__() got an unexpected keyword argument 'on_change'`. En Flet 0.84 el Dropdown NO acepta `on_change` en `__init__` — sólo se puede setear como atributo después de instanciar. Verificado por smoke test: el resto de widgets (Checkbox, IconButton, Container, ElevatedButton, TextField) sí aceptan callbacks en init, sólo Dropdown es la excepción. Agregué un smoke test transitorio que construye main(page) con un Page mockado para validar que no haya otros errores similares — pasó: cero kwargs inválidos en el resto del código.
