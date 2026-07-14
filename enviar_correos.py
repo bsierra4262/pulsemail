@@ -3288,6 +3288,51 @@ def _html_a_markdown(html_str):
     return s.strip()
 
 
+# ── Detección de REBOTES (bounces) — NO son respuestas de clientes ──
+# Un rebote llega desde postmaster/mailer-daemon (o con asunto tipo
+# "Undeliverable") y trae In-Reply-To apuntando a nuestro correo, así que
+# el detector lo tomaría como "respuesta". Lo interceptamos: el correo
+# afectado va DIRECTO a lista negra (es problema del dominio destino, no
+# una respuesta real) y NO aparece en el panel Respuestas.
+_RE_ASUNTO_REBOTE = re.compile(
+    r"(undeliverable|undelivered|delivery status notification|"
+    r"delivery (?:has )?failed|mail delivery (?:failed|failure|subsystem|system)|"
+    r"returned mail|failure notice|no se pudo entregar|correo no entregado|"
+    r"mensaje no entregado|devoluci[oó]n de correo)",
+    re.IGNORECASE,
+)
+
+
+def _es_remitente_rebote(rem):
+    """True si el From es un notificador de rebotes (postmaster/mailer-daemon)."""
+    r = (rem or "").lower()
+    return ("postmaster" in r or "mailer-daemon" in r or "mail-daemon" in r
+            or "maildaemon" in r or "daemon" in r)
+
+
+def _es_asunto_rebote(asunto):
+    return bool(_RE_ASUNTO_REBOTE.search(asunto or ""))
+
+
+def _extraer_email_rebotado(cuerpo, mi_correo, contactos):
+    """Extrae del cuerpo del bounce el correo del destinatario que rebotó
+    (el primero que no sea postmaster/daemon ni el nuestro, y que —si hay
+    contactos cargados— pertenezca a la campaña)."""
+    mi = (mi_correo or "").lower()
+    for c in re.findall(
+        r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+", cuerpo or ""
+    ):
+        cl = c.lower()
+        if "daemon" in cl or "postmaster" in cl:
+            continue
+        if cl == mi:
+            continue
+        if contactos and cl not in contactos:
+            continue
+        return cl
+    return ""
+
+
 def detectar_respuestas_y_calendly(dias=30, forzar_full=False):
     """
     Busca por IMAP en los últimos `dias`:
@@ -3311,8 +3356,20 @@ def detectar_respuestas_y_calendly(dias=30, forzar_full=False):
         return _cargar_respuestas_archivo()
 
     data = _cargar_respuestas_archivo()
+
+    # ── Limpieza: sacar del panel Respuestas los REBOTES (postmaster/
+    #    mailer-daemon) que se hayan colado antes. No son respuestas de
+    #    clientes — el correo afectado va a lista negra, no acá. ──
+    _resp_limpias = [
+        r for r in data["respuestas"]
+        if not _es_remitente_rebote(r.get("from"))
+    ]
+    if len(_resp_limpias) != len(data["respuestas"]):
+        data["respuestas"] = _resp_limpias
+
     vistos_resp = {(r.get("uid"), r.get("from")) for r in data["respuestas"]}
     vistos_cal  = {c.get("uid") for c in data["calendly"]}
+    vistos_rebote = set(data.get("_rebotes_vistos", []))
 
     # IDs que mandamos NOSOTROS. Si una respuesta tiene In-Reply-To o
     # References apuntando a uno de estos IDs, ES una respuesta a un
@@ -3420,10 +3477,10 @@ def detectar_respuestas_y_calendly(dias=30, forzar_full=False):
             # PASO 2: Decisión local — qué UIDs necesitan cuerpo (RFC822)
             # ──────────────────────────────────────────────────────────
             mi_correo = (MI_CORREO() or "").lower()
-            uids_necesita_cuerpo = []   # [(uid_b, "calendly"|"respuesta", info)]
+            uids_necesita_cuerpo = []   # [(uid_b, "calendly"|"respuesta"|"rebote", info)]
             for uid_b, info in info_por_uid.items():
                 rem = info["remitente"]
-                if not rem or "daemon" in rem:
+                if not rem:
                     continue
                 if rem == mi_correo:
                     continue
@@ -3438,6 +3495,18 @@ def detectar_respuestas_y_calendly(dias=30, forzar_full=False):
                                 respuesta_hilo = True
                                 break
                 info["via_hilo"] = respuesta_hilo
+
+                # ── REBOTE (bounce): postmaster/mailer-daemon, o un NDR de
+                #    "no entregable" en respuesta a un correo nuestro. NO es
+                #    una respuesta del cliente → el correo afectado va DIRECTO
+                #    a lista negra y NO aparece en el panel Respuestas. ──
+                if _es_remitente_rebote(rem) or (
+                    respuesta_hilo and _es_asunto_rebote(info["asunto"])
+                ):
+                    if info["msg_id"] in vistos_rebote:
+                        continue
+                    uids_necesita_cuerpo.append((uid_b, "rebote", info))
+                    continue
 
                 plataforma = _identificar_plataforma_reunion(rem)
                 if plataforma:
@@ -3483,6 +3552,7 @@ def detectar_respuestas_y_calendly(dias=30, forzar_full=False):
             # ──────────────────────────────────────────────────────────
             # PASO 4: Procesamiento local (sin más IMAP)
             # ──────────────────────────────────────────────────────────
+            rebotados_nuevos = []   # correos que rebotaron → lista negra (lote)
             for uid_b, tipo, info in uids_necesita_cuerpo:
                 cuerpo = cuerpos_por_uid.get(uid_b, "")
                 rem = info["remitente"]
@@ -3509,6 +3579,13 @@ def detectar_respuestas_y_calendly(dias=30, forzar_full=False):
                         "invitado":   invitado,
                     })
                     vistos_cal.add(msg_id)
+                elif tipo == "rebote":
+                    # El correo afectado va DIRECTO a lista negra (problema
+                    # del dominio destino), NO al panel Respuestas.
+                    rebotado = _extraer_email_rebotado(cuerpo, mi_correo, contactos)
+                    if rebotado:
+                        rebotados_nuevos.append(rebotado)
+                    vistos_rebote.add(msg_id)
                 else:  # respuesta
                     es_baja = False
                     razon_baja = ""
@@ -3534,7 +3611,20 @@ def detectar_respuestas_y_calendly(dias=30, forzar_full=False):
                     })
                     vistos_resp.add(info["clave"])
 
+            # Rebotados → lista negra en UNA sola escritura (rápido).
+            if rebotados_nuevos:
+                try:
+                    agregar_lote_lista_negra(
+                        rebotados_nuevos,
+                        motivo="Rebote: correo no entregable (dominio destino)",
+                        auto=True,
+                    )
+                except Exception:
+                    pass
+
             data["_last_uid"] = max_uid_visto
+            # Cap del tracking de rebotes vistos (evita crecer sin fin)
+            data["_rebotes_vistos"] = list(vistos_rebote)[-8000:]
     except Exception as e:
         # Errores transitorios de red (SSL EOF, timeouts) NO los logueamos
         # como ERROR — son comunes con polling frecuente y no requieren

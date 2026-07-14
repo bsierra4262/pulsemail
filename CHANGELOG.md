@@ -2,6 +2,10 @@
 
 Formato basado en [Keep a Changelog](https://keepachangelog.com/) y [SemVer](https://semver.org/).
 
+## [1.2.2] — 2026-07-14  _patch_
+
+Rebotes (postmaster/mailer-daemon) ya NO aparecen en el panel Respuestas: se detectan como bounce y el correo afectado va directo a lista negra. Limpia los rebotes que ya se habian colado en Respuestas. Deteccion por remitente (postmaster/daemon) y por asunto de NDR (Undeliverable/Delivery Status).
+
 ## [1.2.1] — 2026-07-14  _patch_
 
 Rebotes no se repiten: todo correo que rebota (postmaster/mailer-daemon no entregable) se agrega automaticamente a la lista negra, y el envio ahora excluye lista negra + rechazados/depurados previos. Nunca se reenvia a una casilla que ya reboto. Helper de lista negra en lote (una sola escritura).
