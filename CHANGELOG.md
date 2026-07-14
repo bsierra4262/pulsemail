@@ -2,6 +2,10 @@
 
 Formato basado en [Keep a Changelog](https://keepachangelog.com/) y [SemVer](https://semver.org/).
 
+## [1.2.1] — 2026-07-14  _patch_
+
+Rebotes no se repiten: todo correo que rebota (postmaster/mailer-daemon no entregable) se agrega automaticamente a la lista negra, y el envio ahora excluye lista negra + rechazados/depurados previos. Nunca se reenvia a una casilla que ya reboto. Helper de lista negra en lote (una sola escritura).
+
 ## [1.2.0] — 2026-07-13  _minor_
 
 Fix critico backups: reemplazo dialogos tkinter (fallaban en el .exe por tcl/tk no empaquetado) por dialogo nativo Win32 comdlg32 -> importar/exportar funciona. Nueva campana de correo con diseno profesional (hero, pilares, Saira, botones VML anti-Outlook) y 100% config-driven: botones WhatsApp + Agendar reunion condicionales segun config, firma configurada sale en la campana, datos de empresa en nueva pestana Configuracion -> Empresa. Anti-spam: header List-Unsubscribe atado a BAJA. Nada hardcodeado salvo el asunto.

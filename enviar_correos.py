@@ -249,6 +249,35 @@ def agregar_a_lista_negra(email_addr, motivo="Agregado manualmente", auto=False)
     return True
 
 
+def agregar_lote_lista_negra(emails, motivo="Agregado en lote", auto=True):
+    """Agrega muchos emails a la lista negra en UNA sola lectura/escritura
+    (mucho más rápido que llamar `agregar_a_lista_negra` N veces).
+    Idempotente: ignora los que ya están. Retorna cuántos NUEVOS se agregaron."""
+    if not emails:
+        return 0
+    data = cargar_lista_negra()
+    existentes = {
+        (e.get("email") or "").strip().lower()
+        for e in data["emails"] if e.get("email")
+    }
+    ahora = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    nuevos = 0
+    for em in emails:
+        if not em or "@" not in em:
+            continue
+        en = em.strip().lower()
+        if en in existentes:
+            continue
+        data["emails"].append({
+            "email": en, "fecha": ahora, "motivo": motivo, "auto": bool(auto),
+        })
+        existentes.add(en)
+        nuevos += 1
+    if nuevos:
+        _guardar_lista_negra(data)
+    return nuevos
+
+
 def quitar_de_lista_negra(email_addr):
     """Quita un email. Retorna True si existía y fue removido."""
     if not email_addr:
@@ -1460,6 +1489,18 @@ def revisar_rebotes(fecha_actual, enviados_hoy):
         with open(ARCHIVO_RECHAZOS, "w", encoding="utf-8") as f:
             json.dump(historial, f, indent=4, ensure_ascii=False)
 
+        # Auto-lista negra: todo correo que rebotó (postmaster/mailer-daemon,
+        # "no entregable") se agrega para NO reintentarlo en futuras campañas.
+        if rechazados:
+            try:
+                agregar_lote_lista_negra(
+                    rechazados,
+                    motivo="Rebote: correo no entregable (postmaster/mailer-daemon)",
+                    auto=True,
+                )
+            except Exception:
+                pass
+
         total_rechazados = len(rechazados)
         porcentaje = (total_rechazados / enviados_hoy * 100) if enviados_hoy > 0 else 0
 
@@ -1579,7 +1620,20 @@ def main():
     # campaña, se aplicará en la próxima corrida (igualmente la mayoría
     # de adds son automáticos al recibir un BAJA, que se aplica en la
     # siguiente campaña).
+    # Set de exclusión: lista negra (opt-outs + rebotes auto-agregados) MÁS
+    # los correos que ya rebotaron antes (registro_rechazados.json). Así
+    # NUNCA reenviamos a un correo que dio "no entregable"/postmaster ni a
+    # uno ya depurado — no se repiten.
     blacklist = cargar_lista_negra_set()
+    try:
+        rechazados_previos = {
+            (r.get("email") or "").strip().lower()
+            for r in cargar_rechazados_todos(filtrar_por_contactos=False)
+            if r.get("email")
+        }
+    except Exception:
+        rechazados_previos = set()
+    excluidos = blacklist | rechazados_previos
     skipped_blacklist = 0
 
     for fila in lista_clientes:
@@ -1611,15 +1665,15 @@ def main():
                 saltar_hasta_ultimo = False
             continue
 
-        # ── Lista negra: skip silencioso para opt-outs ──
-        if destino.lower() in blacklist:
+        # ── Exclusión: opt-outs + rebotes previos (no reenviar) ──
+        if destino.lower() in excluidos:
             skipped_blacklist += 1
             if skipped_blacklist <= 5:   # primeros 5 al historial; el resto, batch
                 guardar_evento_historial(
                     hoy, "info",
-                    f"Saltado por lista negra (opt-out): {destino}",
+                    f"Saltado (lista negra / rebote previo): {destino}",
                 )
-            print(f" Saltado por lista negra: {destino}")
+            print(f" Saltado (lista negra / rebote previo): {destino}")
             continue
 
         nombre = (
@@ -2016,6 +2070,17 @@ def revisar_rebotes_recientes(dias=7):
         nuevos_set = set()
         for emails in encontrados.values():
             nuevos_set |= emails
+
+        # Auto-lista negra: los rebotados no se reintentan nunca más.
+        if nuevos_set:
+            try:
+                agregar_lote_lista_negra(
+                    nuevos_set,
+                    motivo="Rebote: correo no entregable",
+                    auto=True,
+                )
+            except Exception:
+                pass
 
         # Sincronizar el contador de "rebotes" del historial diario, así
         # el Dashboard y Estadísticas reflejan el número correcto sin
