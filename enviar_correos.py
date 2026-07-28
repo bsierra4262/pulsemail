@@ -1821,6 +1821,51 @@ def cargar_rechazados_todos(filtrar_por_contactos=True):
     return _cached_read(clave, ARCHIVO_RECHAZOS, _loader)
 
 
+def agregar_a_rechazados(emails, fecha_str=None):
+    """Agrega emails a `registro_rechazados.json` de forma IDEMPOTENTE y
+    ADITIVA (nunca borra). Si un email ya está (en cualquier fecha) no se
+    duplica. Una sola escritura. Retorna cuántos NUEVOS se agregaron.
+
+    Misma lógica que la lista negra: cuando un rebote se detecta, se carga
+    acá y también en lista negra (ver `agregar_lote_lista_negra`)."""
+    if not emails:
+        return 0
+    fecha_str = fecha_str or datetime.now().strftime("%Y-%m-%d")
+    historial = {}
+    if os.path.exists(ARCHIVO_RECHAZOS):
+        try:
+            with open(ARCHIVO_RECHAZOS, "r", encoding="utf-8") as f:
+                historial = json.load(f)
+        except Exception:
+            historial = {}
+    if not isinstance(historial, dict):
+        historial = {}
+    existentes = set()
+    for b in historial.values():
+        for c in (b.get("correos") or []):
+            existentes.add((c or "").strip().lower())
+    bloque = historial.get(fecha_str) or {"total": 0, "correos": []}
+    nuevos = 0
+    for em in emails:
+        el = (em or "").strip().lower()
+        if not el or "@" not in el or el in existentes:
+            continue
+        bloque.setdefault("correos", []).append(el)
+        existentes.add(el)
+        nuevos += 1
+    if nuevos:
+        bloque["total"] = len(bloque["correos"])
+        historial[fecha_str] = bloque
+        try:
+            with open(ARCHIVO_RECHAZOS, "w", encoding="utf-8") as f:
+                json.dump(historial, f, indent=4, ensure_ascii=False)
+        except Exception:
+            pass
+        _cache_invalidate("rechazados_todos_True")
+        _cache_invalidate("rechazados_todos_False")
+    return nuevos
+
+
 def cargar_depurados():
     """Set de correos marcados como ya depurados (ocultos en la pestaña)."""
     def _loader():
@@ -2123,22 +2168,19 @@ def revisar_rebotes_recientes(dias=7):
                         if not contactos_set or encontrado in contactos_set:
                             encontrados.setdefault(fecha_str, set()).add(encontrado)
 
-        # Reconstruir el archivo de rechazados con SOLO los encontrados
-        # (esto efectivamente "limpia" rechazados que el usuario eliminó
-        # manualmente del INBOX, como pidió el cliente)
-        nuevo_historial = {}
-        for fecha_k, emails in encontrados.items():
-            nuevo_historial[fecha_k] = {
-                "total":   len(emails),
-                "correos": sorted(emails),
-            }
-
-        with open(ARCHIVO_RECHAZOS, "w", encoding="utf-8") as f:
-            json.dump(nuevo_historial, f, indent=4, ensure_ascii=False)
-
+        # ADITIVO (no borra): agregamos los rebotes encontrados a los que ya
+        # había. Antes esto RECONSTRUÍA el archivo (wipe), lo que borraba
+        # rebotes cargados por otros escaneos. Ahora es aditivo e idempotente
+        # — así se re-carga todo aunque hayas borrado el historial y nunca se
+        # pierde lo ya detectado.
         nuevos_set = set()
-        for emails in encontrados.values():
-            nuevos_set |= emails
+        for fecha_k, emails in encontrados.items():
+            if emails:
+                try:
+                    agregar_a_rechazados(sorted(emails), fecha_str=fecha_k)
+                except Exception:
+                    pass
+                nuevos_set |= emails
 
         # Auto-lista negra: los rebotados no se reintentan nunca más.
         if nuevos_set:
@@ -2167,7 +2209,7 @@ def revisar_rebotes_recientes(dias=7):
         return {
             "total":      len(nuevos_set),
             "agregados":  len(nuevos_set - actuales_set),
-            "eliminados": len(actuales_set - nuevos_set),
+            "eliminados": 0,   # ya no se borran (comportamiento aditivo)
             "error":      "",
         }
 
@@ -3578,7 +3620,11 @@ def detectar_respuestas_y_calendly(dias=30, forzar_full=False):
                 if _es_remitente_rebote(rem) or (
                     respuesta_hilo and _es_asunto_rebote(info["asunto"])
                 ):
-                    if info["msg_id"] in vistos_rebote:
+                    # En escaneo FORZADO (Escanear bandeja / full rescan) NO
+                    # salteamos por "ya visto" — así, si el usuario borró el
+                    # historial, se vuelven a cargar todos los rebotes. Los
+                    # `agregar_*` son idempotentes (si ya está, no duplica).
+                    if not forzar_full and info["msg_id"] in vistos_rebote:
                         continue
                     uids_necesita_cuerpo.append((uid_b, "rebote", info))
                     continue
@@ -3689,7 +3735,9 @@ def detectar_respuestas_y_calendly(dias=30, forzar_full=False):
                     })
                     vistos_resp.add(info["clave"])
 
-            # Rebotados → lista negra en UNA sola escritura (rápido).
+            # Rebotados → se cargan en AMBOS (misma lógica): lista negra
+            # (para no reenviar) y rechazados (para la pestaña). Idempotente:
+            # si ya están, no se duplican.
             if rebotados_nuevos:
                 try:
                     agregar_lote_lista_negra(
@@ -3697,6 +3745,10 @@ def detectar_respuestas_y_calendly(dias=30, forzar_full=False):
                         motivo="Rebote: correo no entregable (dominio destino)",
                         auto=True,
                     )
+                except Exception:
+                    pass
+                try:
+                    agregar_a_rechazados(rebotados_nuevos)
                 except Exception:
                     pass
 

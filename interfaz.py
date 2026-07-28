@@ -2923,6 +2923,7 @@ def main(page: ft.Page):
                 "Desactivado: muestra los pendientes de depurar.",
     )
     pagina_rechazados     = [0]
+    filtro_rechazados     = [""]   # búsqueda por correo
     TAM_PAGINA_RECH       = 50
 
     def _flash(msg, color=C_AZUL, segundos=2):
@@ -2952,9 +2953,12 @@ def main(page: ft.Page):
     )
 
     def _escanear_rebotes_forzado(e=None):
-        """Reescanea IMAP por mailer-daemon + postmaster en los últimos
-        7 días. Si el usuario eliminó manualmente correos de rebotes,
-        esos desaparecen del listado al refrescar."""
+        """Escaneo FORZADO de rebotes en IMAP. Usa el mismo motor que
+        'Escanear bandeja' (detectar_respuestas_y_calendly con forzar_full),
+        que caza postmaster Y mailer-daemon y carga cada rebote en AMBOS:
+        rechazados y lista negra — idempotente (si ya está, no duplica).
+        También corre el re-escaneo clásico de mailer-daemon por las dudas.
+        Re-carga todo aunque hayas borrado el historial."""
         if ring_rechazados_scan.visible:
             return
         cfg = enviar_correos.cargar_config()
@@ -2962,29 +2966,32 @@ def main(page: ft.Page):
             _flash("Configurá la cuenta antes de escanear.", C_ROJO, 3)
             return
         ring_rechazados_scan.visible = True
-        _flash("Escaneando rebotes en IMAP (mailer-daemon + postmaster)...",
-               C_AZUL, 60)
+        _flash("Escaneando rebotes (bandeja completa, 60 días)...", C_AZUL, 90)
         safe_update(ring_rechazados_scan)
 
         def trabajador():
             try:
-                resultado = enviar_correos.revisar_rebotes_recientes(dias=7)
-                if resultado.get("error"):
-                    _flash(f"Error: {resultado['error']}", C_ROJO, 6)
-                else:
-                    partes = [f"Total: {resultado['total']}"]
-                    if resultado["agregados"]:
-                        partes.append(f"+{resultado['agregados']} nuevos")
-                    if resultado["eliminados"]:
-                        partes.append(f"-{resultado['eliminados']} restablecidos")
-                    _flash("Escaneo completo. " + " · ".join(partes),
-                           C_EXITO, 5)
-                    agregar_log(
-                        "info",
-                        f"Re-escaneo de rebotes: {resultado['total']} en total, "
-                        f"{resultado['agregados']} nuevos, "
-                        f"{resultado['eliminados']} restablecidos."
-                    )
+                antes = len(enviar_correos.cargar_rechazados_todos(
+                    filtrar_por_contactos=False))
+                # Motor principal: detecta postmaster/mailer-daemon y NDRs,
+                # carga en rechazados + lista negra (idempotente, forzado).
+                enviar_correos.detectar_respuestas_y_calendly(
+                    dias=60, forzar_full=True,
+                )
+                # Complemento: mailer-daemon clásico (aditivo).
+                try:
+                    enviar_correos.revisar_rebotes_recientes(dias=60)
+                except Exception:
+                    pass
+                despues = len(enviar_correos.cargar_rechazados_todos(
+                    filtrar_por_contactos=False))
+                nuevos = max(0, despues - antes)
+                _flash(f"Escaneo completo. {despues} rechazados en total"
+                       + (f" (+{nuevos} nuevos)" if nuevos else "") + ".",
+                       C_EXITO, 5)
+                agregar_log("info",
+                            f"Re-escaneo de rebotes: {despues} en total, "
+                            f"{nuevos} nuevos.")
             except Exception as ex:
                 _flash(f"Falló: {ex}", C_ROJO, 6)
             finally:
@@ -3044,12 +3051,15 @@ def main(page: ft.Page):
         # Lógica del checkbox:
         #   chk OFF (default) → muestra sólo PENDIENTES (no depurados)
         #   chk ON            → muestra sólo DEPURADOS (los ya procesados)
+        q = (filtro_rechazados[0] or "").strip().lower()
         items_visibles = []
         for item in rechazados:
             es_dep = item["email"] in depurados
             if mostrar_dep and not es_dep:
                 continue
             if (not mostrar_dep) and es_dep:
+                continue
+            if q and q not in item["email"]:
                 continue
             items_visibles.append((item, es_dep))
 
@@ -3298,6 +3308,18 @@ def main(page: ft.Page):
         tooltip="Página siguiente",
     )
 
+    tf_buscar_rech = ft.TextField(
+        hint_text="Buscar correo específico...",
+        prefix_icon=ft.Icons.SEARCH_ROUNDED,
+        border_color=C_BORDE,
+        focused_border_color=C_MORADO,
+        text_style=ft.TextStyle(font_family="Saira"),
+        expand=True,
+        on_change=lambda e: (filtro_rechazados.__setitem__(0, e.control.value),
+                             pagina_rechazados.__setitem__(0, 0),
+                             refrescar_rechazados()),
+    )
+
     vista_rechazados = ft.Column(
         expand=True,
         spacing=16,
@@ -3344,6 +3366,11 @@ def main(page: ft.Page):
                         ),
                     ),
                 ],
+            ),
+            ft.Row(
+                spacing=10,
+                vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                controls=[tf_buscar_rech],
             ),
             ft.Row(
                 spacing=14,
@@ -4768,7 +4795,7 @@ def main(page: ft.Page):
                 # incremental, sino uno completo que garantice que
                 # encuentre todo lo que hay.
                 enviar_correos.detectar_respuestas_y_calendly(
-                    dias=30, forzar_full=True,
+                    dias=60, forzar_full=True,
                 )
                 despues = enviar_correos.cargar_respuestas()
                 n_desp  = (len(despues.get("respuestas", []))

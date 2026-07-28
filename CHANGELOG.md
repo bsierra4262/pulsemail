@@ -2,6 +2,10 @@
 
 Formato basado en [Keep a Changelog](https://keepachangelog.com/) y [SemVer](https://semver.org/).
 
+## [1.3.2] — 2026-07-28  _patch_
+
+Fix critico rechazados/lista negra: al borrar el historial, los escaneos ahora RE-CARGAN los rebotes (antes el tracking interno los marcaba como vistos y no los re-agregaba). Escaneo forzado (Escanear bandeja / Escanear rebotes) ignora 'vistos' y re-procesa todo; cada rebote se carga en AMBOS (rechazados + lista negra) idempotente. Botones de escaneo con ventana 60 dias y motor robusto (postmaster + mailer-daemon). revisar_rebotes_recientes ahora es aditivo (no borra). Nuevo helper agregar_a_rechazados.
+
 ## [1.3.1] — 2026-07-28  _patch_
 
 Fix critico deteccion auto-replies: ampliado parece_auto_reply para cazar 'Ausencia', 'cuenta no operativa / account no longer available', 'de licencia', 'fuera de oficina', cuenta cerrada/inexistente, mailbox full, etc. (antes se colaban como respuestas reales). El cleanup re-clasifica es_auto en cada escaneo (Escanear bandeja corrige lo cacheado de antes y lo persiste); el filtro Reales tambien lo computa al vuelo, se corrige al instante.
