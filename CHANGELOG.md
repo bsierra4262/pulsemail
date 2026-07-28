@@ -2,6 +2,10 @@
 
 Formato basado en [Keep a Changelog](https://keepachangelog.com/) y [SemVer](https://semver.org/).
 
+## [1.3.1] — 2026-07-28  _patch_
+
+Fix critico deteccion auto-replies: ampliado parece_auto_reply para cazar 'Ausencia', 'cuenta no operativa / account no longer available', 'de licencia', 'fuera de oficina', cuenta cerrada/inexistente, mailbox full, etc. (antes se colaban como respuestas reales). El cleanup re-clasifica es_auto en cada escaneo (Escanear bandeja corrige lo cacheado de antes y lo persiste); el filtro Reales tambien lo computa al vuelo, se corrige al instante.
+
 ## [1.3.0] — 2026-07-28  _minor_
 
 Panel Rechazados ahora incluye los rebotes auto-agregados a la lista negra (existentes + futuros). Respuestas: las BAJA ya no se muestran (van solo a lista negra) y se limpian las que estaban. Nuevo filtro Reales/Automaticas en Respuestas (default Reales) para separar respuestas verdaderas de auto-replies (fuera de oficina, etc.); defensa en UI para no mostrar BAJA/rebotes aunque queden en el archivo. Nuevo Auto-envio programado en Configuracion -> Cuenta: la app lanza la campana sola cada dia a la hora elegida, envia hasta el limite diario y sigue al dia siguiente donde quedo, hasta terminar toda la base; se reanuda al cargar una base nueva.

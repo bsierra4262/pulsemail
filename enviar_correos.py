@@ -1948,20 +1948,45 @@ def desmarcar_ignorado(clave):
 # Patrones que sugieren un correo automático (auto-reply, out-of-office,
 # unsubscribe, vacaciones, etc.). Se usan para sugerir ignorar pero
 # NO se ignoran automáticamente — siempre lo decide el usuario.
+# Patrones de respuesta automática (fuera de oficina, cuenta cerrada,
+# licencia, etc.). Se buscan en el ASUNTO. Ampliado para cubrir los casos
+# reales que se colaban como "respuestas": "Ausencia Re:...", "CUENTA NO
+# OPERATIVA / ACCOUNT NO LONGER AVAILABLE", "Fuera de oficina", etc.
 _PATRONES_AUTO_REPLY = re.compile(
-    r"\b("
-    r"out\s*of\s*office|"
-    r"automatic\s*reply|"
-    r"auto[-\s]?reply|"
-    r"fuera\s*de\s*(la\s*)?oficina|"
-    r"respuesta\s*autom[aá]tica|"
-    r"vacaci[oó]n(es)?|"
-    r"unsubscribe|"
-    r"desuscribir|"
-    r"baja\s*de\s*la\s*lista|"
-    r"no[-\s]?reply|"
-    r"do[-\s]?not[-\s]?reply"
-    r")\b",
+    "(?:" + "|".join([
+        # ── Inglés ──
+        r"out\s*of\s*(the\s*)?office",
+        r"automatic\s*(reply|response)",
+        r"auto[-\s]?reply", r"auto[-\s]?responder",
+        r"on\s*(vacation|leave|holiday|annual\s*leave)",
+        r"away\s*from\s*(my\s*)?(desk|office|email|the\s*office)",
+        r"no\s*longer\s*(available|active|work|works|employed|exist|exists|with)",
+        r"account\s*(is\s*)?(no\s*longer\s*)?(available|active|disabled|closed|"
+        r"deactivated|suspended|not\s*monitored)",
+        r"mailbox\s*(is\s*)?full", r"quota\s*exceeded",
+        r"do[-\s]?not[-\s]?reply", r"no[-\s]?reply",
+        r"unsubscribe", r"undeliverable",
+        r"i\s*am\s*(currently\s*)?(out|away|on\s*leave|unavailable)",
+        r"currently\s*(out|away|unavailable|on\s*leave)",
+        # ── Español ──
+        r"respuesta\s*autom[aá]tica", r"mensaje\s*autom[aá]tico",
+        r"notificaci[oó]n\s*autom[aá]tica", r"correo\s*autom[aá]tico",
+        r"fuera\s*de\s*(la\s*)?oficina", r"\bausencia\b", r"\bausente\b",
+        r"me\s*encuentro\s*(ausente|de\s*licencia|fuera|de\s*vacaciones)",
+        r"estar[ée]\s*(ausente|de\s*licencia|de\s*vacaciones|fuera)",
+        r"de\s*licencia", r"licencia\s*(m[ée]dica|anual|por|vacacional)",
+        r"vacaci[oó]n(es)?", r"de\s*vacaciones",
+        r"cuenta\s*no\s*operativa",
+        r"cuenta\s*(inexistente|deshabilitada|cerrada|no\s*(activa|disponible|"
+        r"v[aá]lida|operativa))",
+        r"usuario\s*(inexistente|no\s*existe|desconocido|no\s*v[aá]lido)",
+        r"ya\s*no\s*(trabaja|pertenece|forma\s*parte|labora|est[aá])",
+        r"casilla\s*(llena|no\s*monitoreada|inexistente)", r"buz[oó]n\s*lleno",
+        r"correo\s*no\s*(monitoreado|v[aá]lido|existe)",
+        r"no\s*se\s*(monitorea|revisa)\b",
+        r"a\s*mi\s*(regreso|retorno)", r"reenv[ií]o\s*autom[aá]tico",
+        r"desuscribir", r"baja\s*de\s*la\s*lista", r"no\s*disponible\s*hasta",
+    ]) + ")",
     re.IGNORECASE,
 )
 
@@ -3406,13 +3431,16 @@ def detectar_respuestas_y_calendly(dias=30, forzar_full=False):
     #      · REBOTES (postmaster/mailer-daemon) → van a lista negra.
     #      · BAJAS (es_baja) → ya están en lista negra, no se muestran.
     # ──
-    _resp_limpias = [
-        r for r in data["respuestas"]
-        if not _es_remitente_rebote(r.get("from"))
-        and not r.get("es_baja")
-    ]
-    if len(_resp_limpias) != len(data["respuestas"]):
-        data["respuestas"] = _resp_limpias
+    _resp_limpias = []
+    for r in data["respuestas"]:
+        if _es_remitente_rebote(r.get("from")) or r.get("es_baja"):
+            continue
+        # Re-clasificar auto-reply con los patrones ACTUALES y persistir el
+        # flag. Así "Escanear bandeja" corrige lo que quedó mal clasificado
+        # en versiones anteriores (ej: "Ausencia", "cuenta no operativa").
+        r["es_auto"] = parece_auto_reply(r.get("subject", ""))
+        _resp_limpias.append(r)
+    data["respuestas"] = _resp_limpias
 
     vistos_resp = {(r.get("uid"), r.get("from")) for r in data["respuestas"]}
     vistos_cal  = {c.get("uid") for c in data["calendly"]}
