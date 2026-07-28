@@ -2,6 +2,10 @@
 
 Formato basado en [Keep a Changelog](https://keepachangelog.com/) y [SemVer](https://semver.org/).
 
+## [1.3.0] — 2026-07-28  _minor_
+
+Panel Rechazados ahora incluye los rebotes auto-agregados a la lista negra (existentes + futuros). Respuestas: las BAJA ya no se muestran (van solo a lista negra) y se limpian las que estaban. Nuevo filtro Reales/Automaticas en Respuestas (default Reales) para separar respuestas verdaderas de auto-replies (fuera de oficina, etc.); defensa en UI para no mostrar BAJA/rebotes aunque queden en el archivo. Nuevo Auto-envio programado en Configuracion -> Cuenta: la app lanza la campana sola cada dia a la hora elegida, envia hasta el limite diario y sigue al dia siguiente donde quedo, hasta terminar toda la base; se reanuda al cargar una base nueva.
+
 ## [1.2.2] — 2026-07-14  _patch_
 
 Rebotes (postmaster/mailer-daemon) ya NO aparecen en el panel Respuestas: se detectan como bounce y el correo afectado va directo a lista negra. Limpia los rebotes que ya se habian colado en Respuestas. Deteccion por remitente (postmaster/daemon) y por asunto de NDR (Undeliverable/Delivery Status).

@@ -4144,6 +4144,7 @@ def main(page: ft.Page):
     ring_resp             = ft.ProgressRing(color=C_MORADO, width=18, height=18,
                                              stroke_width=2.5, visible=False)
     filtro_respuestas     = ["todas"]                       # todas | respuestas | calendly
+    filtro_auto_resp      = ["reales"]                      # todas | reales | auto (default: solo reales)
     filtro_asunto_resp    = [""]                            # texto libre
     solo_campana_resp     = [True]                          # sólo correos cuyo asunto matchee la campaña
     mostrar_ignorados     = [False]                         # checkbox "Mostrar ignorados"
@@ -4324,10 +4325,33 @@ def main(page: ft.Page):
         items = []
         if filtro_respuestas[0] in ("todas", "respuestas"):
             for r in respuestas:
+                # Defensa en UI: nunca mostrar BAJA ni rebotes aunque hayan
+                # quedado en el archivo (el detector los limpia, pero esto
+                # garantiza que no se cuelen entre limpieza y limpieza).
+                if r.get("es_baja"):
+                    continue
+                if enviar_correos._es_remitente_rebote(r.get("from")):
+                    continue
                 items.append(("respuesta", r))
         if filtro_respuestas[0] in ("todas", "calendly"):
             for c in calendly:
                 items.append(("calendly", c))
+
+        # Filtro Reales vs Automáticas (sólo aplica a respuestas). Una
+        # respuesta es "automática" si su asunto es de fuera-de-oficina /
+        # auto-reply. Con "reales" mostramos sólo respuestas de verdad;
+        # con "auto", sólo las automáticas. Las reuniones no entran en
+        # este eje (se ven con el filtro Reuniones).
+        def _es_auto_item(it):
+            return bool(it.get("es_auto")) or enviar_correos.parece_auto_reply(
+                it.get("subject", "")
+            )
+        if filtro_auto_resp[0] == "reales":
+            items = [(t, it) for (t, it) in items
+                     if t == "respuesta" and not _es_auto_item(it)]
+        elif filtro_auto_resp[0] == "auto":
+            items = [(t, it) for (t, it) in items
+                     if t == "respuesta" and _es_auto_item(it)]
 
         # Solo de la campaña: el asunto debe contener parte del asunto base
         if solo_campana_resp[0] and _asunto_campana_lower:
@@ -4799,6 +4823,43 @@ def main(page: ft.Page):
             padding=ft.Padding(12, 8, 12, 8),
         )
 
+    # ── Filtro Reales vs Automáticas (respuestas de verdad vs fuera-de-
+    #    oficina/auto-reply). Eje independiente del filtro Todas/Respuestas/
+    #    Reuniones. Color azul para diferenciarlo. ──
+    def _set_filtro_auto_resp(valor):
+        filtro_auto_resp[0] = valor
+        pagina_resp[0]      = 0
+        for k, b in btns_filtro_auto.items():
+            activo = (k == valor)
+            b.style = ft.ButtonStyle(
+                bgcolor={ft.ControlState.DEFAULT: C_AZUL if activo else C_BLANCO},
+                color={ft.ControlState.DEFAULT: C_BLANCO if activo else C_AZUL},
+                side={ft.ControlState.DEFAULT: ft.BorderSide(1.2, C_AZUL)},
+                shape=ft.RoundedRectangleBorder(radius=8),
+                padding=ft.Padding(12, 8, 12, 8),
+            )
+        _render_respuestas()
+
+    btns_filtro_auto = {
+        "todas":  ft.ElevatedButton(
+            "Todas", on_click=lambda e: _set_filtro_auto_resp("todas")),
+        "reales": ft.ElevatedButton(
+            "Reales", icon=ft.Icons.PERSON_ROUNDED,
+            on_click=lambda e: _set_filtro_auto_resp("reales")),
+        "auto":   ft.ElevatedButton(
+            "Automáticas", icon=ft.Icons.SMART_TOY_ROUNDED,
+            on_click=lambda e: _set_filtro_auto_resp("auto")),
+    }
+    for k, b in btns_filtro_auto.items():
+        activo = (k == filtro_auto_resp[0])
+        b.style = ft.ButtonStyle(
+            bgcolor={ft.ControlState.DEFAULT: C_AZUL if activo else C_BLANCO},
+            color={ft.ControlState.DEFAULT: C_BLANCO if activo else C_AZUL},
+            side={ft.ControlState.DEFAULT: ft.BorderSide(1.2, C_AZUL)},
+            shape=ft.RoundedRectangleBorder(radius=8),
+            padding=ft.Padding(12, 8, 12, 8),
+        )
+
     tf_buscar_asunto = ft.TextField(
         hint_text="Filtrar por asunto, remitente o invitado...",
         prefix_icon=ft.Icons.SEARCH_ROUNDED,
@@ -4880,6 +4941,17 @@ def main(page: ft.Page):
                     ft.Container(width=10),
                     chk_solo_campana,
                     chk_mostrar_ignorados,
+                ],
+            ),
+            ft.Row(
+                spacing=10,
+                vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                controls=[
+                    ft.Text("Tipo de respuesta:", size=12, color=C_TEXTO_3,
+                            font_family="Saira"),
+                    btns_filtro_auto["todas"],
+                    btns_filtro_auto["reales"],
+                    btns_filtro_auto["auto"],
                 ],
             ),
             ft.Row(
@@ -5376,6 +5448,24 @@ def main(page: ft.Page):
         text_style=ft.TextStyle(font_family="Saira"),
         expand=True,
     )
+    # ── Auto-envío programado ──
+    chk_auto_envio = ft.Checkbox(
+        label="Enviar solo cada día a esta hora (hasta terminar toda la base)",
+        value=bool(cfg_actual.get("auto_envio_activo", False)),
+        active_color=C_MORADO,
+        label_style=ft.TextStyle(font_family="Saira", size=12, color=C_TEXTO_2),
+    )
+    tf_auto_envio_hora = ft.TextField(
+        label="Hora de inicio (HH:MM)",
+        value=str(cfg_actual.get("auto_envio_hora", "09:00")),
+        hint_text="09:00",
+        prefix_icon=ft.Icons.SCHEDULE_ROUNDED,
+        border_color=C_BORDE,
+        focused_border_color=C_MORADO,
+        label_style=ft.TextStyle(color=C_TEXTO_2, font_family="Saira"),
+        text_style=ft.TextStyle(font_family="Saira"),
+        width=200,
+    )
     tf_correos_copia = ft.TextField(
         label="Correos en copia (CC) — opcional",
         value=cfg_actual.get("correos_copia", ""),
@@ -5846,6 +5936,16 @@ def main(page: ft.Page):
         safe_update(lbl_cfg_estado, dot_cfg_estado, smtp_dot_sidebar,
                     smtp_label_sidebar, smtp_cuenta_label)
 
+    def _norm_hora(v):
+        """Normaliza 'HH:MM' (0-23:0-59). Cae a '09:00' si es inválido."""
+        v = (v or "").strip()
+        m = re.match(r"^(\d{1,2}):(\d{2})$", v)
+        if not m:
+            return "09:00"
+        h = min(23, max(0, int(m.group(1))))
+        mi = min(59, max(0, int(m.group(2))))
+        return f"{h:02d}:{mi:02d}"
+
     def guardar_configuracion(e):
         # Merge con la config actual para no perder campos no editables
         # desde el formulario (ej: tema).
@@ -5868,6 +5968,8 @@ def main(page: ft.Page):
             "empresa_telefono":   (tf_empresa_telefono.value or "").strip(),
             "empresa_email":      (tf_empresa_email.value or "").strip(),
             "empresa_whatsapp":   (tf_empresa_whatsapp.value or "").strip(),
+            "auto_envio_activo":  bool(chk_auto_envio.value),
+            "auto_envio_hora":    _norm_hora(tf_auto_envio_hora.value),
         })
         enviar_correos.guardar_config(cfg)
 
@@ -5986,6 +6088,42 @@ def main(page: ft.Page):
                 ),
                 ft.Row(spacing=12, controls=[tf_correo, tf_password]),
                 ft.Row(spacing=12, controls=[tf_limite]),
+
+                # ── Auto-envío programado ──
+                ft.Container(
+                    bgcolor=C_FONDO,
+                    border_radius=ft.BorderRadius(10, 10, 10, 10),
+                    border=borde_all(1, C_BORDE),
+                    padding=ft.Padding(16, 14, 16, 14),
+                    content=ft.Column(
+                        spacing=10,
+                        controls=[
+                            ft.Row(
+                                spacing=8,
+                                controls=[
+                                    ft.Icon(ft.Icons.ALARM_ON_ROUNDED,
+                                            color=C_MORADO, size=20),
+                                    ft.Text("Auto-envío programado",
+                                            size=14, weight=ft.FontWeight.BOLD,
+                                            color=C_TEXTO_1, font_family="Saira"),
+                                ],
+                            ),
+                            chk_auto_envio,
+                            ft.Row(spacing=12, controls=[tf_auto_envio_hora]),
+                            ft.Text(
+                                "Cada día a la hora indicada, la app lanza la "
+                                "campaña sola, envía hasta el límite diario y "
+                                "sigue al día siguiente donde quedó — hasta "
+                                "terminar toda la base cargada. Si cargás una "
+                                "base nueva, arranca de cero. Requiere que la "
+                                "app esté abierta a esa hora.",
+                                size=11, color=C_TEXTO_3, italic=True,
+                                font_family="Saira",
+                            ),
+                        ],
+                    ),
+                ),
+
                 ft.Container(
                     padding=ft.Padding(0, 8, 0, 0),
                     content=ft.Text(
@@ -6889,6 +7027,8 @@ def main(page: ft.Page):
             tf_empresa_telefono.value = cfg_r.get("empresa_telefono", "")
             tf_empresa_email.value    = cfg_r.get("empresa_email", "")
             tf_empresa_whatsapp.value = cfg_r.get("empresa_whatsapp", "")
+            chk_auto_envio.value      = bool(cfg_r.get("auto_envio_activo", False))
+            tf_auto_envio_hora.value  = str(cfg_r.get("auto_envio_hora", "09:00"))
             contenedor_vista.content = vista_configuracion
             lbl_topbar_titulo.value  = "Configuración"
             btn_iniciar.visible      = False
@@ -7172,6 +7312,55 @@ def main(page: ft.Page):
 
     if not _INIT_HECHO[0]:
         threading.Thread(target=watcher_respuestas, daemon=True).start()
+
+    # ── Watcher del auto-envío programado ──────────────────────────
+    # Cada día, a la hora configurada, lanza la campaña sola (si está
+    # activado, hay credenciales, no está ya corriendo y la base no está
+    # completa). main() envía hasta el límite diario y sigue al día
+    # siguiente donde quedó, hasta terminar toda la base.
+    def watcher_scheduler():
+        import time as _time
+        ultimo_lanzamiento = [None]   # "YYYY-MM-DD" del último auto-lanzamiento
+        while True:
+            _time.sleep(20)
+            try:
+                cfg = enviar_correos.cargar_config()
+                if not cfg.get("auto_envio_activo"):
+                    continue
+                hora_cfg = _norm_hora(cfg.get("auto_envio_hora") or "09:00")
+                ahora   = datetime.now()
+                hoy_str = ahora.strftime("%Y-%m-%d")
+                hh, mm  = int(hora_cfg[:2]), int(hora_cfg[3:5])
+                # Ventana de disparo: de la hora exacta hasta +5 min (por si
+                # el chequeo de 20s no cae justo en el minuto).
+                delta_min = (ahora.hour * 60 + ahora.minute) - (hh * 60 + mm)
+                if not (0 <= delta_min <= 5):
+                    continue
+                if ultimo_lanzamiento[0] == hoy_str:
+                    continue                       # ya se disparó hoy
+                if campana_activa[0]:
+                    ultimo_lanzamiento[0] = hoy_str
+                    continue                       # ya está corriendo
+                if not cfg.get("correo") or not cfg.get("password"):
+                    continue                       # sin credenciales
+                ultimo_lanzamiento[0] = hoy_str
+                if enviar_correos.campana_esta_completa():
+                    agregar_log("info",
+                                "Auto-envío: la base ya está completa. "
+                                "Cargá una base nueva para reanudar.")
+                    continue
+                agregar_log("info",
+                            f"Auto-envío programado ({hora_cfg}): "
+                            "lanzando la campaña automáticamente.")
+                try:
+                    arrancar(None)
+                except Exception as ex:
+                    agregar_log("error", f"Auto-envío no pudo lanzar: {ex}")
+            except Exception:
+                pass
+
+    if not _INIT_HECHO[0]:
+        threading.Thread(target=watcher_scheduler, daemon=True).start()
 
         # Pre-warm de Chrome en background. La primera renderización de
         # un correo del Hilo cuesta 2-3 s porque Chrome tiene que

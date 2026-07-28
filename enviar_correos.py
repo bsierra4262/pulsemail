@@ -614,6 +614,12 @@ _CONFIG_DEFAULTS = {
     "empresa_telefono":  "+54 11 7700-6868",
     "empresa_email":     "info@intellihelp.tech",
     "empresa_whatsapp":  "+54 9 11 5027-4827",
+    # ── Auto-envío programado ──
+    # Si está activo, la app lanza la campaña sola cada día a la hora
+    # indicada (formato "HH:MM"), continúa donde quedó y respeta el límite
+    # diario, hasta terminar toda la base de contactos.
+    "auto_envio_activo": False,
+    "auto_envio_hora":   "09:00",
 }
 
 
@@ -773,8 +779,28 @@ def cargar_estado():
         return {"ultimo_email": "", "fecha": "", "enviados_hoy": 0}
 
 def guardar_estado(email_str, enviados, fecha):
+    # Preservamos claves extra del estado (ej: campana_completa) al guardar
+    # el progreso — antes se sobrescribía todo y se perdían.
+    estado = cargar_estado()
+    estado.update({
+        "ultimo_email": email_str, "fecha": fecha, "enviados_hoy": enviados,
+    })
     with open(LOG_PROGRESO, "w", encoding="utf-8") as f:
-        json.dump({"ultimo_email": email_str, "fecha": fecha, "enviados_hoy": enviados}, f)
+        json.dump(estado, f)
+
+def marcar_campana_completa(completa=True):
+    """Marca si TODA la base de contactos ya fue enviada. Lo usa el
+    auto-envío programado para saber cuándo dejar de relanzar."""
+    estado = cargar_estado()
+    estado["campana_completa"] = bool(completa)
+    try:
+        with open(LOG_PROGRESO, "w", encoding="utf-8") as f:
+            json.dump(estado, f)
+    except Exception:
+        pass
+
+def campana_esta_completa():
+    return bool(cargar_estado().get("campana_completa", False))
 
 def estado_de_hoy():
     """Devuelve (enviados_hoy, ultimo_email) si la fecha guardada coincide con hoy, sino (0, '')."""
@@ -1523,6 +1549,9 @@ def main():
     # Reset del flag de stop al comenzar la campaña — si veníamos de
     # un "Detener" previo, ya no aplica para esta corrida nueva.
     reset_stop_campana()
+    # Arrancamos una corrida → la base todavía NO está completa. Si al
+    # final resulta que ya se envió todo, se vuelve a marcar completa=True.
+    marcar_campana_completa(False)
 
     limite = LIMITE_DIARIO()
     estado = cargar_estado()
@@ -1728,6 +1757,9 @@ def main():
         msg = "No se enviaron correos nuevos. Ya terminamos la lista entera."
         print(f"\n{msg}")
         guardar_evento_historial(hoy, "info", msg)
+        # Toda la base ya fue enviada → el auto-envío programado deja de
+        # relanzar hasta que se cargue una base nueva.
+        marcar_campana_completa(True)
     else:
         msg = f"Lista finalizada por el momento. Total enviados hoy: {enviados}"
         print(f"\n{msg}")
@@ -1752,27 +1784,39 @@ def cargar_rechazados_todos(filtrar_por_contactos=True):
     cargados, devuelve todos. Cacheado por mtime."""
     clave = f"rechazados_todos_{filtrar_por_contactos}"
     def _loader():
-        if not os.path.exists(ARCHIVO_RECHAZOS):
-            return []
-        try:
-            with open(ARCHIVO_RECHAZOS, "r", encoding="utf-8") as f:
-                data = json.load(f)
-        except Exception:
-            return []
-
-        contactos_set = emails_de_contactos() if filtrar_por_contactos else set()
-
         vistos = {}
-        for fecha in sorted(data.keys()):
-            bloque = data.get(fecha) or {}
-            for c in bloque.get("correos", []):
-                c_lower = (c or "").strip().lower()
-                if not c_lower:
+        # 1) registro_rechazados.json — rebotes históricos por fecha
+        if os.path.exists(ARCHIVO_RECHAZOS):
+            try:
+                with open(ARCHIVO_RECHAZOS, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                for fecha in sorted(data.keys()):
+                    bloque = data.get(fecha) or {}
+                    for c in bloque.get("correos", []):
+                        c_lower = (c or "").strip().lower()
+                        if c_lower and c_lower not in vistos:
+                            vistos[c_lower] = {"email": c_lower, "fecha": fecha}
+            except Exception:
+                pass
+
+        # 2) lista negra — entradas de REBOTE (motivo empieza con "Rebote").
+        #    Así todo correo que rebotó y se auto-agregó a la lista negra
+        #    también aparece en la pestaña Rechazados (existentes + futuros).
+        try:
+            for e in cargar_lista_negra().get("emails", []):
+                if not (e.get("motivo") or "").lower().startswith("rebote"):
                     continue
-                if filtrar_por_contactos and contactos_set and c_lower not in contactos_set:
-                    continue
-                if c_lower not in vistos:
-                    vistos[c_lower] = {"email": c_lower, "fecha": fecha}
+                cl = (e.get("email") or "").strip().lower()
+                if cl and cl not in vistos:
+                    vistos[cl] = {"email": cl, "fecha": (e.get("fecha") or "")[:10]}
+        except Exception:
+            pass
+
+        # 3) filtro opcional por contactos de la campaña
+        if filtrar_por_contactos:
+            contactos_set = emails_de_contactos()
+            if contactos_set:
+                return [v for v in vistos.values() if v["email"] in contactos_set]
         return list(vistos.values())
     return _cached_read(clave, ARCHIVO_RECHAZOS, _loader)
 
@@ -3357,12 +3401,15 @@ def detectar_respuestas_y_calendly(dias=30, forzar_full=False):
 
     data = _cargar_respuestas_archivo()
 
-    # ── Limpieza: sacar del panel Respuestas los REBOTES (postmaster/
-    #    mailer-daemon) que se hayan colado antes. No son respuestas de
-    #    clientes — el correo afectado va a lista negra, no acá. ──
+    # ── Limpieza del panel Respuestas: sacar lo que NO es una respuesta
+    #    real del cliente —
+    #      · REBOTES (postmaster/mailer-daemon) → van a lista negra.
+    #      · BAJAS (es_baja) → ya están en lista negra, no se muestran.
+    # ──
     _resp_limpias = [
         r for r in data["respuestas"]
         if not _es_remitente_rebote(r.get("from"))
+        and not r.get("es_baja")
     ]
     if len(_resp_limpias) != len(data["respuestas"]):
         data["respuestas"] = _resp_limpias
@@ -3592,21 +3639,24 @@ def detectar_respuestas_y_calendly(dias=30, forzar_full=False):
                     if cuerpo or asunto:
                         es_baja, razon_baja = es_pedido_de_baja(asunto, cuerpo)
                     if es_baja:
+                        # BAJA → directo a lista negra. NO se muestra en el
+                        # panel Respuestas (no es una respuesta a atender).
                         agregar_a_lista_negra(
-                            rem,
-                            motivo=f"Auto-baja: {razon_baja}",
-                            auto=True,
+                            rem, motivo=f"Auto-baja: {razon_baja}", auto=True,
                         )
-                        logging.info(
-                            f"Lista negra: {rem} agregado "
-                            f"automáticamente ({razon_baja})"
-                        )
+                        logging.info(f"Lista negra (BAJA): {rem} ({razon_baja})")
+                        vistos_resp.add(info["clave"])
+                        continue
+                    # Respuesta automática (fuera de oficina, auto-reply…):
+                    # se guarda pero marcada para poder filtrarla en la UI.
+                    es_auto = parece_auto_reply(asunto)
                     data["respuestas"].append({
                         "uid":      msg_id,
                         "from":     rem,
                         "subject":  asunto,
                         "date":     fecha_msg,
-                        "es_baja":  es_baja,
+                        "es_baja":  False,
+                        "es_auto":  es_auto,
                         "via_hilo": info["via_hilo"],
                     })
                     vistos_resp.add(info["clave"])
@@ -3678,6 +3728,12 @@ def importar_archivo_local(origen_path, nombre_local):
             except Exception:
                 pass
         shutil.copy2(origen_path, destino)
+        # Base nueva de contactos → reanudar el auto-envío desde cero.
+        if os.path.basename(nombre_local).lower() == "contactos.csv":
+            try:
+                marcar_campana_completa(False)
+            except Exception:
+                pass
         return True, f"Importado: {nombre_local}"
     except Exception as e:
         logging.error(f"Error importando {origen_path} -> {nombre_local}: {e}")
