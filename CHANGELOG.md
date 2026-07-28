@@ -2,6 +2,10 @@
 
 Formato basado en [Keep a Changelog](https://keepachangelog.com/) y [SemVer](https://semver.org/).
 
+## [1.3.3] — 2026-07-28  _patch_
+
+Fix critico de compilacion: el .exe ahora EMPAQUETA el cliente de Flet (la ventana) adentro. Antes flet pack no lo incluia y al primer arranque intentaba descargarlo de GitHub, fallando en PCs sin internet/certificados con 'SSL: CERTIFICATE_VERIFY_FAILED' y la app no abria. Ahora es 100% autonomo (se instala y abre solo, sin descargar nada). _build_helper baja el cliente una vez y lo empaqueta en flet_desktop/app.
+
 ## [1.3.2] — 2026-07-28  _patch_
 
 Fix critico rechazados/lista negra: al borrar el historial, los escaneos ahora RE-CARGAN los rebotes (antes el tracking interno los marcaba como vistos y no los re-agregaba). Escaneo forzado (Escanear bandeja / Escanear rebotes) ignora 'vistos' y re-procesa todo; cada rebote se carga en AMBOS (rechazados + lista negra) idempotente. Botones de escaneo con ventana 60 dias y motor robusto (postmaster + mailer-daemon). revisar_rebotes_recientes ahora es aditivo (no borra). Nuevo helper agregar_a_rechazados.

@@ -38,6 +38,41 @@ def main():
         if os.path.exists(os.path.join(raiz, nombre)):
             add_data_args.extend(["--add-data", f"{nombre};."])
 
+    # ── Cliente de Flet OFFLINE (CRÍTICO para que sea 100% autónomo) ──
+    # `flet pack` NO empaqueta el cliente desktop (la ventana). Al primer
+    # arranque, `flet_desktop.ensure_client_cached()` intenta DESCARGARLO
+    # de GitHub, y en PCs sin internet o sin certificados actualizados
+    # falla con "SSL: CERTIFICATE_VERIFY_FAILED" y la app no abre.
+    # Lo empaquetamos nosotros en `flet_desktop/app/flet-windows.zip`:
+    # ensure_client_cached() busca ahí PRIMERO y, si está, extrae local sin
+    # descargar nada. Lo bajamos una vez a `_flet_client/` (cacheado).
+    try:
+        import flet_desktop.version as _fdv
+        _ver = _fdv.version
+        _client_dir = os.path.join(raiz, "_flet_client")
+        os.makedirs(_client_dir, exist_ok=True)
+        _zip = os.path.join(_client_dir, "flet-windows.zip")
+        if not os.path.exists(_zip) or os.path.getsize(_zip) < 1_000_000:
+            _url = (f"https://github.com/flet-dev/flet/releases/download/"
+                    f"v{_ver}/flet-windows.zip")
+            print(f"Descargando cliente Flet v{_ver} para empaquetar offline...")
+            import ssl as _ssl, urllib.request as _urlreq, shutil as _sh
+            try:
+                import certifi as _certifi
+                _ctx = _ssl.create_default_context(cafile=_certifi.where())
+            except Exception:
+                _ctx = _ssl.create_default_context()
+            with _urlreq.urlopen(_url, context=_ctx, timeout=300) as _r, \
+                    open(_zip, "wb") as _f:
+                _sh.copyfileobj(_r, _f)
+        add_data_args.extend(["--add-data", f"{_zip};flet_desktop/app"])
+        print(f"Cliente Flet empaquetado OFFLINE: {_zip} "
+              f"({os.path.getsize(_zip) // (1024*1024)} MB)")
+    except Exception as _e:
+        print(f"ADVERTENCIA: no se pudo empaquetar el cliente Flet offline "
+              f"(la app intentará descargarlo al primer uso): {_e}",
+              file=sys.stderr)
+
     flet_argv = [
         "flet", "pack", "interfaz.py",
         "--name", "Pulsemail",

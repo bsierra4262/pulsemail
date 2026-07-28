@@ -18,6 +18,9 @@ build/
 dist/
 *.spec
 
+# --- Cliente Flet descargado para empaquetar offline (39 MB, se re-baja) ---
+_flet_client/
+
 # --- Output del instalador (binarios generados, no se versionan) ---
 installer_output/
 
