@@ -6231,6 +6231,67 @@ def main(page: ft.Page):
         ),
     )
 
+    # ── Correo de prueba (previsualizar antes de lanzar) ──
+    tf_correo_prueba = ft.TextField(
+        label="Enviar prueba a",
+        value="bsierra@intellihelp.tech",
+        prefix_icon=ft.Icons.SEND_ROUNDED,
+        border_color=C_BORDE,
+        focused_border_color=C_MORADO,
+        label_style=ft.TextStyle(color=C_TEXTO_2, font_family="Saira"),
+        text_style=ft.TextStyle(font_family="Saira"),
+        expand=True,
+    )
+    lbl_prueba_estado = ft.Text("", size=12, font_family="Saira")
+    ring_prueba = ft.ProgressRing(color=C_MORADO, width=16, height=16,
+                                  stroke_width=2.5, visible=False)
+
+    def _enviar_prueba(e=None):
+        dest = (tf_correo_prueba.value or "").strip()
+        if not dest or "@" not in dest:
+            lbl_prueba_estado.value = "Poné una dirección de prueba válida."
+            lbl_prueba_estado.color = C_ROJO
+            safe_update(lbl_prueba_estado)
+            return
+        # Guardamos los campos del Mensaje para que la prueba refleje lo que
+        # tenés escrito AHORA (aunque no hayas apretado Guardar).
+        cfg_p = enviar_correos.cargar_config()
+        cfg_p["modo_correo"]  = modo_correo_actual[0]
+        cfg_p["texto_asunto"] = (tf_texto_asunto.value or "").strip() \
+            or enviar_correos.TEXTO_ASUNTO_DEFAULT
+        cfg_p["texto_cuerpo"] = (tf_texto_cuerpo.value or "").rstrip() \
+            or enviar_correos.TEXTO_CUERPO_DEFAULT
+        enviar_correos.guardar_config(cfg_p)
+        ring_prueba.visible = True
+        lbl_prueba_estado.value = "Enviando prueba..."
+        lbl_prueba_estado.color = C_AZUL
+        safe_update(ring_prueba, lbl_prueba_estado)
+
+        def _trab():
+            try:
+                ok, msg = enviar_correos.enviar_correo_prueba(dest)
+            except Exception as ex:
+                ok, msg = False, str(ex)
+            ring_prueba.visible = False
+            lbl_prueba_estado.value = ("✓ " if ok else "") + msg
+            lbl_prueba_estado.color = C_EXITO if ok else C_ROJO
+            safe_update(ring_prueba, lbl_prueba_estado)
+
+        threading.Thread(target=_trab, daemon=True).start()
+
+    btn_correo_prueba = ft.ElevatedButton(
+        "Enviar correo de prueba",
+        icon=ft.Icons.OUTGOING_MAIL_ROUNDED,
+        on_click=_enviar_prueba,
+        style=ft.ButtonStyle(
+            bgcolor={ft.ControlState.DEFAULT: C_VERDE,
+                     ft.ControlState.HOVERED: C_VERDE_DARK},
+            color={ft.ControlState.DEFAULT: C_BLANCO},
+            shape=ft.RoundedRectangleBorder(radius=8),
+            padding=ft.Padding(16, 12, 16, 12),
+        ),
+    )
+
     # ── Tab "Mensaje" — formato y contenido del correo de campaña ──
     _refrescar_botones_modo()
     tab_mensaje = ft.Container(
@@ -6270,6 +6331,48 @@ def main(page: ft.Page):
                     "Firma, se agrega automáticamente al final. El asunto NO "
                     "lleva el nombre para que parezca un correo personal.",
                     size=11, color=C_TEXTO_3, italic=True, font_family="Saira",
+                ),
+
+                ft.Divider(height=1, color=C_BORDE),
+
+                # ── Correo de prueba ──
+                ft.Container(
+                    bgcolor=C_FONDO,
+                    border_radius=ft.BorderRadius(10, 10, 10, 10),
+                    border=borde_all(1, C_BORDE),
+                    padding=ft.Padding(16, 14, 16, 14),
+                    content=ft.Column(
+                        spacing=10,
+                        controls=[
+                            ft.Row(
+                                spacing=8,
+                                controls=[
+                                    ft.Icon(ft.Icons.SCIENCE_ROUNDED,
+                                            color=C_MORADO, size=20),
+                                    ft.Text("Probar el correo antes de enviar",
+                                            size=14, weight=ft.FontWeight.BOLD,
+                                            color=C_TEXTO_1, font_family="Saira"),
+                                ],
+                            ),
+                            ft.Text(
+                                "Manda un correo de prueba a la dirección que "
+                                "pongas, armado igual que la campaña (respeta "
+                                "el formato y el mensaje de arriba), para ver "
+                                "cómo llega. Usa un nombre de ejemplo.",
+                                size=11, color=C_TEXTO_3, font_family="Saira",
+                            ),
+                            ft.Row(
+                                spacing=12,
+                                vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                                controls=[
+                                    tf_correo_prueba,
+                                    btn_correo_prueba,
+                                    ring_prueba,
+                                ],
+                            ),
+                            lbl_prueba_estado,
+                        ],
+                    ),
                 ),
             ],
         ),

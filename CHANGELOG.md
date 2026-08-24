@@ -2,6 +2,10 @@
 
 Formato basado en [Keep a Changelog](https://keepachangelog.com/) y [SemVer](https://semver.org/).
 
+## [1.4.1] — 2026-08-24  _patch_
+
+Asunto default del modo texto sin 'Fwd:' -> 'Retomando el contacto'. Nuevo boton 'Enviar correo de prueba' en Configuracion -> Mensaje: manda un correo de prueba (armado igual que la campana, respetando el formato y el mensaje editado, sin copiar a los CC) a la direccion que elijas, para previsualizar antes de lanzar. Default bsierra@intellihelp.tech.
+
 ## [1.4.0] — 2026-08-24  _minor_
 
 Nuevo modo de campaña en TEXTO PLANO (email personal 1-a-1, mejor entregabilidad en frio). Config -> Mensaje: toggle Texto plano / HTML, con asunto y cuerpo editables (default asunto 'Fwd: Retomando el contacto' y el mensaje de retomar contacto). @nombre se reemplaza por el nombre del contacto. text/plain puro, sin sufijo de nombre en el asunto, con firma de texto al cierre si esta configurada. El modo HTML profesional sigue disponible. Default: texto plano.

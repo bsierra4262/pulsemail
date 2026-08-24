@@ -586,7 +586,7 @@ URL_CALENDLY = ""
 # ── Campaña en TEXTO PLANO (estilo email personal 1-a-1) ──
 # Defaults del modo texto. `@nombre` se reemplaza por el nombre de pila del
 # contacto. Editable desde Configuración → Mensaje.
-TEXTO_ASUNTO_DEFAULT = "Fwd: Retomando el contacto"
+TEXTO_ASUNTO_DEFAULT = "Retomando el contacto"
 TEXTO_CUERPO_DEFAULT = (
     "¡Hola @nombre!\n"
     "Te estoy contactando ya que hace un tiempo nos pusimos en contacto "
@@ -1493,6 +1493,46 @@ def enviar_correo(msg, destino, intentos_previos=0, nombre=""):
         f"Guardado en pendiente para retomar."
     )
     return "agotado"
+
+
+def enviar_correo_prueba(destino, nombre_muestra="Juan Pérez"):
+    """Envía un correo de PRUEBA a `destino`, armado EXACTAMENTE igual que la
+    campaña (`preparar_correo`, respeta modo texto/HTML y todo lo de config),
+    para previsualizar cómo sale antes de lanzar. Un solo intento, sin
+    reintentos ni cola, y SIN copiar a las direcciones en CC. Devuelve
+    (ok: bool, mensaje: str)."""
+    cfg = cargar_config()
+    correo   = (cfg.get("correo")   or "").strip()
+    password = (cfg.get("password") or "").strip()
+    host     = (cfg.get("smtp_host") or "smtp.gmail.com").strip()
+    try:
+        port = int(cfg.get("smtp_port", 587) or 587)
+    except (ValueError, TypeError):
+        port = 587
+
+    destino = (destino or "").strip()
+    if not correo or not password:
+        return False, "Configurá la cuenta (correo + contraseña) primero."
+    if not destino or "@" not in destino:
+        return False, "Poné una dirección de prueba válida."
+
+    try:
+        msg = preparar_correo(nombre_muestra, destino)
+        # En la prueba NO copiamos a los CC de la campaña.
+        if msg.get("Cc"):
+            del msg["Cc"]
+        with smtplib.SMTP(host, port, timeout=20) as server:
+            server.starttls()
+            server.login(correo, password)
+            server.send_message(msg)
+        return True, f"Correo de prueba enviado a {destino}."
+    except smtplib.SMTPAuthenticationError:
+        return False, "Credenciales inválidas."
+    except smtplib.SMTPRecipientsRefused:
+        return False, "El destinatario fue rechazado."
+    except Exception as e:
+        logging.error(f"Error enviando correo de prueba a {destino}: {e}")
+        return False, f"Error de envío: {e}"
 
 
 # ==========================================
