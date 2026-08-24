@@ -583,6 +583,21 @@ CORREO_COPIA = ""
 URL_WHATSAPP = ""
 URL_CALENDLY = ""
 
+# ── Campaña en TEXTO PLANO (estilo email personal 1-a-1) ──
+# Defaults del modo texto. `@nombre` se reemplaza por el nombre de pila del
+# contacto. Editable desde Configuración → Mensaje.
+TEXTO_ASUNTO_DEFAULT = "Fwd: Retomando el contacto"
+TEXTO_CUERPO_DEFAULT = (
+    "¡Hola @nombre!\n"
+    "Te estoy contactando ya que hace un tiempo nos pusimos en contacto "
+    "contigo para presentarles nuestra empresa y nuestros servicios.\n"
+    "Me gustaría poder robarte unos minutos para poder conversar contigo y "
+    "ver si los podemos ayudar con alguna necesidad que tengan.\n"
+    "Desde ya muchas gracias por tu tiempo, y quedo a tu disposición por "
+    "cualquier cuestión,\n"
+    "Saludos,"
+)
+
 TIEMPO_MINIMO, TIEMPO_MAXIMO = 25, 45
 
 
@@ -620,6 +635,12 @@ _CONFIG_DEFAULTS = {
     # diario, hasta terminar toda la base de contactos.
     "auto_envio_activo": False,
     "auto_envio_hora":   "09:00",
+    # ── Formato del correo de campaña ──
+    # 'texto' = email en texto plano, estilo personal (mejor en frío).
+    # 'html'  = plantilla profesional con diseño (hero, botones, etc.).
+    "modo_correo":   "texto",
+    "texto_asunto":  TEXTO_ASUNTO_DEFAULT,
+    "texto_cuerpo":  TEXTO_CUERPO_DEFAULT,
 }
 
 
@@ -932,7 +953,53 @@ def _fila_contacto_html(label, value_html):
     )
 
 
+def _preparar_correo_texto(nombre, destino):
+    """Arma el correo de campaña en TEXTO PLANO (estilo email personal 1-a-1).
+    Asunto y cuerpo salen de config (`texto_asunto` / `texto_cuerpo`), con
+    `@nombre` reemplazado por el nombre de pila del contacto. Es text/plain
+    puro (sin HTML) — el formato con mejor entregabilidad para correo en frío.
+    Si hay firma de texto configurada, se agrega al cierre."""
+    correo_remitente = MI_CORREO()
+    msg = EmailMessage()
+    cc_lista = _parsear_cc(get_config_value("correos_copia"))
+
+    asunto = (get_config_value("texto_asunto") or TEXTO_ASUNTO_DEFAULT).strip()
+    # Sin sufijo "| nombre": tiene que parecer un correo personal.
+    msg["Subject"] = asunto or TEXTO_ASUNTO_DEFAULT
+    msg["From"]    = correo_remitente
+    msg["To"]      = destino
+    if cc_lista:
+        msg["Cc"]  = ", ".join(cc_lista)
+    if correo_remitente:
+        msg["List-Unsubscribe"] = f"<mailto:{correo_remitente}?subject=BAJA>"
+
+    # Nombre de pila (primera palabra). "Cliente" (fallback de main) → sin
+    # nombre, para no mandar "¡Hola Cliente!".
+    nombre_pila = (nombre or "").strip().split()[0] if (nombre or "").strip() else ""
+    if nombre_pila.lower() == "cliente":
+        nombre_pila = ""
+
+    cuerpo = get_config_value("texto_cuerpo") or TEXTO_CUERPO_DEFAULT
+    cuerpo = cuerpo.replace("@nombre", nombre_pila)
+    # Limpiar saludo si no hay nombre: "¡Hola !" → "¡Hola!"
+    cuerpo = cuerpo.replace("¡Hola !", "¡Hola!").replace("Hola !", "Hola!")
+    cuerpo = re.sub(r"[ \t]{2,}", " ", cuerpo)
+
+    # Firma de texto configurada → al cierre (después de "Saludos,").
+    firma_tipo  = (get_config_value("firma_tipo") or "texto").lower()
+    firma_texto = (get_config_value("firma") or "").strip()
+    if firma_tipo == "texto" and firma_texto and firma_texto not in cuerpo:
+        cuerpo = cuerpo.rstrip() + "\n" + firma_texto
+
+    msg.set_content(cuerpo)   # text/plain PURO (sin alternativa HTML)
+    return msg
+
+
 def preparar_correo(nombre, destino):
+    # Modo TEXTO PLANO (personal) vs HTML (plantilla profesional). Config.
+    if (get_config_value("modo_correo") or "texto").lower() == "texto":
+        return _preparar_correo_texto(nombre, destino)
+
     from html import escape as _esc
     correo_remitente = MI_CORREO()
     _ff = _FF_CORREO

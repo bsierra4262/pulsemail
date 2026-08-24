@@ -2,6 +2,10 @@
 
 Formato basado en [Keep a Changelog](https://keepachangelog.com/) y [SemVer](https://semver.org/).
 
+## [1.4.0] — 2026-08-24  _minor_
+
+Nuevo modo de campaña en TEXTO PLANO (email personal 1-a-1, mejor entregabilidad en frio). Config -> Mensaje: toggle Texto plano / HTML, con asunto y cuerpo editables (default asunto 'Fwd: Retomando el contacto' y el mensaje de retomar contacto). @nombre se reemplaza por el nombre del contacto. text/plain puro, sin sufijo de nombre en el asunto, con firma de texto al cierre si esta configurada. El modo HTML profesional sigue disponible. Default: texto plano.
+
 ## [1.3.3] — 2026-07-28  _patch_
 
 Fix critico de compilacion: el .exe ahora EMPAQUETA el cliente de Flet (la ventana) adentro. Antes flet pack no lo incluia y al primer arranque intentaba descargarlo de GitHub, fallando en PCs sin internet/certificados con 'SSL: CERTIFICATE_VERIFY_FAILED' y la app no abria. Ahora es 100% autonomo (se instala y abre solo, sin descargar nada). _build_helper baja el cliente una vez y lo empaqueta en flet_desktop/app.

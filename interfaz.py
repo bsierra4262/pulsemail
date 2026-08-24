@@ -5803,6 +5803,66 @@ def main(page: ft.Page):
                                     on_click=lambda e: _set_firma_tipo("imagen")),
     }
 
+    # ── Formato del correo de campaña: Texto plano vs HTML ──
+    modo_correo_actual = [cfg_actual.get("modo_correo", "texto")]
+
+    def _refrescar_botones_modo():
+        for k, b in btns_modo_correo.items():
+            activo = (k == modo_correo_actual[0])
+            b.style = ft.ButtonStyle(
+                bgcolor={ft.ControlState.DEFAULT: C_MORADO if activo else C_BLANCO},
+                color={ft.ControlState.DEFAULT: C_BLANCO if activo else C_MORADO},
+                side={ft.ControlState.DEFAULT: ft.BorderSide(1.2, C_MORADO)},
+                shape=ft.RoundedRectangleBorder(radius=8),
+                padding=ft.Padding(14, 8, 14, 8),
+            )
+        try:
+            for b in btns_modo_correo.values():
+                b.update()
+        except Exception:
+            pass
+
+    def _set_modo_correo(m):
+        modo_correo_actual[0] = m
+        cfg_p = enviar_correos.cargar_config()
+        cfg_p["modo_correo"] = m
+        enviar_correos.guardar_config(cfg_p)
+        _refrescar_botones_modo()
+
+    btns_modo_correo = {
+        "texto": ft.ElevatedButton("Texto plano (personal)",
+                                   icon=ft.Icons.TEXT_SNIPPET_ROUNDED,
+                                   on_click=lambda e: _set_modo_correo("texto")),
+        "html":  ft.ElevatedButton("HTML (diseño profesional)",
+                                   icon=ft.Icons.BRUSH_ROUNDED,
+                                   on_click=lambda e: _set_modo_correo("html")),
+    }
+
+    tf_texto_asunto = ft.TextField(
+        label="Asunto",
+        value=cfg_actual.get("texto_asunto",
+                             enviar_correos.TEXTO_ASUNTO_DEFAULT),
+        prefix_icon=ft.Icons.SUBJECT_ROUNDED,
+        border_color=C_BORDE,
+        focused_border_color=C_MORADO,
+        label_style=ft.TextStyle(color=C_TEXTO_2, font_family="Saira"),
+        text_style=ft.TextStyle(font_family="Saira"),
+        expand=True,
+    )
+    tf_texto_cuerpo = ft.TextField(
+        label="Mensaje (usá @nombre para el nombre del contacto)",
+        value=cfg_actual.get("texto_cuerpo",
+                             enviar_correos.TEXTO_CUERPO_DEFAULT),
+        multiline=True,
+        min_lines=8,
+        max_lines=16,
+        border_color=C_BORDE,
+        focused_border_color=C_MORADO,
+        label_style=ft.TextStyle(color=C_TEXTO_2, font_family="Saira"),
+        text_style=ft.TextStyle(font_family="Saira"),
+        expand=True,
+    )
+
     # ── Logo personalizado del cliente ───────────────────────────
     # Se muestra en el sidebar y se incrusta en cada correo enviado
     # (reemplaza al logo embebido del bundle).
@@ -5997,6 +6057,11 @@ def main(page: ft.Page):
             "empresa_whatsapp":   (tf_empresa_whatsapp.value or "").strip(),
             "auto_envio_activo":  bool(chk_auto_envio.value),
             "auto_envio_hora":    _norm_hora(tf_auto_envio_hora.value),
+            "modo_correo":        modo_correo_actual[0],
+            "texto_asunto":       (tf_texto_asunto.value or "").strip()
+                                   or enviar_correos.TEXTO_ASUNTO_DEFAULT,
+            "texto_cuerpo":       (tf_texto_cuerpo.value or "").rstrip()
+                                   or enviar_correos.TEXTO_CUERPO_DEFAULT,
         })
         enviar_correos.guardar_config(cfg)
 
@@ -6162,6 +6227,50 @@ def main(page: ft.Page):
                     ),
                 ),
                 ft.Row(spacing=12, controls=[tf_correos_copia]),
+            ],
+        ),
+    )
+
+    # ── Tab "Mensaje" — formato y contenido del correo de campaña ──
+    _refrescar_botones_modo()
+    tab_mensaje = ft.Container(
+        padding=ft.Padding(0, 20, 0, 0),
+        content=ft.Column(
+            spacing=16,
+            scroll=ft.ScrollMode.AUTO,
+            controls=[
+                ft.Text(
+                    "Elegí cómo se envía el correo de campaña. "
+                    "\"Texto plano\" es un email simple y personal (como el que "
+                    "escribirías a mano) — suele rendir mucho mejor en frío y "
+                    "entra menos a spam. \"HTML\" usa la plantilla con diseño.",
+                    size=12, color=C_TEXTO_3, font_family="Saira",
+                ),
+                ft.Row(
+                    spacing=10,
+                    vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                    controls=[
+                        ft.Text("Formato:", size=12, color=C_TEXTO_2,
+                                weight=ft.FontWeight.W_500, font_family="Saira"),
+                        btns_modo_correo["texto"],
+                        btns_modo_correo["html"],
+                    ],
+                ),
+                ft.Divider(height=1, color=C_BORDE),
+                ft.Text(
+                    "Contenido del modo TEXTO PLANO (editable). Usá "
+                    "@nombre donde quieras que vaya el nombre del contacto.",
+                    size=12, weight=ft.FontWeight.BOLD, color=C_TEXTO_2,
+                    font_family="Saira",
+                ),
+                ft.Row(spacing=12, controls=[tf_texto_asunto]),
+                ft.Row(spacing=12, controls=[tf_texto_cuerpo]),
+                ft.Text(
+                    "Si tenés una firma de texto configurada en la pestaña "
+                    "Firma, se agrega automáticamente al final. El asunto NO "
+                    "lleva el nombre para que parezca un correo personal.",
+                    size=11, color=C_TEXTO_3, italic=True, font_family="Saira",
+                ),
             ],
         ),
     )
@@ -6770,6 +6879,7 @@ def main(page: ft.Page):
     # ── Sub-pestañas custom (más confiable que ft.Tabs en Flet 0.84) ──
     cfg_tabs = [
         ("cuenta",     "Cuenta",     ft.Icons.ACCOUNT_CIRCLE_ROUNDED, tab_cuenta),
+        ("mensaje",    "Mensaje",    ft.Icons.MAIL_OUTLINE_ROUNDED,   tab_mensaje),
         ("reuniones",  "Reuniones",  ft.Icons.EVENT_AVAILABLE_ROUNDED, tab_reuniones),
         ("whatsapp",   "WhatsApp",   ft.Icons.CHAT_ROUNDED,           tab_whatsapp),
         ("empresa",    "Empresa",    ft.Icons.BUSINESS_ROUNDED,       tab_empresa),
@@ -7056,6 +7166,12 @@ def main(page: ft.Page):
             tf_empresa_whatsapp.value = cfg_r.get("empresa_whatsapp", "")
             chk_auto_envio.value      = bool(cfg_r.get("auto_envio_activo", False))
             tf_auto_envio_hora.value  = str(cfg_r.get("auto_envio_hora", "09:00"))
+            modo_correo_actual[0]     = cfg_r.get("modo_correo", "texto")
+            _refrescar_botones_modo()
+            tf_texto_asunto.value     = cfg_r.get("texto_asunto",
+                                                  enviar_correos.TEXTO_ASUNTO_DEFAULT)
+            tf_texto_cuerpo.value     = cfg_r.get("texto_cuerpo",
+                                                  enviar_correos.TEXTO_CUERPO_DEFAULT)
             contenedor_vista.content = vista_configuracion
             lbl_topbar_titulo.value  = "Configuración"
             btn_iniciar.visible      = False
