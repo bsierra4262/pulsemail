@@ -2,6 +2,10 @@
 
 Formato basado en [Keep a Changelog](https://keepachangelog.com/) y [SemVer](https://semver.org/).
 
+## [1.4.6] — 2026-08-24  _patch_
+
+Modo texto: si la firma es de tipo IMAGEN, el correo se manda como HTML incrustando la imagen de firma al cierre (como antes) — se habia roto en v1.4.5. Si la firma es de tipo TEXTO, sale texto puro con la firma de texto. La firma sale siempre de la config de la app (Gmail no agrega firma via SMTP).
+
 ## [1.4.5] — 2026-08-24  _patch_
 
 Modo texto plano: ahora sale 100% texto puro, NO adjunta la firma de imagen de la app (para que 'todo salga del Gmail'). Solo agrega firma si es de tipo TEXTO. La firma de imagen se usa unicamente en modo HTML. Nota: Gmail no agrega su firma en envios por SMTP, asi que si queres firma en modo texto hay que ponerla como texto en la pestana Firma.
