@@ -1495,12 +1495,15 @@ def enviar_correo(msg, destino, intentos_previos=0, nombre=""):
     return "agotado"
 
 
-def enviar_correo_prueba(destino, nombre_muestra="Juan Pérez"):
+def enviar_correo_prueba(destino, nombre_muestra=None):
     """Envía un correo de PRUEBA a `destino`, armado EXACTAMENTE igual que la
     campaña (`preparar_correo`, respeta modo texto/HTML y todo lo de config),
     para previsualizar cómo sale antes de lanzar. Un solo intento, sin
-    reintentos ni cola, y SIN copiar a las direcciones en CC. Devuelve
-    (ok: bool, mensaje: str)."""
+    reintentos ni cola, y SIN copiar a las direcciones en CC.
+
+    `nombre_muestra` es el nombre REAL de la persona de esa dirección (lo pone
+    el usuario en la UI) — se usa para el `@nombre`, igual que un contacto de
+    la base. Devuelve (ok: bool, mensaje: str)."""
     cfg = cargar_config()
     correo   = (cfg.get("correo")   or "").strip()
     password = (cfg.get("password") or "").strip()
@@ -1517,7 +1520,7 @@ def enviar_correo_prueba(destino, nombre_muestra="Juan Pérez"):
         return False, "Poné una dirección de prueba válida."
 
     try:
-        msg = preparar_correo(nombre_muestra, destino)
+        msg = preparar_correo(nombre_muestra or "", destino)
         # En la prueba NO copiamos a los CC de la campaña.
         if msg.get("Cc"):
             del msg["Cc"]
@@ -1525,7 +1528,9 @@ def enviar_correo_prueba(destino, nombre_muestra="Juan Pérez"):
             server.starttls()
             server.login(correo, password)
             server.send_message(msg)
-        return True, f"Correo de prueba enviado a {destino}."
+        pila = (nombre_muestra or "").strip().split()[0] if (nombre_muestra or "").strip() else ""
+        detalle = f" Saludó a \"{pila}\" (así sale el @nombre)." if pila else ""
+        return True, f"Correo de prueba enviado a {destino}.{detalle}"
     except smtplib.SMTPAuthenticationError:
         return False, "Credenciales inválidas."
     except smtplib.SMTPRecipientsRefused:

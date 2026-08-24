@@ -2,6 +2,10 @@
 
 Formato basado en [Keep a Changelog](https://keepachangelog.com/) y [SemVer](https://semver.org/).
 
+## [1.4.2] — 2026-08-24  _patch_
+
+El correo de prueba ahora usa un nombre REAL del primer contacto de tu base (regla real del @nombre), en vez de un nombre generico, para verificar que la personalizacion funciona de verdad. Avisa que nombre uso. Si no hay base cargada, saluda sin nombre y lo aclara.
+
 ## [1.4.1] — 2026-08-24  _patch_
 
 Asunto default del modo texto sin 'Fwd:' -> 'Retomando el contacto'. Nuevo boton 'Enviar correo de prueba' en Configuracion -> Mensaje: manda un correo de prueba (armado igual que la campana, respetando el formato y el mensaje editado, sin copiar a los CC) a la direccion que elijas, para previsualizar antes de lanzar. Default bsierra@intellihelp.tech.
