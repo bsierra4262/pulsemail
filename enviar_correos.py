@@ -598,6 +598,17 @@ TEXTO_CUERPO_DEFAULT = (
     "Saludos,"
 )
 
+# Firma de TEXTO por defecto (se agrega separada, al cierre, en modo texto).
+# Editable desde Configuración → Firma → Texto.
+TEXTO_FIRMA_DEFAULT = (
+    "Carlos Baldelli\n"
+    "Director\n"
+    "Teléfono: +54 11 7700-6868\n"
+    "Celular: +54 11 7700-6868\n"
+    "intellihelp.tech\n"
+    "Av. Dorrego 1789 piso 6° Of 604. CABA - Argentina"
+)
+
 TIEMPO_MINIMO, TIEMPO_MAXIMO = 25, 45
 
 
@@ -612,7 +623,7 @@ _CONFIG_DEFAULTS = {
     "smtp_port":     587,
     "imap_host":     "imap.gmail.com",
     "tema":          "sistema",   # 'claro' | 'oscuro' | 'sistema'
-    "firma":         "",          # firma personal del usuario (texto plano)
+    "firma":         TEXTO_FIRMA_DEFAULT,  # firma de texto (precargada, editable)
     "firma_tipo":    "texto",     # 'texto' | 'imagen'
     "firma_imagen":  "",          # ruta absoluta a la imagen de firma
     "correos_copia": "",          # CC: lista separada por coma o vacío
@@ -993,9 +1004,10 @@ def _preparar_correo_texto(nombre, destino):
     firma_img_ok = (firma_tipo == "imagen" and firma_imagen
                     and os.path.exists(firma_imagen))
 
-    # Firma de TEXTO → al cierre (después de "Saludos,"). Correo 100% texto.
+    # Firma de TEXTO → al cierre, SEPARADA con una línea en blanco (como una
+    # firma real, no pegada al "Saludos,"). Correo 100% texto.
     if firma_tipo == "texto" and firma_texto and firma_texto not in cuerpo:
-        cuerpo = cuerpo.rstrip() + "\n" + firma_texto
+        cuerpo = cuerpo.rstrip() + "\n\n" + firma_texto
 
     msg.set_content(cuerpo)   # versión text/plain (fallback)
 
@@ -1012,8 +1024,8 @@ def _preparar_correo_texto(nombre, destino):
                 'font-size:14px;color:#1a1a1a;line-height:1.5;">'
                 + cuerpo_html +
                 '<br><br>'
-                '<img src="cid:firma_usuario" alt="Firma" '
-                'style="max-width:520px;width:100%;height:auto;display:block;'
+                '<img src="cid:firma_usuario" alt="Firma" width="400" '
+                'style="max-width:400px;height:auto;display:block;'
                 'border:0;outline:none;text-decoration:none;" />'
                 '</div>'
             )

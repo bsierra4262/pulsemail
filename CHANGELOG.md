@@ -2,6 +2,10 @@
 
 Formato basado en [Keep a Changelog](https://keepachangelog.com/) y [SemVer](https://semver.org/).
 
+## [1.4.7] — 2026-08-24  _patch_
+
+Firma de texto precargada por default (Carlos Baldelli, cargo, telefonos, web, direccion) y SEPARADA del mensaje con linea en blanco (como firma real). Firma de imagen: reducida a 400px de ancho (antes salia muy grande/desproporcionada).
+
 ## [1.4.6] — 2026-08-24  _patch_
 
 Modo texto: si la firma es de tipo IMAGEN, el correo se manda como HTML incrustando la imagen de firma al cierre (como antes) — se habia roto en v1.4.5. Si la firma es de tipo TEXTO, sale texto puro con la firma de texto. La firma sale siempre de la config de la app (Gmail no agrega firma via SMTP).
