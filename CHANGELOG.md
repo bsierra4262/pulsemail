@@ -2,6 +2,10 @@
 
 Formato basado en [Keep a Changelog](https://keepachangelog.com/) y [SemVer](https://semver.org/).
 
+## [1.4.5] — 2026-08-24  _patch_
+
+Modo texto plano: ahora sale 100% texto puro, NO adjunta la firma de imagen de la app (para que 'todo salga del Gmail'). Solo agrega firma si es de tipo TEXTO. La firma de imagen se usa unicamente en modo HTML. Nota: Gmail no agrega su firma en envios por SMTP, asi que si queres firma en modo texto hay que ponerla como texto en la pestana Firma.
+
 ## [1.4.4] — 2026-08-24  _patch_
 
 Modo texto: si la firma es IMAGEN, ahora se adjunta (antes solo salia la firma de texto). Se agrega una alternativa HTML con el mensaje + la imagen de firma al cierre. Correo de prueba: el nombre se deriva de la direccion de prueba (parte antes del @: carlos.baldelli -> Carlos Baldelli, nbaldelli -> Nbaldelli); se saco el campo manual de nombre.

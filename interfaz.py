@@ -6360,8 +6360,8 @@ def main(page: ft.Page):
                                 "Poné la dirección de prueba: el correo sale "
                                 "armado igual que la campaña y el @nombre se "
                                 "toma de esa misma dirección (ej: "
-                                "carlos.baldelli@… → Carlos Baldelli). Si tenés "
-                                "firma imagen, también se adjunta.",
+                                "carlos.baldelli@… → Carlos Baldelli). En modo "
+                                "texto sale 100% texto (sin adjuntar imagen).",
                                 size=11, color=C_TEXTO_3, font_family="Saira",
                             ),
                             ft.Row(

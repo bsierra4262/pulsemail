@@ -985,48 +985,19 @@ def _preparar_correo_texto(nombre, destino):
     cuerpo = cuerpo.replace("¡Hola !", "¡Hola!").replace("Hola !", "Hola!")
     cuerpo = re.sub(r"[ \t]{2,}", " ", cuerpo)
 
-    # Firma configurada.
-    firma_tipo   = (get_config_value("firma_tipo") or "texto").lower()
-    firma_texto  = (get_config_value("firma") or "").strip()
-    firma_imagen = (get_config_value("firma_imagen") or "").strip()
-    firma_img_ok = (firma_tipo == "imagen" and firma_imagen
-                    and os.path.exists(firma_imagen))
-
-    # Firma de TEXTO → al cierre (después de "Saludos,").
+    # Firma de TEXTO configurada → al cierre (después de "Saludos,").
+    # En modo TEXTO PLANO NO adjuntamos la firma de IMAGEN: el correo queda
+    # 100% texto (personal), para que "todo salga del Gmail". Si querés una
+    # firma acá, ponela como TEXTO en la pestaña Firma. (La firma de imagen
+    # sólo se usa en modo HTML.)
+    # OJO: Gmail NO agrega su firma en envíos por SMTP (solo al redactar
+    # desde la web/app de Gmail), así que la firma tiene que venir de acá.
+    firma_tipo  = (get_config_value("firma_tipo") or "texto").lower()
+    firma_texto = (get_config_value("firma") or "").strip()
     if firma_tipo == "texto" and firma_texto and firma_texto not in cuerpo:
         cuerpo = cuerpo.rstrip() + "\n" + firma_texto
 
-    msg.set_content(cuerpo)   # versión text/plain
-
-    # Firma de IMAGEN: texto plano no puede embeber imágenes, así que
-    # agregamos una alternativa HTML con el MISMO mensaje + la imagen de
-    # firma al cierre. El correo sigue viéndose personal (sólo el texto y la
-    # firma). Los clientes muestran el HTML; los que no, el texto plano.
-    if firma_img_ok:
-        try:
-            from html import escape as _esc
-            cuerpo_html = _esc(cuerpo).replace("\n", "<br>\n")
-            html = (
-                '<div style="font-family:Arial,Helvetica,sans-serif;'
-                'font-size:14px;color:#1a1a1a;line-height:1.5;">'
-                + cuerpo_html +
-                '<br><br>'
-                '<img src="cid:firma_usuario" alt="Firma" '
-                'style="max-width:460px;width:100%;height:auto;display:block;'
-                'border:0;outline:none;text-decoration:none;" />'
-                '</div>'
-            )
-            msg.add_alternative(html, subtype="html")
-            with open(firma_imagen, "rb") as _f:
-                _datos = _f.read()
-            _ext = os.path.splitext(firma_imagen)[1].lstrip(".").lower() or "jpeg"
-            if _ext == "jpg":
-                _ext = "jpeg"
-            msg.get_payload()[-1].add_related(
-                _datos, maintype="image", subtype=_ext, cid="<firma_usuario>")
-        except Exception:
-            pass
-
+    msg.set_content(cuerpo)   # text/plain PURO (sin adjuntos ni HTML)
     return msg
 
 
