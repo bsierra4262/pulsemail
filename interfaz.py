@@ -6295,7 +6295,7 @@ def main(page: ft.Page):
 
     btn_correo_prueba = ft.ElevatedButton(
         "Enviar correo de prueba",
-        icon=ft.Icons.OUTGOING_MAIL_ROUNDED,
+        icon=ft.Icons.FORWARD_TO_INBOX_ROUNDED,
         on_click=_enviar_prueba,
         style=ft.ButtonStyle(
             bgcolor={ft.ControlState.DEFAULT: C_VERDE,

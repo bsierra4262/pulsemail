@@ -2,6 +2,10 @@
 
 Formato basado en [Keep a Changelog](https://keepachangelog.com/) y [SemVer](https://semver.org/).
 
+## [1.4.3] — 2026-08-24  _patch_
+
+Fix crash: el boton 'Enviar correo de prueba' usaba un icono inexistente (ft.Icons.OUTGOING_MAIL_ROUNDED) -> la app tiraba 'The application encountered an error: OUTGOING_MAIL_ROUNDED' al abrir Configuracion -> Mensaje. Cambiado a FORWARD_TO_INBOX_ROUNDED. Escaneados los 94 iconos de la UI: todos validos.
+
 ## [1.4.2] — 2026-08-24  _patch_
 
 El correo de prueba ahora usa un nombre REAL del primer contacto de tu base (regla real del @nombre), en vez de un nombre generico, para verificar que la personalizacion funciona de verdad. Avisa que nombre uso. Si no hay base cargada, saluda sin nombre y lo aclara.
