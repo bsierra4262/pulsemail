@@ -2,6 +2,10 @@
 
 Formato basado en [Keep a Changelog](https://keepachangelog.com/) y [SemVer](https://semver.org/).
 
+## [1.4.4] — 2026-08-24  _patch_
+
+Modo texto: si la firma es IMAGEN, ahora se adjunta (antes solo salia la firma de texto). Se agrega una alternativa HTML con el mensaje + la imagen de firma al cierre. Correo de prueba: el nombre se deriva de la direccion de prueba (parte antes del @: carlos.baldelli -> Carlos Baldelli, nbaldelli -> Nbaldelli); se saco el campo manual de nombre.
+
 ## [1.4.3] — 2026-08-24  _patch_
 
 Fix crash: el boton 'Enviar correo de prueba' usaba un icono inexistente (ft.Icons.OUTGOING_MAIL_ROUNDED) -> la app tiraba 'The application encountered an error: OUTGOING_MAIL_ROUNDED' al abrir Configuracion -> Mensaje. Cambiado a FORWARD_TO_INBOX_ROUNDED. Escaneados los 94 iconos de la UI: todos validos.

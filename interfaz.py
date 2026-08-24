@@ -6242,17 +6242,6 @@ def main(page: ft.Page):
         text_style=ft.TextStyle(font_family="Saira"),
         expand=True,
     )
-    tf_nombre_prueba = ft.TextField(
-        label="Nombre real de esa persona",
-        value="Brian",
-        hint_text="Ej: Brian",
-        prefix_icon=ft.Icons.PERSON_ROUNDED,
-        border_color=C_BORDE,
-        focused_border_color=C_MORADO,
-        label_style=ft.TextStyle(color=C_TEXTO_2, font_family="Saira"),
-        text_style=ft.TextStyle(font_family="Saira"),
-        width=230,
-    )
     lbl_prueba_estado = ft.Text("", size=12, font_family="Saira")
     ring_prueba = ft.ProgressRing(color=C_MORADO, width=16, height=16,
                                   stroke_width=2.5, visible=False)
@@ -6278,12 +6267,11 @@ def main(page: ft.Page):
         lbl_prueba_estado.color = C_AZUL
         safe_update(ring_prueba, lbl_prueba_estado)
 
-        nombre_prueba = (tf_nombre_prueba.value or "").strip()
-
         def _trab():
             try:
-                ok, msg = enviar_correos.enviar_correo_prueba(
-                    dest, nombre_muestra=nombre_prueba)
+                # Sin nombre: se deriva de la dirección de prueba (parte
+                # antes del @), ej nbaldelli → Nbaldelli.
+                ok, msg = enviar_correos.enviar_correo_prueba(dest)
             except Exception as ex:
                 ok, msg = False, str(ex)
             ring_prueba.visible = False
@@ -6369,10 +6357,11 @@ def main(page: ft.Page):
                                 ],
                             ),
                             ft.Text(
-                                "Poné la dirección de prueba y el NOMBRE REAL de "
-                                "esa persona. El correo sale armado igual que la "
-                                "campaña, usando ese nombre en el @nombre — así "
-                                "ves exactamente cómo le llega a un contacto.",
+                                "Poné la dirección de prueba: el correo sale "
+                                "armado igual que la campaña y el @nombre se "
+                                "toma de esa misma dirección (ej: "
+                                "carlos.baldelli@… → Carlos Baldelli). Si tenés "
+                                "firma imagen, también se adjunta.",
                                 size=11, color=C_TEXTO_3, font_family="Saira",
                             ),
                             ft.Row(
@@ -6380,7 +6369,6 @@ def main(page: ft.Page):
                                 vertical_alignment=ft.CrossAxisAlignment.CENTER,
                                 controls=[
                                     tf_correo_prueba,
-                                    tf_nombre_prueba,
                                     btn_correo_prueba,
                                     ring_prueba,
                                 ],

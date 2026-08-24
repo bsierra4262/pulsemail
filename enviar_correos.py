@@ -985,13 +985,48 @@ def _preparar_correo_texto(nombre, destino):
     cuerpo = cuerpo.replace("¡Hola !", "¡Hola!").replace("Hola !", "Hola!")
     cuerpo = re.sub(r"[ \t]{2,}", " ", cuerpo)
 
-    # Firma de texto configurada → al cierre (después de "Saludos,").
-    firma_tipo  = (get_config_value("firma_tipo") or "texto").lower()
-    firma_texto = (get_config_value("firma") or "").strip()
+    # Firma configurada.
+    firma_tipo   = (get_config_value("firma_tipo") or "texto").lower()
+    firma_texto  = (get_config_value("firma") or "").strip()
+    firma_imagen = (get_config_value("firma_imagen") or "").strip()
+    firma_img_ok = (firma_tipo == "imagen" and firma_imagen
+                    and os.path.exists(firma_imagen))
+
+    # Firma de TEXTO → al cierre (después de "Saludos,").
     if firma_tipo == "texto" and firma_texto and firma_texto not in cuerpo:
         cuerpo = cuerpo.rstrip() + "\n" + firma_texto
 
-    msg.set_content(cuerpo)   # text/plain PURO (sin alternativa HTML)
+    msg.set_content(cuerpo)   # versión text/plain
+
+    # Firma de IMAGEN: texto plano no puede embeber imágenes, así que
+    # agregamos una alternativa HTML con el MISMO mensaje + la imagen de
+    # firma al cierre. El correo sigue viéndose personal (sólo el texto y la
+    # firma). Los clientes muestran el HTML; los que no, el texto plano.
+    if firma_img_ok:
+        try:
+            from html import escape as _esc
+            cuerpo_html = _esc(cuerpo).replace("\n", "<br>\n")
+            html = (
+                '<div style="font-family:Arial,Helvetica,sans-serif;'
+                'font-size:14px;color:#1a1a1a;line-height:1.5;">'
+                + cuerpo_html +
+                '<br><br>'
+                '<img src="cid:firma_usuario" alt="Firma" '
+                'style="max-width:460px;width:100%;height:auto;display:block;'
+                'border:0;outline:none;text-decoration:none;" />'
+                '</div>'
+            )
+            msg.add_alternative(html, subtype="html")
+            with open(firma_imagen, "rb") as _f:
+                _datos = _f.read()
+            _ext = os.path.splitext(firma_imagen)[1].lstrip(".").lower() or "jpeg"
+            if _ext == "jpg":
+                _ext = "jpeg"
+            msg.get_payload()[-1].add_related(
+                _datos, maintype="image", subtype=_ext, cid="<firma_usuario>")
+        except Exception:
+            pass
+
     return msg
 
 
@@ -1495,6 +1530,15 @@ def enviar_correo(msg, destino, intentos_previos=0, nombre=""):
     return "agotado"
 
 
+def _nombre_desde_email(direccion):
+    """Deriva un nombre de la parte local de un email (antes del @):
+    'carlos.baldelli' → 'Carlos Baldelli'; 'nbaldelli' → 'Nbaldelli'."""
+    local = (direccion or "").split("@")[0]
+    local = re.sub(r"[._\-]+", " ", local)   # separadores → espacio
+    local = re.sub(r"\d+", "", local).strip()  # sacar números
+    return local.title()
+
+
 def enviar_correo_prueba(destino, nombre_muestra=None):
     """Envía un correo de PRUEBA a `destino`, armado EXACTAMENTE igual que la
     campaña (`preparar_correo`, respeta modo texto/HTML y todo lo de config),
@@ -1518,6 +1562,11 @@ def enviar_correo_prueba(destino, nombre_muestra=None):
         return False, "Configurá la cuenta (correo + contraseña) primero."
     if not destino or "@" not in destino:
         return False, "Poné una dirección de prueba válida."
+
+    # Si no se pasa nombre, se deriva de la DIRECCIÓN de prueba (parte antes
+    # del @): 'carlos.baldelli' → 'Carlos Baldelli', 'nbaldelli' → 'Nbaldelli'.
+    if nombre_muestra is None:
+        nombre_muestra = _nombre_desde_email(destino)
 
     try:
         msg = preparar_correo(nombre_muestra or "", destino)
