@@ -591,7 +591,7 @@ Falta una librería de Python. Si reinstalás Python (en caso de que estés usá
 
 - **Antes que nada, hacé un respaldo**: Configuración → Datos → Exportar configuración completa.
 - **Para problemas técnicos**: contactá a la persona que te dio el programa o a tu equipo de soporte.
-- **Documentación técnica para desarrolladores**: hay un archivo separado llamado `DOCS_DESARROLLADORES.md` en la carpeta del programa, pero es bastante denso — está pensado para programadores.
+- **Documentación técnica para desarrolladores**: está en [`DOCS_DESARROLLADORES.md`](DOCS_DESARROLLADORES.md), en esta misma carpeta, pero es bastante denso — está pensado para programadores.
 
 ---
 

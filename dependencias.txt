@@ -10,7 +10,7 @@ REM       (o copiar las líneas pip y ejecutarlas en una terminal)
 REM    3. Una vez instalado todo: ejecutar  py interfaz.py
 REM
 REM  Para COMPILAR a .exe distribuible (instalador profesional):
-REM    Ver el archivo  COMPILAR.md  para instrucciones completas.
+REM    Ver el archivo  INSTALL.md  para instrucciones completas.
 REM    Resumen: instalar Inno Setup → ejecutar build_installer.bat
 REM
 REM ═════════════════════════════════════════════════════════════════

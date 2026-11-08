@@ -70,10 +70,15 @@ Correo masivo/
 ├── enviar_correos.py        ← Backend: SMTP, IMAP, persistencia, lógica
 ├── interfaz.py              ← Frontend Flet: UI, threading, render
 ├── build_installer.bat      ← Script de build para .exe + instalador
+├── bump_version.py          ← Versionado (VERSION + CHANGELOG.md)
 ├── dependencias.txt         ← Lista comentada de pip installs
-├── COMPILAR.md              ← Guía paso a paso para compilar
-├── DOCS_DESARROLLADORES.md  ← Este documento
-├── DOCS_USUARIO.md          ← Documentación de funcionalidades
+├── requirements.txt         ← Las mismas dependencias, para pip install -r
+├── README.md · INSTALL.md   ← Presentación, instalación y compilación
+├── md/
+│   ├── DOCS_DESARROLLADORES.md  ← Este documento
+│   └── DOCS_USUARIO.md          ← Manual de usuario
+├── tests/                   ← Pruebas automatizadas (unittest + SMTP falso local)
+├── docs/                    ← Banner y capturas del README
 │
 ├── logo-app.png/.ico        ← Ícono de la aplicación
 ├── ITH-logo.png             ← Logo cliente por defecto (sustituible)
@@ -689,7 +694,7 @@ dist/Pulsemail.exe (onefile, ~80 MB)
 installer_output/PulsemailSetup_v1.0.0.exe
 ```
 
-Ver `COMPILAR.md` para instrucciones paso a paso.
+Ver [`INSTALL.md`](../INSTALL.md) para instrucciones paso a paso.
 
 ### Hidden imports
 
@@ -741,9 +746,10 @@ Estas limitaciones quedaron documentadas en este mismo archivo y en los comentar
 
 ## Apéndice: cómo testear cambios
 
+0. **Pruebas automatizadas:** `python -m unittest discover -s tests -v`. Cubren el armado de mensajes, la persistencia, la detección de bajas y rebotes, el versionado y una campaña completa contra un SMTP falso en `127.0.0.1` (no sale ningún correo). Corren igual en GitHub Actions.
 1. **Backend aislado:** importar `enviar_correos` desde un script de prueba, configurar credenciales de test, llamar `main()` con un CSV pequeño (2-3 contactos a tu propia cuenta).
 2. **UI con datos reales:** copiar `config.json` y `contactos.csv` reales a la carpeta del repo, correr `py interfaz.py`.
-3. **Build completo:** seguir `COMPILAR.md`. Probar en una segunda PC (idealmente sin Python instalado) para verificar que el `.exe` es self-contained.
+3. **Build completo:** seguir [`INSTALL.md`](../INSTALL.md). Probar en una segunda PC (idealmente sin Python instalado) para verificar que el `.exe` es self-contained.
 4. **Probar reintentos:** durante una campaña, desactivar wifi → ver toast "Sin conexión", verificar que `registro_pendiente.json` se cree, esperar al menos 30 intentos para ver toast "Inestable", reactivar → ver toast "Recuperada".
 5. **Probar Detener:** durante la pausa entre correos, apretar Detener → debe responder en < 1s y guardar pendiente con el siguiente correo a intentar.
 
