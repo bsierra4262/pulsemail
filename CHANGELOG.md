@@ -18,6 +18,7 @@ y el versionado, [SemVer](https://semver.org/lang/es/).
 
 ### Changed
 
+- La firma de texto precargada es genérica (Equipo Intellihelp, datos de la empresa) y ya no incluye datos personales.
 - La documentación de usuario y la técnica pasan a `md/`; `COMPILAR.md` se integra en
   `INSTALL.md`.
 - `bump_version.py` escribe las entradas nuevas con el formato de este archivo, debajo de

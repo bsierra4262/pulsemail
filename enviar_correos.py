@@ -601,10 +601,9 @@ TEXTO_CUERPO_DEFAULT = (
 # Firma de TEXTO por defecto (se agrega separada, al cierre, en modo texto).
 # Editable desde Configuración → Firma → Texto.
 TEXTO_FIRMA_DEFAULT = (
-    "Carlos Baldelli\n"
-    "Director\n"
+    "Equipo Intellihelp\n"
+    "Intellihelp S.A.\n"
     "Teléfono: +54 11 7700-6868\n"
-    "Celular: +54 11 7700-6868\n"
     "intellihelp.tech\n"
     "Av. Dorrego 1789 piso 6° Of 604. CABA - Argentina"
 )
