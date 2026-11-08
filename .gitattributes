@@ -1,0 +1,15 @@
+# El repositorio guarda LF; los scripts de Windows se mantienen en CRLF.
+* text=auto eol=lf
+
+*.py    text eol=lf
+*.md    text eol=lf
+*.yml   text eol=lf
+*.txt   text eol=lf
+*.iss   text eol=lf
+*.bat   text eol=crlf
+
+*.png   binary
+*.jpg   binary
+*.jpeg  binary
+*.ico   binary
+*.svg   text eol=lf

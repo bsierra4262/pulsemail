@@ -1,0 +1,9 @@
+# Dependencias para ejecutar Pulsemail desde el código fuente.
+# Las pruebas (tests/) sólo usan la biblioteca estándar de Python.
+flet==0.84.0
+Pillow
+html2image
+# Opcionales
+plyer
+# Sólo para compilar el instalador
+pyinstaller

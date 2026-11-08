@@ -41,8 +41,17 @@ registro_pendiente.json
 registro_msg_ids.json
 lista_negra.json
 historial/
+firma/
 sistema_errores.log
 sistema_errores.log.*
+
+# --- Secretos locales (nunca se versionan) ---
+.env
+.env.*
+*.pem
+*.key
+*.p12
+pulsemail_backup*.zip
 
 # --- Cache de renderizado HTML (Chrome headless) ---
 ith_mail_render_cache/
@@ -52,7 +61,6 @@ ith_mail_render_cache/
 .vscode/
 .idea/
 *.code-workspace
-.claude/
 
 # --- Sistema operativo ---
 Thumbs.db
