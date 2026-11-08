@@ -65,30 +65,36 @@ def bump(actual: str, tipo: str) -> str:
     raise SystemExit(f"Tipo de bump desconocido: {tipo}")
 
 
+_SECCION_POR_TIPO = {"major": "Changed", "minor": "Added", "patch": "Fixed"}
+
+
 def agregar_changelog(version_nueva: str, tipo: str, notas: str) -> None:
-    """Inserta una entrada nueva al principio del CHANGELOG.md.
-    Si el archivo no existe, lo crea con un header."""
+    """Inserta la entrada de la versión nueva en el CHANGELOG.md, con el
+    formato de Keep a Changelog: debajo de `[Unreleased]` y encima de la
+    última versión publicada. Si el archivo no existe, lo crea."""
     fecha = datetime.now().strftime("%Y-%m-%d")
     seccion = (
-        f"## [{version_nueva}] — {fecha}  _{tipo}_\n\n"
-        f"{notas.strip() if notas else '_(sin notas)_'}\n\n"
+        f"## [{version_nueva}] - {fecha}\n\n"
+        f"### {_SECCION_POR_TIPO.get(tipo, 'Changed')}\n\n"
+        f"- {notas.strip() if notas else 'Sin notas.'}\n\n"
     )
 
     if not os.path.exists(ARCHIVO_CHANGELOG):
-        header = (
-            "# Changelog — Pulsemail\n\n"
-            "Formato basado en [Keep a Changelog](https://keepachangelog.com/) "
-            "y [SemVer](https://semver.org/).\n\n"
+        contenido = (
+            "# Changelog\n\n"
+            "Todos los cambios notables de Pulsemail se documentan en este archivo.\n"
+            "El formato sigue [Keep a Changelog](https://keepachangelog.com/es-ES/1.1.0/)\n"
+            "y el versionado, [SemVer](https://semver.org/lang/es/).\n\n"
+            "## [Unreleased]\n\n" + seccion
         )
-        contenido = header + seccion
     else:
         with open(ARCHIVO_CHANGELOG, "r", encoding="utf-8") as f:
             previo = f.read()
-        # Insertamos la nueva sección justo después de la primera línea
-        # blanca posterior al título (preserva el header de intro).
-        partes = previo.split("\n\n", 2)
-        if len(partes) >= 3:
-            contenido = f"{partes[0]}\n\n{partes[1]}\n\n{seccion}{partes[2]}"
+        # La entrada va antes de la primera versión publicada (cualquier
+        # `## [x.y.z]`), así `[Unreleased]` queda siempre arriba.
+        m = re.search(r"^## \[\d+\.\d+\.\d+\]", previo, re.MULTILINE)
+        if m:
+            contenido = previo[:m.start()] + seccion + previo[m.start():]
         else:
             contenido = previo.rstrip() + "\n\n" + seccion
 
