@@ -18,6 +18,7 @@ y el versionado, [SemVer](https://semver.org/lang/es/).
 
 ### Changed
 
+- El README explica la relación con el CRM: Pulsemail sigue en uso y su motor se migra al CRM.
 - La firma de texto precargada es genérica (Equipo Intellihelp, datos de la empresa) y ya no incluye datos personales.
 - La documentación de usuario y la técnica pasan a `md/`; `COMPILAR.md` se integra en
   `INSTALL.md`.

@@ -48,6 +48,14 @@ Todo corre en la PC de quien la usa: no hay servidor, no hay suscripción y los 
 contactos no salen del equipo. Se instala con un instalador propio, sin permisos de
 administrador, y una actualización nunca toca la configuración ni la base.
 
+### Relación con el CRM
+
+Pulsemail es la herramienta de envío que Intellihelp usó antes de tener su CRM propio y la que
+sigue mandando las campañas hoy. Su motor de envío se está llevando al
+[CRM INTELLIHELP](https://github.com/bsierra4262/crm-intellihelp), donde primero se valida en la
+instalación de pruebas y después pasa a producción. Cuando esa migración termine, las campañas
+se van a manejar desde el CRM y Pulsemail queda como antecedente.
+
 ## La aplicación por dentro
 
 Identidad visual de Intellihelp: tipografía Saira y paleta `#663399` · `#9CC930`, con tema
