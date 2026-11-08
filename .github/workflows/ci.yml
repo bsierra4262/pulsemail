@@ -1,0 +1,41 @@
+# Pulsemail — integración continua
+# Sintaxis de todo el código, control de secretos y la batería de pruebas
+# (incluye una campaña completa contra un SMTP falso en 127.0.0.1: no sale
+# ningún correo de la máquina del runner).
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  pruebas:
+    name: Pruebas (${{ matrix.os }}, Python ${{ matrix.python }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python: ['3.11', '3.12']
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Sintaxis de todos los módulos
+        run: python -m py_compile enviar_correos.py interfaz.py bump_version.py _build_helper.py tests/smtp_falso.py
+
+      - name: Sin secretos ni datos del usuario en el repositorio
+        if: runner.os == 'Linux'
+        run: |
+          ! git ls-files | grep -E '(^|/)(config\.json|contactos\.csv|lista_negra\.json|registro_[a-z_]+\.json|\.env(\..*)?)$|\.(pem|key|p12)$|(^|/)historial/'
+          ! git grep -nE '^-----BEGIN (RSA |EC |ENCRYPTED )?PRIVATE KEY-----$'
+
+      - name: Pruebas
+        run: python -m unittest discover -s tests -v
