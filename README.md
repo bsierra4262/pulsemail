@@ -355,6 +355,6 @@ reconocimiento de autoría (Ley 11.723 art. 52; Convenio de Berna art. 6 bis). V
 
 ## Autor
 
-**Brian Sierra** — Intellihelp. Diseño, desarrollo e implementación completos: motor de envío
-SMTP, lectura y clasificación por IMAP, interfaz de escritorio, empaquetado e instalador para
-Windows, y pruebas.
+**Brian Sierra** — Administrador de sistemas (SysAdmin) en Intellihelp · [LinkedIn](https://www.linkedin.com/in/brian-gabriel-sierra/) · [GitHub](https://github.com/bsierra4262)
+
+Diseño, desarrollo e implementación completos: motor de envío SMTP, lectura y clasificación por IMAP, interfaz de escritorio, empaquetado e instalador para Windows, y pruebas.
